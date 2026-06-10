@@ -15,11 +15,11 @@ async function main() {
   getDb();
   console.log(`[db] SQLite initialized at ${config.dbPath}`);
 
-  // Ensure GitHub labels exist for all repos
+  // Ensure GitHub labels exist for all repos (non-blocking, best-effort)
   const repos = getEnabledRepos();
   for (const repo of repos) {
     console.log(`[labels] Ensuring labels for ${repo.github}...`);
-    await ensureLabels(repo.github);
+    ensureLabels(repo.github).catch((e) => console.warn(`[labels] Skipped ${repo.github}: ${e.message}`));
   }
 
   const app = Fastify({ logger: false });

@@ -20,23 +20,19 @@ export interface DispatchResult {
   idle: boolean;
 }
 
-function buildPrompt(title: string, body: string): string {
+function buildPrompt(repo: string, issueNumber: number, title: string): string {
   return [
-    `You are an autonomous coding agent. Your task is to resolve the following GitHub issue.`,
+    `你是一个自动化编码代理。请实现 GitHub Issue #${issueNumber}。`,
     ``,
-    `## Issue: ${title}`,
+    `步骤：`,
+    `1. 使用 gh issue view ${issueNumber} --repo ${repo} 阅读 issue 的完整内容`,
+    `2. 阅读并理解 issue 的需求`,
+    `3. 探索代码库，理解相关代码`,
+    `4. 实现所需的改动`,
+    `5. 创建名为 "agent/issue-${issueNumber}" 的分支，提交改动`,
+    `6. 推送分支并创建 Pull Request：gh pr create --title "fix: ${title}" --body "Closes #${issueNumber}"`,
     ``,
-    body,
-    ``,
-    `## Instructions`,
-    `1. Read and understand the issue thoroughly`,
-    `2. Explore the codebase to understand the relevant code`,
-    `3. Implement the necessary changes`,
-    `4. Create a git branch named "agent/issue-{number}" and commit your changes`,
-    `5. Push the branch and create a Pull Request using: gh pr create --title "{title}" --body "Closes #{number}"`,
-    `6. Make sure the PR description references the issue number so it auto-closes on merge`,
-    ``,
-    `Important: When done, output the PR URL on a line by itself so it can be detected.`,
+    `注意：完成后在输出中单独一行输出 PR 的 URL。`,
   ].join("\n");
 }
 
@@ -180,9 +176,10 @@ function dispatchNew(pollResults: PollResult[]): number {
     const logPath = path.join(config.logDir, `${repo.name}-${issue.number}.log`);
 
     // Build claude command
-    const prompt = buildPrompt(issue.title || `Issue #${issue.number}`, issue.url);
-    const safePrompt = prompt.replace(/'/g, "'\\''");
-    const command = `cd ${repo.path} && claude -p '${safePrompt}' 2>&1 | tee ${logPath}`;
+    const prompt = buildPrompt(repo.github, issue.number, issue.title || `Issue #${issue.number}`);
+    const promptFile = path.join(config.logDir, `${repo.name}-${issue.number}-prompt.txt`);
+    fs.writeFileSync(promptFile, prompt, "utf-8");
+    const command = `cd ${repo.path} && claude -p "$(cat ${promptFile})" 2>&1 | tee ${logPath}`;
 
     console.log(`[dispatcher] 🚀 Dispatching ${repo.github}#${issue.number} → session ${session}`);
 

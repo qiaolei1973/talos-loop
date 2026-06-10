@@ -23,19 +23,28 @@ interface GhIssue {
 }
 
 function ghIssueList(repo: string, label: string): GhIssue[] {
-  const raw = execSync(
-    `gh issue list --repo ${repo} --label "${label}" --state open --json number,title,url,labels --limit 50`,
-    { encoding: "utf-8", timeout: 30_000 }
-  );
-  return JSON.parse(raw);
+  try {
+    const raw = execSync(
+      `gh issue list --repo ${repo} --label "${label}" --state open --json number,title,url,labels --limit 50`,
+      { encoding: "utf-8", timeout: 30_000 }
+    );
+    return JSON.parse(raw);
+  } catch {
+    // Label may not exist yet — return empty
+    return [];
+  }
 }
 
 function ghIssueView(repo: string, number: number): { labels: { name: string }[] } {
-  const raw = execSync(
-    `gh issue view ${number} --repo ${repo} --json labels`,
-    { encoding: "utf-8", timeout: 15_000 }
-  );
-  return JSON.parse(raw);
+  try {
+    const raw = execSync(
+      `gh issue view ${number} --repo ${repo} --json labels`,
+      { encoding: "utf-8", timeout: 15_000 }
+    );
+    return JSON.parse(raw);
+  } catch {
+    return { labels: [] };
+  }
 }
 
 export function pollRepo(repo: RepoConfig): PollResult {

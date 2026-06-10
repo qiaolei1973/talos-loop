@@ -6,6 +6,12 @@
   "claudeTimeout": 600,
   "repos": [
     {
+      "name": "talos-deploy",
+      "github": "qiaolei1973/talos-deploy",
+      "path": "/home/agent/talos-deploy",
+      "enabled": true
+    },
+    {
       "name": "skills",
       "github": "qiaolei1973/skills",
       "path": "/home/agent/skills",
