@@ -186,7 +186,7 @@ function dispatchNew(pollResults: PollResult[]): number {
     const scriptFile = path.join(config.logDir, `${repo.name}-${issue.number}-run.sh`);
     fs.writeFileSync(scriptFile, `#!/bin/bash
 cd ${repo.path}
-claude -p "$(cat ${promptFile})" --verbose 2>&1 | tee ${logPath}
+claude -p "$(cat ${promptFile})" --verbose --dangerously-skip-permissions 2>&1 | tee ${logPath}
 `, "utf-8");
     fs.chmodSync(scriptFile, 0o755);
     const command = scriptFile;
