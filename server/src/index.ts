@@ -6,9 +6,13 @@ import { loadConfig } from "./config.js";
 import { getDb } from "./db/index.js";
 import { registerApiRoutes, startPoller } from "./routes/api.js";
 import { ensureLabels } from "./services/dispatcher.js";
+import { checkTmux } from "./services/tmux.js";
 import { getEnabledRepos } from "./config.js";
 
 async function main() {
+  // Check required dependencies
+  checkTmux();
+
   const config = loadConfig();
 
   // Initialize DB
