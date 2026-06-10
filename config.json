@@ -1,0 +1,15 @@
+{
+  "port": 3100,
+  "pollInterval": 300000,
+  "triggerLabel": "ready-for-agent",
+  "maxParallel": 1,
+  "claudeTimeout": 600,
+  "repos": [
+    {
+      "name": "skills",
+      "github": "qiaolei1973/skills",
+      "path": "/home/agent/skills",
+      "enabled": true
+    }
+  ]
+}
