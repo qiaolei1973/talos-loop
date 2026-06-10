@@ -70,9 +70,12 @@ function ghEditLabel(repo: string, number: number, removeLabel: string, addLabel
 
 function ghComment(repo: string, number: number, body: string): void {
   try {
-    execSync(`gh issue comment ${number} --repo ${repo} --body "${body.replace(/"/g, '\\"')}"`, {
+    const tmpFile = path.join(require("os").tmpdir(), `tl-comment-${Date.now()}.md`);
+    fs.writeFileSync(tmpFile, body, "utf-8");
+    execSync(`gh issue comment ${number} --repo ${repo} --body-file "${tmpFile}"`, {
       timeout: 15_000,
     });
+    fs.unlinkSync(tmpFile);
   } catch (err: any) {
     console.error(`[dispatcher] Failed to comment on ${repo}#${number}: ${err.message}`);
   }
@@ -175,13 +178,21 @@ function dispatchNew(pollResults: PollResult[]): number {
     const session = tmux.sessionName(repo.name, issue.number);
     const logPath = path.join(config.logDir, `${repo.name}-${issue.number}.log`);
 
-    // Build claude command (wrapped in bash -c for pipe/subshell support)
+    // Build claude command
     const prompt = buildPrompt(repo.github, issue.number, issue.title || `Issue #${issue.number}`);
     const promptFile = path.join(config.logDir, `${repo.name}-${issue.number}-prompt.txt`);
     fs.writeFileSync(promptFile, prompt, "utf-8");
-    const command = `bash -c 'cd ${repo.path} && claude -p "$(cat ${promptFile})" 2>&1 | tee ${logPath}'`;
+    // Use shell script file to avoid quoting issues, keep bash alive with exec
+    const scriptFile = path.join(config.logDir, `${repo.name}-${issue.number}-run.sh`);
+    fs.writeFileSync(scriptFile, `#!/bin/bash
+cd ${repo.path}
+exec claude -p "$(cat ${promptFile})" 2>&1 | tee ${logPath}
+`, "utf-8");
+    fs.chmodSync(scriptFile, 0o755);
+    const command = scriptFile;
 
     console.log(`[dispatcher] 🚀 Dispatching ${repo.github}#${issue.number} → session ${session}`);
+    console.log(`[dispatcher] DEBUG command: ${command}`);
 
     try {
       // Update GitHub labels
