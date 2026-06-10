@@ -30,7 +30,7 @@ let cachedConfig: AppConfig | null = null;
 function defaults(): Partial<AppConfig> {
   return {
     port: 3100,
-    pollInterval: 300_000, // 5 minutes
+    pollInterval: 60_000, // 1 minute
     triggerLabel: "ready-for-agent",
     processingLabel: "agent-processing",
     doneLabel: "agent-done",

@@ -10,8 +10,11 @@ import {
   updateIssueTmux,
   type Session,
 } from "../db/index.js";
-import { pollRepo, type PollResult, type DiscoveredIssue } from "./poller.js";
+import { pollRepo, getIssueLabels, type PollResult, type DiscoveredIssue } from "./poller.js";
 import * as tmux from "./tmux.js";
+import { createLogger } from "./logger.js";
+
+const log = createLogger("dispatcher");
 
 export interface DispatchResult {
   dispatched: number;
@@ -20,26 +23,29 @@ export interface DispatchResult {
   idle: boolean;
 }
 
-function buildPrompt(repo: string, issueNumber: number, title: string): string {
+function buildPrompt(
+  repo: string,
+  issueNumber: number,
+  repoPath: string,
+): string {
   return [
     `你是一个自动化编码代理。请实现 GitHub Issue #${issueNumber}。`,
     ``,
-    `步骤：`,
-    `1. 使用 gh issue view ${issueNumber} --repo ${repo} 阅读 issue 的完整内容`,
-    `2. 阅读并理解 issue 的需求`,
-    `3. 探索代码库，理解相关代码`,
-    `4. 实现所需的改动`,
-    `5. 创建名为 "agent/issue-${issueNumber}" 的分支，提交改动`,
-    `6. 推送分支并创建 Pull Request：gh pr create --title "fix: ${title}" --body "Closes #${issueNumber}"`,
+    `要求：`,
+    `- 阅读并理解 issue 内容`,
+    `- 使用 git worktree 隔离工作（自行决定 worktree 路径和分支名，请使用语义化的分支名）`,
+    `- 在 worktree 中完成所有开发工作`,
+    `- 完成后提交代码，推送分支，并创建 Pull Request 关联 Issue #${issueNumber}`,
+    `- 最后清理 worktree：cd ${repoPath} && git worktree remove <你的worktree路径>`,
     ``,
-    `注意：完成后在输出中单独一行输出 PR 的 URL。`,
+    `完成后在输出中单独一行输出 PR 的 URL。`,
   ].join("\n");
 }
 
 function parseLogForPrUrl(logPath: string): string | null {
   try {
-    const log = fs.readFileSync(logPath, "utf-8");
-    const match = log.match(/https:\/\/github\.com\/[^/]+\/[^/]+\/pull\/\d+/);
+    const logFile = fs.readFileSync(logPath, "utf-8");
+    const match = logFile.match(/https:\/\/github\.com\/[^/]+\/[^/]+\/pull\/\d+/);
     return match ? match[0] : null;
   } catch {
     return null;
@@ -48,9 +54,9 @@ function parseLogForPrUrl(logPath: string): string | null {
 
 function parseLogForError(logPath: string): string {
   try {
-    const log = fs.readFileSync(logPath, "utf-8");
+    const logFile = fs.readFileSync(logPath, "utf-8");
     // Take last 500 chars as error summary
-    const tail = log.slice(-500).trim();
+    const tail = logFile.slice(-500).trim();
     return tail || "Unknown error (empty log)";
   } catch {
     return "Failed to read log file";
@@ -64,7 +70,7 @@ function ghEditLabel(repo: string, number: number, removeLabel: string, addLabel
       { timeout: 15_000 }
     );
   } catch (err: any) {
-    console.error(`[dispatcher] Failed to edit labels on ${repo}#${number}: ${err.message}`);
+    log.error(`Failed to edit labels on ${repo}#${number}: ${err.message}`);
   }
 }
 
@@ -77,7 +83,7 @@ function ghComment(repo: string, number: number, body: string): void {
     });
     fs.unlinkSync(tmpFile);
   } catch (err: any) {
-    console.error(`[dispatcher] Failed to comment on ${repo}#${number}: ${err.message}`);
+    log.error(`Failed to comment on ${repo}#${number}: ${err.message}`);
   }
 }
 
@@ -122,26 +128,22 @@ function checkRunningSessions(): { completed: number; failed: number } {
     const alive = tmux.isAlive(session.tmux_session);
 
     if (alive) {
-      // Still running, skip
       continue;
     }
 
     // Session has exited — determine result
-
     const prUrl = session.log_path ? parseLogForPrUrl(session.log_path) : null;
 
     if (prUrl) {
-      // Success!
-      console.log(`[dispatcher] ✅ ${repo}#${number} done — ${prUrl}`);
+      log.info(`✅ ${repo}#${number} done — ${prUrl}`);
       updateSessionStatus(session.id, "done", prUrl);
       ghEditLabel(repo, number, config.processingLabel, config.doneLabel);
       ghComment(repo, number, `✅ Agent completed. PR: ${prUrl}`);
       updateIssueTmux(repo, number, null);
       completed++;
     } else {
-      // Failed
       const errorSummary = session.log_path ? parseLogForError(session.log_path) : "No log available";
-      console.log(`[dispatcher] ❌ ${repo}#${number} failed`);
+      log.info(`❌ ${repo}#${number} failed`);
       updateSessionStatus(session.id, "failed", undefined, errorSummary.slice(0, 500));
       ghEditLabel(repo, number, config.processingLabel, config.failedLabel);
       ghComment(repo, number, `❌ Agent processing failed.\n\n\`\`\`\n${errorSummary.slice(0, 1000)}\n\`\`\``);
@@ -159,6 +161,7 @@ function dispatchNew(pollResults: PollResult[]): number {
   const runningCount = getRunningSessions().length;
 
   if (runningCount >= config.maxParallel) {
+    log.info(`Max parallel (${config.maxParallel}) reached, ${runningCount} running`);
     return 0;
   }
 
@@ -175,32 +178,43 @@ function dispatchNew(pollResults: PollResult[]): number {
 
   for (const candidate of candidates.slice(0, slotsAvailable)) {
     const { issue, repo } = candidate;
+
+    // Real-time label verification — guard against stale poll data
+    const currentLabels = getIssueLabels(repo.github, issue.number);
+    if (!currentLabels.includes(config.triggerLabel)) {
+      log.info(`Skipping ${repo.github}#${issue.number} — trigger label no longer present`);
+      continue;
+    }
+    if (currentLabels.includes(config.processingLabel) || currentLabels.includes(config.doneLabel)) {
+      log.warn(`Skipping ${repo.github}#${issue.number} — unexpected labels: ${currentLabels.join(", ")}`);
+      continue;
+    }
+
     const session = tmux.sessionName(repo.name, issue.number);
     const logPath = path.join(config.logDir, `${repo.name}-${issue.number}.log`);
 
     // Build claude command
-    const prompt = buildPrompt(repo.github, issue.number, issue.title || `Issue #${issue.number}`);
+    const prompt = buildPrompt(repo.github, issue.number, repo.path);
     const promptFile = path.join(config.logDir, `${repo.name}-${issue.number}-prompt.txt`);
     fs.writeFileSync(promptFile, prompt, "utf-8");
-    // Use shell script to avoid quoting issues; stdbuf for line-buffered output
+
     const scriptFile = path.join(config.logDir, `${repo.name}-${issue.number}-run.sh`);
     fs.writeFileSync(scriptFile, `#!/bin/bash
 cd ${repo.path}
-claude -p "$(cat ${promptFile})" --verbose --dangerously-skip-permissions 2>&1 | tee ${logPath}
+claude "$(cat ${promptFile})" --dangerously-skip-permissions
 `, "utf-8");
     fs.chmodSync(scriptFile, 0o755);
     const command = scriptFile;
 
-    console.log(`[dispatcher] 🚀 Dispatching ${repo.github}#${issue.number} → session ${session}`);
-    console.log(`[dispatcher] DEBUG command: ${command}`);
+    log.info(`🚀 Dispatching ${repo.github}#${issue.number} → session ${session}`);
 
     try {
       // Update GitHub labels
       ghEditLabel(repo.github, issue.number, config.triggerLabel, config.processingLabel);
       ghComment(repo.github, issue.number, "🤖 Agent has started processing this issue...");
 
-      // Create tmux session
-      tmux.createSession(session, command);
+      // Create tmux session (with pipe-pane logging)
+      tmux.createSession(session, command, logPath);
 
       // Record in DB
       updateIssueTmux(repo.github, issue.number, session);
@@ -208,7 +222,7 @@ claude -p "$(cat ${promptFile})" --verbose --dangerously-skip-permissions 2>&1 |
 
       dispatched++;
     } catch (err: any) {
-      console.error(`[dispatcher] Failed to dispatch ${repo.github}#${issue.number}: ${err.message}`);
+      log.error(`Failed to dispatch ${repo.github}#${issue.number}: ${err.message}`);
       ghEditLabel(repo.github, issue.number, config.processingLabel, config.failedLabel);
     }
   }

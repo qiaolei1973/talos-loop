@@ -1,6 +1,6 @@
 {
   "port": 3100,
-  "pollInterval": 300000,
+  "pollInterval": 60000,
   "triggerLabel": "ready-for-agent",
   "maxParallel": 1,
   "claudeTimeout": 600,

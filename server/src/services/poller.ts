@@ -1,6 +1,9 @@
 import { execSync } from "child_process";
 import { loadConfig, getEnabledRepos, type RepoConfig } from "../config.js";
 import { upsertIssue, getIssue, type Issue } from "../db/index.js";
+import { createLogger } from "./logger.js";
+
+const log = createLogger("poller");
 
 export interface DiscoveredIssue {
   issue: Issue;
@@ -73,17 +76,17 @@ export function pollRepo(repo: RepoConfig): PollResult {
       }
     }
   } catch (err: any) {
-    console.error(`[poller] Error polling ${repo.github}: ${err.message}`);
+    log.error(`Error polling ${repo.github}: ${err.message}`);
     return { repo, discovered, processing, error: err.message };
   }
 
-  console.log(`[poller] ${repo.github}: ${discovered.length} queued, ${processing.length} processing`);
+  log.info(`${repo.github}: ${discovered.length} queued, ${processing.length} processing`);
   return { repo, discovered, processing };
 }
 
 export function pollAll(): PollResult[] {
   const repos = getEnabledRepos();
-  console.log(`[poller] Polling ${repos.length} repos...`);
+  log.info(`Polling ${repos.length} repos...`);
   return repos.map(pollRepo);
 }
 

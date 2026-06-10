@@ -6,6 +6,9 @@ import { pollAll, getIssueLabels } from "../services/poller.js";
 import { dispatch } from "../services/dispatcher.js";
 import { getRunningSessions } from "../db/index.js";
 import * as tmux from "../services/tmux.js";
+import { createLogger } from "../services/logger.js";
+
+const log = createLogger("api");
 
 let lastPollAt: Date | null = null;
 let nextPollAt: Date | null = null;
@@ -135,7 +138,7 @@ export async function registerApiRoutes(app: FastifyInstance): Promise<void> {
 
   // Webhook endpoint (optional — just triggers a poll)
   app.post("/api/webhook", async (_request, _reply) => {
-    console.log("[webhook] Received webhook event, triggering poll...");
+    log.info("Received webhook event, triggering poll...");
     const result = runPollCycle();
     return { triggered: true, ...result };
   });

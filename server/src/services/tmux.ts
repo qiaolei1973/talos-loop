@@ -1,5 +1,8 @@
 import { execSync } from "child_process";
 import fs from "fs";
+import { createLogger } from "./logger.js";
+
+const log = createLogger("tmux");
 
 const SESSION_PREFIX = "tl";
 
@@ -7,9 +10,9 @@ const SESSION_PREFIX = "tl";
 export function checkTmux(): void {
   try {
     const ver = execSync("tmux -V", { timeout: 3_000, encoding: "utf-8" }).trim();
-    console.log(`[tmux] ${ver}`);
+    log.info(ver);
   } catch {
-    console.error("FATAL: tmux is not installed. Please install it first: sudo dnf install -y tmux");
+    log.error("tmux is not installed. Please install it first: sudo dnf install -y tmux");
     process.exit(1);
   }
 }
@@ -19,9 +22,17 @@ export function sessionName(repoName: string, issueNumber: number): string {
   return `${SESSION_PREFIX}-${repoName}-${issueNumber}`;
 }
 
-/** Create a new detached tmux session running a command */
-export function createSession(name: string, command: string): void {
+/** Create a new detached tmux session running a command, with optional log file */
+export function createSession(name: string, command: string, logPath?: string): void {
   execSync(`/usr/bin/tmux new-session -d -s "${name}" -x 200 -y 50 "${command}"`, { timeout: 10_000 });
+  // Use tmux pipe-pane to log all terminal output to file (works with TUI apps like claude)
+  if (logPath) {
+    try {
+      execSync(`/usr/bin/tmux pipe-pane -t "${name}" "cat >> ${logPath}"`, { timeout: 5_000 });
+    } catch {
+      // Non-critical — tmux session still works, just no log file
+    }
+  }
 }
 
 /** Check if a tmux session is still alive */

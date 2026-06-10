@@ -67,7 +67,8 @@ function StatusBadge({ status }: { status: string }) {
 
 function timeAgo(dateStr: string | null): string {
   if (!dateStr) return "-";
-  const d = new Date(dateStr);
+  // SQLite datetime('now') returns UTC without 'Z' — append it so JS parses as UTC
+  const d = new Date(dateStr.endsWith("Z") ? dateStr : dateStr + "Z");
   const diff = Math.floor((Date.now() - d.getTime()) / 1000);
   if (diff < 60) return `${diff}s ago`;
   if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
