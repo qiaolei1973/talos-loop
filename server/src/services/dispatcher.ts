@@ -182,11 +182,11 @@ function dispatchNew(pollResults: PollResult[]): number {
     const prompt = buildPrompt(repo.github, issue.number, issue.title || `Issue #${issue.number}`);
     const promptFile = path.join(config.logDir, `${repo.name}-${issue.number}-prompt.txt`);
     fs.writeFileSync(promptFile, prompt, "utf-8");
-    // Use shell script file to avoid quoting issues, keep bash alive with exec
+    // Use shell script to avoid quoting issues; stdbuf for line-buffered output
     const scriptFile = path.join(config.logDir, `${repo.name}-${issue.number}-run.sh`);
     fs.writeFileSync(scriptFile, `#!/bin/bash
 cd ${repo.path}
-exec claude -p "$(cat ${promptFile})" 2>&1 | tee ${logPath}
+claude -p "$(cat ${promptFile})" --verbose 2>&1 | tee ${logPath}
 `, "utf-8");
     fs.chmodSync(scriptFile, 0o755);
     const command = scriptFile;

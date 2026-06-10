@@ -21,7 +21,7 @@ export function sessionName(repoName: string, issueNumber: number): string {
 
 /** Create a new detached tmux session running a command */
 export function createSession(name: string, command: string): void {
-  execSync(`/usr/bin/tmux new-session -d -s "${name}" ${command}`, { timeout: 10_000 });
+  execSync(`/usr/bin/tmux new-session -d -s "${name}" -x 200 -y 50 "${command}"`, { timeout: 10_000 });
 }
 
 /** Check if a tmux session is still alive */
