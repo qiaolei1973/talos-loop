@@ -175,11 +175,11 @@ function dispatchNew(pollResults: PollResult[]): number {
     const session = tmux.sessionName(repo.name, issue.number);
     const logPath = path.join(config.logDir, `${repo.name}-${issue.number}.log`);
 
-    // Build claude command
+    // Build claude command (wrapped in bash -c for pipe/subshell support)
     const prompt = buildPrompt(repo.github, issue.number, issue.title || `Issue #${issue.number}`);
     const promptFile = path.join(config.logDir, `${repo.name}-${issue.number}-prompt.txt`);
     fs.writeFileSync(promptFile, prompt, "utf-8");
-    const command = `cd ${repo.path} && claude -p "$(cat ${promptFile})" 2>&1 | tee ${logPath}`;
+    const command = `bash -c 'cd ${repo.path} && claude -p "$(cat ${promptFile})" 2>&1 | tee ${logPath}'`;
 
     console.log(`[dispatcher] 🚀 Dispatching ${repo.github}#${issue.number} → session ${session}`);
 

@@ -5,7 +5,6 @@ import fs from "fs";
 import { loadConfig } from "./config.js";
 import { getDb } from "./db/index.js";
 import { registerApiRoutes, startPoller } from "./routes/api.js";
-import { ensureLabels } from "./services/dispatcher.js";
 import { checkTmux } from "./services/tmux.js";
 import { getEnabledRepos } from "./config.js";
 
@@ -19,12 +18,7 @@ async function main() {
   getDb();
   console.log(`[db] SQLite initialized at ${config.dbPath}`);
 
-  // Ensure GitHub labels exist for all repos (non-blocking, best-effort)
   const repos = getEnabledRepos();
-  for (const repo of repos) {
-    console.log(`[labels] Ensuring labels for ${repo.github}...`);
-    ensureLabels(repo.github).catch((e) => console.warn(`[labels] Skipped ${repo.github}: ${e.message}`));
-  }
 
   const app = Fastify({ logger: false });
 
