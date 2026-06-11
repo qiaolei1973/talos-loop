@@ -9,6 +9,7 @@ import {
   Clock,
   Loader2,
   GitBranch,
+  Check,
 } from "lucide-react";
 
 interface Issue {
@@ -61,6 +62,29 @@ function StatusBadge({ status }: { status: string }) {
       <Icon className={`h-3 w-3 ${status === "processing" ? "animate-spin" : ""}`} />
       {c.label}
     </span>
+  );
+}
+
+function AttachButton({ session }: { session: string }) {
+  const [copied, setCopied] = useState(false);
+
+  const handleCopy = async () => {
+    const cmd = `tmux attach -t ${session}`;
+    await navigator.clipboard.writeText(cmd);
+    setCopied(true);
+    alert(`已复制到剪贴板:\n\n${cmd}`);
+    setTimeout(() => setCopied(false), 1500);
+  };
+
+  return (
+    <button
+      onClick={handleCopy}
+      className="mr-2 inline-flex items-center gap-1 rounded bg-gray-100 px-2 py-0.5 text-xs text-gray-600 hover:bg-gray-200 cursor-pointer"
+      title={`tmux attach -t ${session}`}
+    >
+      {copied ? <Check className="h-3 w-3 text-green-600" /> : <Terminal className="h-3 w-3" />}
+      {copied ? "copied!" : "attach"}
+    </button>
   );
 }
 
@@ -219,14 +243,8 @@ export default function App() {
                           </td>
                           <td className="px-4 py-3 text-gray-500">{timeAgo(issue.updated_at)}</td>
                           <td className="px-4 py-3 text-right">
-                            {issue.tmux_session && (
-                              <span
-                                className="mr-2 inline-flex items-center gap-1 rounded bg-gray-100 px-2 py-0.5 text-xs text-gray-600"
-                                title={`tmux attach -t ${issue.tmux_session}`}
-                              >
-                                <Terminal className="h-3 w-3" />
-                                attach
-                              </span>
+                            {issue.status === "processing" && issue.tmux_session && (
+                              <AttachButton session={issue.tmux_session} />
                             )}
                             {issue.status === "failed" && (
                               <button
