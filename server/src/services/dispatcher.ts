@@ -43,11 +43,11 @@ function buildPrompt(
   ].join("\n");
 }
 
-/** Use gh CLI to find a PR that references the issue number */
+/** Use gh CLI to find a PR that references the issue number (any state: open, merged, closed) */
 function findPrUrl(repo: string, issueNumber: number): string | null {
   try {
     const result = execSync(
-      `gh pr list --repo ${repo} --state open --json url --jq '.[0].url'`,
+      `gh pr list --repo ${repo} --state all --search "fixes #${issueNumber}" --json url --jq '.[0].url'`,
       { timeout: 15_000, encoding: "utf-8" },
     ).trim();
     return result || null;
@@ -194,7 +194,18 @@ function dispatchNew(pollResults: PollResult[]): number {
     const promptFile = path.join(os.tmpdir(), `tl-prompt-${session}.txt`);
     fs.writeFileSync(promptFile, prompt, "utf-8");
 
-    const command = `cd ${repo.path} && claude "$(cat ${promptFile})" --dangerously-skip-permissions`;
+    // Use a shell script to avoid quoting hell — $(cat) inside an execSync'd
+    // tmux command breaks because the outer shell consumes the double quotes,
+    // word-splits the multi-line prompt, and turns one command into 20+ args.
+    const scriptFile = path.join(os.tmpdir(), `tl-run-${session}.sh`);
+    fs.writeFileSync(scriptFile, [
+      `#!/bin/bash`,
+      `cd ${repo.path}`,
+      `claude "$(cat ${promptFile})" --dangerously-skip-permissions`,
+      `rm -f "${scriptFile}" "${promptFile}"`,
+    ].join("\n"), "utf-8");
+    fs.chmodSync(scriptFile, 0o755);
+    const command = scriptFile;
 
     log.info(`🚀 Dispatching ${repo.github}#${issue.number} → session ${session}`);
 
