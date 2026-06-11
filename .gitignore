@@ -2,5 +2,8 @@ node_modules/
 dist/
 data/
 *.db
+*.db-wal
+*.db-shm
 .env
 server/data/
+package-lock.json

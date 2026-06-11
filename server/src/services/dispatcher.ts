@@ -1,5 +1,6 @@
 import { execSync } from "child_process";
 import fs from "fs";
+import os from "os";
 import path from "path";
 import { loadConfig } from "../config.js";
 import {
@@ -42,24 +43,16 @@ function buildPrompt(
   ].join("\n");
 }
 
-function parseLogForPrUrl(logPath: string): string | null {
+/** Use gh CLI to find a PR that references the issue number */
+function findPrUrl(repo: string, issueNumber: number): string | null {
   try {
-    const logFile = fs.readFileSync(logPath, "utf-8");
-    const match = logFile.match(/https:\/\/github\.com\/[^/]+\/[^/]+\/pull\/\d+/);
-    return match ? match[0] : null;
+    const result = execSync(
+      `gh pr list --repo ${repo} --state open --json url --jq '.[0].url'`,
+      { timeout: 15_000, encoding: "utf-8" },
+    ).trim();
+    return result || null;
   } catch {
     return null;
-  }
-}
-
-function parseLogForError(logPath: string): string {
-  try {
-    const logFile = fs.readFileSync(logPath, "utf-8");
-    // Take last 500 chars as error summary
-    const tail = logFile.slice(-500).trim();
-    return tail || "Unknown error (empty log)";
-  } catch {
-    return "Failed to read log file";
   }
 }
 
@@ -76,7 +69,7 @@ function ghEditLabel(repo: string, number: number, removeLabel: string, addLabel
 
 function ghComment(repo: string, number: number, body: string): void {
   try {
-    const tmpFile = path.join(require("os").tmpdir(), `tl-comment-${Date.now()}.md`);
+    const tmpFile = path.join(os.tmpdir(), `tl-comment-${Date.now()}.md`);
     fs.writeFileSync(tmpFile, body, "utf-8");
     execSync(`gh issue comment ${number} --repo ${repo} --body-file "${tmpFile}"`, {
       timeout: 15_000,
@@ -125,14 +118,17 @@ function checkRunningSessions(): { completed: number; failed: number } {
   let failed = 0;
 
   for (const { repo, number, ...session } of running) {
-    const alive = tmux.isAlive(session.tmux_session);
+    // Capture pane output while session is still alive (before isAlive check)
+    const lastOutput = tmux.captureOutput(session.tmux_session);
 
-    if (alive) {
+    if (tmux.isAlive(session.tmux_session)) {
       continue;
     }
 
     // Session has exited — determine result
-    const prUrl = session.log_path ? parseLogForPrUrl(session.log_path) : null;
+    // Try finding PR URL from captured terminal output first, then via gh CLI
+    const prMatch = lastOutput.match(/https:\/\/github\.com\/[^/\s]+\/[^/\s]+\/pull\/\d+/);
+    const prUrl = prMatch ? prMatch[0] : findPrUrl(repo, number);
 
     if (prUrl) {
       log.info(`✅ ${repo}#${number} done — ${prUrl}`);
@@ -142,11 +138,12 @@ function checkRunningSessions(): { completed: number; failed: number } {
       updateIssueTmux(repo, number, null);
       completed++;
     } else {
-      const errorSummary = session.log_path ? parseLogForError(session.log_path) : "No log available";
+      // Extract last meaningful lines from captured output as error summary
+      const tail = lastOutput.trim().slice(-500) || "Session exited without creating a PR";
       log.info(`❌ ${repo}#${number} failed`);
-      updateSessionStatus(session.id, "failed", undefined, errorSummary.slice(0, 500));
+      updateSessionStatus(session.id, "failed", undefined, tail);
       ghEditLabel(repo, number, config.processingLabel, config.failedLabel);
-      ghComment(repo, number, `❌ Agent processing failed.\n\n\`\`\`\n${errorSummary.slice(0, 1000)}\n\`\`\``);
+      ghComment(repo, number, `❌ Agent processing failed.\n\n\`\`\`\n${tail.slice(0, 1000)}\n\`\`\``);
       updateIssueTmux(repo, number, null);
       failed++;
     }
@@ -191,20 +188,13 @@ function dispatchNew(pollResults: PollResult[]): number {
     }
 
     const session = tmux.sessionName(repo.name, issue.number);
-    const logPath = path.join(config.logDir, `${repo.name}-${issue.number}.log`);
-
-    // Build claude command
     const prompt = buildPrompt(repo.github, issue.number, repo.path);
-    const promptFile = path.join(config.logDir, `${repo.name}-${issue.number}-prompt.txt`);
+
+    // Write prompt to temp file to avoid shell escaping issues
+    const promptFile = path.join(os.tmpdir(), `tl-prompt-${session}.txt`);
     fs.writeFileSync(promptFile, prompt, "utf-8");
 
-    const scriptFile = path.join(config.logDir, `${repo.name}-${issue.number}-run.sh`);
-    fs.writeFileSync(scriptFile, `#!/bin/bash
-cd ${repo.path}
-claude "$(cat ${promptFile})" --dangerously-skip-permissions
-`, "utf-8");
-    fs.chmodSync(scriptFile, 0o755);
-    const command = scriptFile;
+    const command = `cd ${repo.path} && claude "$(cat ${promptFile})" --dangerously-skip-permissions`;
 
     log.info(`🚀 Dispatching ${repo.github}#${issue.number} → session ${session}`);
 
@@ -213,12 +203,12 @@ claude "$(cat ${promptFile})" --dangerously-skip-permissions
       ghEditLabel(repo.github, issue.number, config.triggerLabel, config.processingLabel);
       ghComment(repo.github, issue.number, "🤖 Agent has started processing this issue...");
 
-      // Create tmux session (with pipe-pane logging)
-      tmux.createSession(session, command, logPath);
+      // Create tmux session
+      tmux.createSession(session, command);
 
       // Record in DB
       updateIssueTmux(repo.github, issue.number, session);
-      createSession(issue.id, session, logPath);
+      createSession(issue.id, session);
 
       dispatched++;
     } catch (err: any) {

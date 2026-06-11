@@ -37,7 +37,6 @@ function migrate(db: Database.Database) {
       tmux_session TEXT NOT NULL,
       status TEXT NOT NULL DEFAULT 'running',
       pr_url TEXT,
-      log_path TEXT,
       error TEXT,
       started_at TEXT NOT NULL DEFAULT (datetime('now')),
       finished_at TEXT
@@ -96,16 +95,15 @@ export interface Session {
   tmux_session: string;
   status: "running" | "done" | "failed";
   pr_url: string | null;
-  log_path: string | null;
   error: string | null;
   started_at: string;
   finished_at: string | null;
 }
 
-export function createSession(issueId: number, tmuxSession: string, logPath: string): Session {
+export function createSession(issueId: number, tmuxSession: string): Session {
   const d = getDb();
-  d.prepare("INSERT INTO sessions (issue_id, tmux_session, log_path) VALUES (?, ?, ?)")
-    .run(issueId, tmuxSession, logPath);
+  d.prepare("INSERT INTO sessions (issue_id, tmux_session) VALUES (?, ?)")
+    .run(issueId, tmuxSession);
   return d.prepare("SELECT * FROM sessions WHERE id = last_insert_rowid()").get() as Session;
 }
 

@@ -30,7 +30,6 @@ interface Session {
   tmux_session: string;
   status: string;
   pr_url: string | null;
-  log_path: string | null;
   error: string | null;
   started_at: string;
   finished_at: string | null;

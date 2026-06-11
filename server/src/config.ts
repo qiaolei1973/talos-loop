@@ -19,7 +19,6 @@ export interface AppConfig {
   claudeTimeout: number; // seconds
   repos: RepoConfig[];
   dbPath: string;
-  logDir: string;
 }
 
 const PROJECT_ROOT = path.resolve(__dirname, "../..");
@@ -38,7 +37,6 @@ function defaults(): Partial<AppConfig> {
     maxParallel: 1,
     claudeTimeout: 600,
     dbPath: path.join(PROJECT_ROOT, "server/data/talos-loop.db"),
-    logDir: path.join(PROJECT_ROOT, "server/data/logs"),
   };
 }
 
@@ -59,7 +57,6 @@ export function loadConfig(): AppConfig {
     maxParallel: parsed.maxParallel ?? def.maxParallel!,
     claudeTimeout: parsed.claudeTimeout ?? def.claudeTimeout!,
     dbPath: parsed.dbPath ?? def.dbPath!,
-    logDir: parsed.logDir ?? def.logDir!,
     repos: (parsed.repos ?? []).map((r: RepoConfig) => ({
       name: r.name,
       github: r.github,
@@ -68,9 +65,8 @@ export function loadConfig(): AppConfig {
     })),
   };
 
-  // Ensure data directories exist
+  // Ensure database directory exists
   fs.mkdirSync(path.dirname(cachedConfig.dbPath), { recursive: true });
-  fs.mkdirSync(cachedConfig.logDir, { recursive: true });
 
   return cachedConfig;
 }

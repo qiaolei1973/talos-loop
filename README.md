@@ -80,7 +80,6 @@ npm install
 | `doneLabel` | `agent-done` | 成功后添加的标签 |
 | `failedLabel` | `agent-failed` | 失败后添加的标签 |
 | `dbPath` | `<root>/server/data/talos-loop.db` | SQLite 数据库路径 |
-| `logDir` | `<root>/server/data/logs` | 日志目录 |
 
 ## 运行
 
@@ -184,7 +183,7 @@ Dispatcher 在调度前会实时验证 GitHub 标签，防止过期数据触发�
 - **控制台：** 彩色 `[LEVEL] [module] message` 格式
 - **文件：** `~/.talos/logs/talos-loop.log`
 
-每个 tmux 会话通过 `pipe-pane` 独立记录完整终端输出，用于 PR URL 提取和失败诊断。
+Claude Code 的执行记录可通过 `claude -r` 查看。
 
 ## License
 
