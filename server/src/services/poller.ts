@@ -1,101 +1,73 @@
-import { execSync } from "child_process";
-import { loadConfig, getEnabledRepos, type RepoConfig } from "../config.js";
-import { upsertIssue, getIssue, type Issue } from "../db/index.js";
+import { getEnabledSources, type SourceConfig } from "../config.js";
+import { upsertIssue, updateIssueStatus, type Issue } from "../db/index.js";
+import { resolvePlugin } from "../plugins/loader.js";
+import type { RawIssue, IssueStatus } from "../types/plugin.js";
 import { createLogger } from "./logger.js";
 
 const log = createLogger("poller");
 
 export interface DiscoveredIssue {
   issue: Issue;
-  repo: RepoConfig;
+  sourceType: string;
+  sourceId: string;
+  targetRepo: string;
   labels: string[];
 }
 
 export interface PollResult {
-  repo: RepoConfig;
+  sourceType: string;
   discovered: DiscoveredIssue[];
   processing: DiscoveredIssue[];
   error?: string;
 }
 
-interface GhIssue {
-  number: number;
-  title: string;
-  url: string;
-  labels: { name: string }[];
-}
-
-function ghIssueList(repo: string, label: string): GhIssue[] {
-  try {
-    const raw = execSync(
-      `gh issue list --repo ${repo} --label "${label}" --state open --json number,title,url,labels --limit 50`,
-      { encoding: "utf-8", timeout: 30_000 }
-    );
-    return JSON.parse(raw);
-  } catch {
-    // Label may not exist yet — return empty
-    return [];
-  }
-}
-
-function ghIssueView(repo: string, number: number): { labels: { name: string }[] } {
-  try {
-    const raw = execSync(
-      `gh issue view ${number} --repo ${repo} --json labels`,
-      { encoding: "utf-8", timeout: 15_000 }
-    );
-    return JSON.parse(raw);
-  } catch {
-    return { labels: [] };
-  }
-}
-
-export function pollRepo(repo: RepoConfig): PollResult {
-  const config = loadConfig();
+async function pollSource(source: SourceConfig): Promise<PollResult> {
   const discovered: DiscoveredIssue[] = [];
   const processing: DiscoveredIssue[] = [];
 
   try {
-    // Fetch issues with trigger label
-    const ghIssues = ghIssueList(repo.github, config.triggerLabel);
+    const plugin = await resolvePlugin(source.type);
+    const ctx = { config: source.config, logger: log };
 
-    for (const gh of ghIssues) {
-      const labelNames = gh.labels.map((l) => l.name);
-      const issue = upsertIssue(repo.github, gh.number, gh.url, gh.title);
-      discovered.push({ issue, repo, labels: labelNames });
-    }
+    const rawIssues: RawIssue[] = await plugin.discover(ctx);
 
-    // Also check for issues with processing label (might have been picked up already)
-    const processingIssues = ghIssueList(repo.github, config.processingLabel);
-    for (const gh of processingIssues) {
-      const labelNames = gh.labels.map((l) => l.name);
-      const issue = upsertIssue(repo.github, gh.number, gh.url, gh.title);
-      // Avoid duplicates if issue has both labels
-      if (!discovered.find((d) => d.issue.number === gh.number)) {
-        processing.push({ issue, repo, labels: labelNames });
+    for (const raw of rawIssues) {
+      const issue = upsertIssue(raw.sourceType, raw.sourceId, raw.targetRepo, raw.url, raw.title);
+      const status: IssueStatus = await plugin.getStatus(ctx, raw.sourceId);
+
+      // Read trigger/processing labels from source config
+      const triggerLabel = source.config.triggerLabel as string;
+      const processingLabel = source.config.processingLabel as string;
+
+      const entry: DiscoveredIssue = {
+        issue,
+        sourceType: raw.sourceType,
+        sourceId: raw.sourceId,
+        targetRepo: raw.targetRepo,
+        labels: status.labels,
+      };
+
+      if (status.labels.includes(processingLabel)) {
+        processing.push(entry);
+        updateIssueStatus(raw.sourceType, raw.sourceId, "processing");
+      } else if (status.labels.includes(triggerLabel)) {
+        discovered.push(entry);
+        updateIssueStatus(raw.sourceType, raw.sourceId, "queued");
+      } else {
+        // Issue exists but doesn't match trigger/processing — skip
       }
     }
   } catch (err: any) {
-    log.error(`Error polling ${repo.github}: ${err.message}`);
-    return { repo, discovered, processing, error: err.message };
+    log.error(`Error polling source "${source.type}": ${err.message}`);
+    return { sourceType: source.type, discovered, processing, error: err.message };
   }
 
-  log.info(`${repo.github}: ${discovered.length} queued, ${processing.length} processing`);
-  return { repo, discovered, processing };
+  log.info(`[${source.type}] ${discovered.length} queued, ${processing.length} processing`);
+  return { sourceType: source.type, discovered, processing };
 }
 
-export function pollAll(): PollResult[] {
-  const repos = getEnabledRepos();
-  log.info(`Polling ${repos.length} repos...`);
-  return repos.map(pollRepo);
-}
-
-/** Get current labels for a specific issue from GitHub */
-export function getIssueLabels(repo: string, number: number): string[] {
-  try {
-    const data = ghIssueView(repo, number);
-    return data.labels.map((l) => l.name);
-  } catch {
-    return [];
-  }
+export async function pollAll(): Promise<PollResult[]> {
+  const sources = getEnabledSources();
+  log.info(`Polling ${sources.length} source(s)...`);
+  return Promise.all(sources.map(pollSource));
 }

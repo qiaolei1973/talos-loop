@@ -2,16 +2,18 @@ import { execSync } from "child_process";
 import fs from "fs";
 import os from "os";
 import path from "path";
-import { loadConfig } from "../config.js";
+import { loadConfig, getRepoByName } from "../config.js";
 import {
   getDb,
-  getRunningSessions,
+  getRunningSessionsWithIssues,
   createSession,
   updateSessionStatus,
   updateIssueTmux,
-  type Session,
+  updateIssueStatus,
 } from "../db/index.js";
-import { pollRepo, getIssueLabels, type PollResult, type DiscoveredIssue } from "./poller.js";
+import { resolvePlugin } from "../plugins/loader.js";
+import type { PollResult, DiscoveredIssue } from "./poller.js";
+import type { SourceContext } from "../types/plugin.js";
 import * as tmux from "./tmux.js";
 import { createLogger } from "./logger.js";
 
@@ -25,29 +27,29 @@ export interface DispatchResult {
 }
 
 function buildPrompt(
-  repo: string,
-  issueNumber: number,
+  sourceId: string,
+  url: string,
   repoPath: string,
 ): string {
   return [
-    `你是一个自动化编码代理。请实现 GitHub Issue #${issueNumber}。`,
+    `你是一个自动化编码代理。请实现以下 Issue: ${url}`,
     ``,
     `要求：`,
     `- 阅读并理解 issue 内容`,
     `- 使用 git worktree 隔离工作（自行决定 worktree 路径和分支名，请使用语义化的分支名）`,
     `- 在 worktree 中完成所有开发工作`,
-    `- 完成后提交代码，推送分支，并创建 Pull Request 关联 Issue #${issueNumber}`,
+    `- 完成后提交代码，推送分支，并创建 Pull Request 关联 Issue`,
     `- 最后清理 worktree：cd ${repoPath} && git worktree remove <你的worktree路径>`,
     ``,
     `完成后在输出中单独一行输出 PR 的 URL。`,
   ].join("\n");
 }
 
-/** Use gh CLI to find a PR that references the issue number (any state: open, merged, closed) */
-function findPrUrl(repo: string, issueNumber: number): string | null {
+/** Use gh CLI to find a PR that references the issue (any state: open, merged, closed) */
+function findPrUrl(remote: string, sourceId: string): string | null {
   try {
     const result = execSync(
-      `gh pr list --repo ${repo} --state all --search "fixes #${issueNumber}" --json url --jq '.[0].url'`,
+      `gh pr list --repo ${remote} --state all --search "fixes #${sourceId}" --json url --jq '.[0].url'`,
       { timeout: 15_000, encoding: "utf-8" },
     ).trim();
     return result || null;
@@ -56,68 +58,23 @@ function findPrUrl(repo: string, issueNumber: number): string | null {
   }
 }
 
-function ghEditLabel(repo: string, number: number, removeLabel: string, addLabel: string): void {
-  try {
-    execSync(
-      `gh issue edit ${number} --repo ${repo} --remove-label "${removeLabel}" --add-label "${addLabel}"`,
-      { timeout: 15_000 }
-    );
-  } catch (err: any) {
-    log.error(`Failed to edit labels on ${repo}#${number}: ${err.message}`);
-  }
-}
-
-function ghComment(repo: string, number: number, body: string): void {
-  try {
-    const tmpFile = path.join(os.tmpdir(), `tl-comment-${Date.now()}.md`);
-    fs.writeFileSync(tmpFile, body, "utf-8");
-    execSync(`gh issue comment ${number} --repo ${repo} --body-file "${tmpFile}"`, {
-      timeout: 15_000,
-    });
-    fs.unlinkSync(tmpFile);
-  } catch (err: any) {
-    log.error(`Failed to comment on ${repo}#${number}: ${err.message}`);
-  }
-}
-
-/** Ensure GitHub labels exist (create if needed) */
-export async function ensureLabels(repo: string): Promise<void> {
+/** Build SourceContext for a given source type by looking up its config */
+function buildSourceContext(sourceType: string): SourceContext {
   const config = loadConfig();
-  const labels = [
-    { name: config.processingLabel, color: "FBCA04", desc: "Agent is processing this issue" },
-    { name: config.doneLabel, color: "0E8A16", desc: "Agent completed, PR created" },
-    { name: config.failedLabel, color: "E1141B", desc: "Agent processing failed" },
-  ];
-  for (const label of labels) {
-    try {
-      execSync(
-        `gh label create "${label.name}" --repo ${repo} --color ${label.color} --description "${label.desc}" --force`,
-        { timeout: 10_000 }
-      );
-    } catch {
-      // label might already exist
-    }
-  }
-}
-
-/** Get running sessions joined with their issue info */
-function getRunningSessionsWithIssues(): (Session & { repo: string; number: number })[] {
-  return getDb().prepare(`
-    SELECT s.*, i.repo, i.number
-    FROM sessions s
-    JOIN issues i ON s.issue_id = i.id
-    WHERE s.status = 'running'
-  `).all() as (Session & { repo: string; number: number })[];
+  const source = config.sources.find((s) => s.type === sourceType);
+  return {
+    config: source?.config ?? {},
+    logger: log,
+  };
 }
 
 /** Check running sessions, detect completions */
-function checkRunningSessions(): { completed: number; failed: number } {
-  const config = loadConfig();
+async function checkRunningSessions(): Promise<{ completed: number; failed: number }> {
   const running = getRunningSessionsWithIssues();
   let completed = 0;
   let failed = 0;
 
-  for (const { repo, number, ...session } of running) {
+  for (const { source_type, source_id, target_repo, ...session } of running) {
     // Capture pane output while session is still alive (before isAlive check)
     const lastOutput = tmux.captureOutput(session.tmux_session);
 
@@ -125,26 +82,51 @@ function checkRunningSessions(): { completed: number; failed: number } {
       continue;
     }
 
+    // Resolve repo info for PR search
+    const repo = getRepoByName(target_repo);
+    const remote = repo?.remote ?? target_repo;
+
     // Session has exited — determine result
-    // Try finding PR URL from captured terminal output first, then via gh CLI
     const prMatch = lastOutput.match(/https:\/\/github\.com\/[^/\s]+\/[^/\s]+\/pull\/\d+/);
-    const prUrl = prMatch ? prMatch[0] : findPrUrl(repo, number);
+    const prUrl = prMatch ? prMatch[0] : findPrUrl(remote, source_id);
+
+    // Get plugin for status callbacks
+    const plugin = await resolvePlugin(source_type);
+    const ctx = buildSourceContext(source_type);
+
+    // Read processing/done/failed labels from source config
+    const processingLabel = ctx.config.processingLabel as string;
+    const doneLabel = ctx.config.doneLabel as string;
+    const failedLabel = ctx.config.failedLabel as string;
 
     if (prUrl) {
-      log.info(`✅ ${repo}#${number} done — ${prUrl}`);
+      log.info(`✅ ${source_type}:${source_id} done — ${prUrl}`);
       updateSessionStatus(session.id, "done", prUrl);
-      ghEditLabel(repo, number, config.processingLabel, config.doneLabel);
-      ghComment(repo, number, `✅ Agent completed. PR: ${prUrl}`);
-      updateIssueTmux(repo, number, null);
+      updateIssueStatus(source_type, source_id, "done");
+
+      if (plugin.onStatusChange) {
+        await plugin.onStatusChange(ctx, source_id, { from: processingLabel, to: doneLabel });
+      }
+      if (plugin.onComment) {
+        await plugin.onComment(ctx, source_id, `✅ Agent completed. PR: ${prUrl}`);
+      }
+
+      updateIssueTmux(source_type, source_id, null);
       completed++;
     } else {
-      // Extract last meaningful lines from captured output as error summary
       const tail = lastOutput.trim().slice(-500) || "Session exited without creating a PR";
-      log.info(`❌ ${repo}#${number} failed`);
+      log.info(`❌ ${source_type}:${source_id} failed`);
       updateSessionStatus(session.id, "failed", undefined, tail);
-      ghEditLabel(repo, number, config.processingLabel, config.failedLabel);
-      ghComment(repo, number, `❌ Agent processing failed.\n\n\`\`\`\n${tail.slice(0, 1000)}\n\`\`\``);
-      updateIssueTmux(repo, number, null);
+      updateIssueStatus(source_type, source_id, "failed");
+
+      if (plugin.onStatusChange) {
+        await plugin.onStatusChange(ctx, source_id, { from: processingLabel, to: failedLabel });
+      }
+      if (plugin.onComment) {
+        await plugin.onComment(ctx, source_id, `❌ Agent processing failed.\n\n\`\`\`\n${tail.slice(0, 1000)}\n\`\`\``);
+      }
+
+      updateIssueTmux(source_type, source_id, null);
       failed++;
     }
   }
@@ -153,8 +135,9 @@ function checkRunningSessions(): { completed: number; failed: number } {
 }
 
 /** Dispatch new issues from poll results */
-function dispatchNew(pollResults: PollResult[]): number {
+async function dispatchNew(pollResults: PollResult[]): Promise<number> {
   const config = loadConfig();
+  const { getRunningSessions } = await import("../db/index.js");
   const runningCount = getRunningSessions().length;
 
   if (runningCount >= config.maxParallel) {
@@ -162,41 +145,56 @@ function dispatchNew(pollResults: PollResult[]): number {
     return 0;
   }
 
-  // Collect all discovered (queued) issues across repos
+  // Collect all discovered (queued) issues across sources
   const candidates: DiscoveredIssue[] = pollResults
-    .flatMap((r) => r.discovered)
-    .filter((d) => d.labels.includes(config.triggerLabel));
+    .flatMap((r) => r.discovered);
 
-  // Sort by issue number (lower = older = higher priority)
-  candidates.sort((a, b) => a.issue.number - b.issue.number);
+  // Sort by sourceId (for GitHub, lower number = older = higher priority)
+  candidates.sort((a, b) => {
+    const aNum = parseInt(a.sourceId, 10);
+    const bNum = parseInt(b.sourceId, 10);
+    if (!isNaN(aNum) && !isNaN(bNum)) return aNum - bNum;
+    return a.sourceId.localeCompare(b.sourceId);
+  });
 
   let dispatched = 0;
   const slotsAvailable = config.maxParallel - runningCount;
 
   for (const candidate of candidates.slice(0, slotsAvailable)) {
-    const { issue, repo } = candidate;
+    const { issue, sourceType, sourceId, targetRepo } = candidate;
+
+    // Resolve repo for path and remote
+    const repo = getRepoByName(targetRepo);
+    if (!repo) {
+      log.error(`Repo "${targetRepo}" not found for ${sourceType}:${sourceId}`);
+      continue;
+    }
 
     // Real-time label verification — guard against stale poll data
-    const currentLabels = getIssueLabels(repo.github, issue.number);
-    if (!currentLabels.includes(config.triggerLabel)) {
-      log.info(`Skipping ${repo.github}#${issue.number} — trigger label no longer present`);
+    const plugin = await resolvePlugin(sourceType);
+    const ctx = buildSourceContext(sourceType);
+    const currentStatus = await plugin.getStatus(ctx, sourceId);
+
+    const triggerLabel = ctx.config.triggerLabel as string;
+    const processingLabel = ctx.config.processingLabel as string;
+    const doneLabel = ctx.config.doneLabel as string;
+
+    if (!currentStatus.labels.includes(triggerLabel)) {
+      log.info(`Skipping ${sourceType}:${sourceId} — trigger label no longer present`);
       continue;
     }
-    if (currentLabels.includes(config.processingLabel) || currentLabels.includes(config.doneLabel)) {
-      log.warn(`Skipping ${repo.github}#${issue.number} — unexpected labels: ${currentLabels.join(", ")}`);
+    if (currentStatus.labels.includes(processingLabel) || currentStatus.labels.includes(doneLabel)) {
+      log.warn(`Skipping ${sourceType}:${sourceId} — unexpected labels: ${currentStatus.labels.join(", ")}`);
       continue;
     }
 
-    const session = tmux.sessionName(repo.name, issue.number);
-    const prompt = buildPrompt(repo.github, issue.number, repo.path);
+    const session = tmux.sessionName(sourceType, targetRepo, sourceId);
+    const prompt = buildPrompt(sourceId, issue.url, repo.path);
 
     // Write prompt to temp file to avoid shell escaping issues
     const promptFile = path.join(os.tmpdir(), `tl-prompt-${session}.txt`);
     fs.writeFileSync(promptFile, prompt, "utf-8");
 
-    // Use a shell script to avoid quoting hell — $(cat) inside an execSync'd
-    // tmux command breaks because the outer shell consumes the double quotes,
-    // word-splits the multi-line prompt, and turns one command into 20+ args.
     const scriptFile = path.join(os.tmpdir(), `tl-run-${session}.sh`);
     fs.writeFileSync(scriptFile, [
       `#!/bin/bash`,
@@ -207,24 +205,32 @@ function dispatchNew(pollResults: PollResult[]): number {
     fs.chmodSync(scriptFile, 0o755);
     const command = scriptFile;
 
-    log.info(`🚀 Dispatching ${repo.github}#${issue.number} → session ${session}`);
+    log.info(`🚀 Dispatching ${sourceType}:${sourceId} → session ${session}`);
 
     try {
-      // Update GitHub labels
-      ghEditLabel(repo.github, issue.number, config.triggerLabel, config.processingLabel);
-      ghComment(repo.github, issue.number, "🤖 Agent has started processing this issue...");
+      // Update status via plugin
+      if (plugin.onStatusChange) {
+        await plugin.onStatusChange(ctx, sourceId, { from: triggerLabel, to: processingLabel });
+      }
+      if (plugin.onComment) {
+        await plugin.onComment(ctx, sourceId, "🤖 Agent has started processing this issue...");
+      }
 
       // Create tmux session
       tmux.createSession(session, command);
 
       // Record in DB
-      updateIssueTmux(repo.github, issue.number, session);
+      updateIssueTmux(sourceType, sourceId, session);
+      updateIssueStatus(sourceType, sourceId, "processing");
       createSession(issue.id, session);
 
       dispatched++;
     } catch (err: any) {
-      log.error(`Failed to dispatch ${repo.github}#${issue.number}: ${err.message}`);
-      ghEditLabel(repo.github, issue.number, config.processingLabel, config.failedLabel);
+      log.error(`Failed to dispatch ${sourceType}:${sourceId}: ${err.message}`);
+      if (plugin.onStatusChange) {
+        const failedLabel = ctx.config.failedLabel as string;
+        await plugin.onStatusChange(ctx, sourceId, { from: processingLabel, to: failedLabel });
+      }
     }
   }
 
@@ -232,9 +238,10 @@ function dispatchNew(pollResults: PollResult[]): number {
 }
 
 /** Main dispatch cycle: check running + dispatch new */
-export function dispatch(pollResults: PollResult[]): DispatchResult {
-  const { completed, failed } = checkRunningSessions();
-  const dispatched = dispatchNew(pollResults);
+export async function dispatch(pollResults: PollResult[]): Promise<DispatchResult> {
+  const { completed, failed } = await checkRunningSessions();
+  const dispatched = await dispatchNew(pollResults);
+  const { getRunningSessions } = await import("../db/index.js");
   const runningCount = getRunningSessions().length;
 
   return {
