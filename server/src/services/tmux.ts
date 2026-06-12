@@ -16,9 +16,9 @@ export function checkTmux(): void {
   }
 }
 
-/** Build a session name from repo name and issue number */
-export function sessionName(repoName: string, issueNumber: number): string {
-  return `${SESSION_PREFIX}-${repoName}-${issueNumber}`;
+/** Build a session name from source type, target repo, and source ID */
+export function sessionName(sourceType: string, targetRepo: string, sourceId: string): string {
+  return `${SESSION_PREFIX}-${sourceType}-${targetRepo}-${sourceId}`;
 }
 
 /** Create a new detached tmux session running a command */

@@ -1,11 +1,10 @@
 import { FastifyInstance } from "fastify";
-import { execSync } from "child_process";
-import { loadConfig, getEnabledRepos } from "../config.js";
-import { getAllIssues, getIssuesByRepo, getSessionsByIssue, getDb } from "../db/index.js";
-import { pollAll, getIssueLabels } from "../services/poller.js";
+import { loadConfig, getEnabledSources } from "../config.js";
+import { getAllIssues, getIssuesByTargetRepo, getSessionsByIssue, getIssueById } from "../db/index.js";
+import { pollAll } from "../services/poller.js";
 import { dispatch } from "../services/dispatcher.js";
 import { getRunningSessions } from "../db/index.js";
-import * as tmux from "../services/tmux.js";
+import { resolvePlugin } from "../plugins/loader.js";
 import { createLogger } from "../services/logger.js";
 
 const log = createLogger("api");
@@ -18,13 +17,17 @@ export function startPoller(): void {
   const config = loadConfig();
 
   // Run first poll immediately
-  runPollCycle();
+  runPollCycle().catch((err) => {
+    log.error(`Poll cycle error: ${err}`);
+  });
 
   // Schedule recurring polls
   function scheduleNext(): void {
     nextPollAt = new Date(Date.now() + config.pollInterval);
     pollTimer = setTimeout(() => {
-      runPollCycle();
+      runPollCycle().catch((err) => {
+        log.error(`Poll cycle error: ${err}`);
+      });
       scheduleNext();
     }, config.pollInterval);
   }
@@ -38,15 +41,11 @@ export function stopPoller(): void {
   }
 }
 
-export function runPollCycle(): { pollResults: ReturnType<typeof pollAll>; dispatchResult: ReturnType<typeof dispatch> } {
-  const pollResults = pollAll();
-  const dispatchResult = dispatch(pollResults);
+export async function runPollCycle(): Promise<{ pollResults: Awaited<ReturnType<typeof pollAll>>; dispatchResult: Awaited<ReturnType<typeof dispatch>> }> {
+  const pollResults = await pollAll();
+  const dispatchResult = await dispatch(pollResults);
   lastPollAt = new Date();
   return { pollResults, dispatchResult };
-}
-
-function getIssueById(id: number) {
-  return getDb().prepare("SELECT * FROM issues WHERE id = ?").get(id) as any;
 }
 
 export async function registerApiRoutes(app: FastifyInstance): Promise<void> {
@@ -54,6 +53,7 @@ export async function registerApiRoutes(app: FastifyInstance): Promise<void> {
   app.get("/api/status", async () => {
     const config = loadConfig();
     const running = getRunningSessions();
+    const sources = getEnabledSources();
     return {
       status: "ok",
       runningCount: running.length,
@@ -61,48 +61,33 @@ export async function registerApiRoutes(app: FastifyInstance): Promise<void> {
       lastPollAt,
       nextPollAt,
       pollInterval: config.pollInterval,
+      sources: sources.map((s) => ({ type: s.type, enabled: s.enabled })),
     };
   });
 
   // List repos
   app.get("/api/repos", async () => {
-    const repos = getEnabledRepos();
-    return repos.map((r) => ({
+    const config = loadConfig();
+    return config.repos.map((r) => ({
       name: r.name,
-      github: r.github,
-      enabled: r.enabled,
+      remote: r.remote,
+      path: r.path,
     }));
   });
 
   // Issues for a specific repo
   app.get("/api/repos/:name/issues", async (request) => {
     const { name } = request.params as { name: string };
-    const config = loadConfig();
-    const repo = config.repos.find((r) => r.name === name);
-    if (!repo) return { error: "Repo not found" };
-
-    const issues = getIssuesByRepo(repo.github);
-    return issues.map((issue) => {
-      const labels = getIssueLabels(repo.github, issue.number);
-      return { ...issue, githubLabels: labels };
-    });
+    const issues = getIssuesByTargetRepo(name);
+    return issues;
   });
 
   // All issues
   app.get("/api/issues", async () => {
     const issues = getAllIssues();
-    const config = loadConfig();
     return issues.map((issue) => {
       const sessions = getSessionsByIssue(issue.id);
-      const labels = getIssueLabels(issue.repo, issue.number);
-      let status = "unknown";
-      if (labels.includes(config.doneLabel)) status = "done";
-      else if (labels.includes(config.processingLabel)) status = "processing";
-      else if (labels.includes(config.failedLabel)) status = "failed";
-      else if (labels.includes(config.triggerLabel)) status = "queued";
-      else status = "other";
-
-      return { ...issue, status, githubLabels: labels, sessions };
+      return { ...issue, sessions };
     });
   });
 
@@ -118,12 +103,17 @@ export async function registerApiRoutes(app: FastifyInstance): Promise<void> {
     const issue = getIssueById(parseInt(id, 10));
     if (!issue) return { error: "Issue not found" };
 
-    const config = loadConfig();
     try {
-      execSync(
-        `gh issue edit ${issue.number} --repo ${issue.repo} --remove-label "${config.failedLabel}" --add-label "${config.triggerLabel}"`,
-        { timeout: 15_000 }
-      );
+      const plugin = await resolvePlugin(issue.source_type);
+      const source = loadConfig().sources.find((s) => s.type === issue.source_type);
+      const ctx = { config: source?.config ?? {}, logger: log };
+
+      const failedLabel = ctx.config.failedLabel as string;
+      const triggerLabel = ctx.config.triggerLabel as string;
+
+      if (plugin.onStatusChange) {
+        await plugin.onStatusChange(ctx, issue.source_id, { from: failedLabel, to: triggerLabel });
+      }
       return { success: true };
     } catch (err: any) {
       return { error: err.message };
@@ -132,14 +122,14 @@ export async function registerApiRoutes(app: FastifyInstance): Promise<void> {
 
   // Manual poll trigger
   app.post("/api/poll", async () => {
-    const result = runPollCycle();
+    const result = await runPollCycle();
     return result;
   });
 
   // Webhook endpoint (optional — just triggers a poll)
   app.post("/api/webhook", async (_request, _reply) => {
     log.info("Received webhook event, triggering poll...");
-    const result = runPollCycle();
+    const result = await runPollCycle();
     return { triggered: true, ...result };
   });
 }

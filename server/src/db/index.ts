@@ -18,17 +18,29 @@ export function getDb(): Database.Database {
 }
 
 function migrate(db: Database.Database) {
+  // Check for old schema and handle clean break
+  const hasOldSchema = db.prepare("PRAGMA table_info(issues)").all()
+    .some((col: any) => col.name === "repo");
+
+  if (hasOldSchema) {
+    // Clean break: drop old table and recreate
+    db.exec("DROP TABLE IF EXISTS sessions");
+    db.exec("DROP TABLE IF EXISTS issues");
+  }
+
   db.exec(`
     CREATE TABLE IF NOT EXISTS issues (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      repo TEXT NOT NULL,
-      number INTEGER NOT NULL,
+      source_type TEXT NOT NULL,
+      source_id TEXT NOT NULL,
+      target_repo TEXT NOT NULL,
       url TEXT NOT NULL,
       title TEXT,
       tmux_session TEXT,
+      status TEXT NOT NULL DEFAULT 'queued',
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-      UNIQUE(repo, number)
+      UNIQUE(source_type, source_id)
     );
 
     CREATE TABLE IF NOT EXISTS sessions (
@@ -42,52 +54,80 @@ function migrate(db: Database.Database) {
       finished_at TEXT
     );
 
-    CREATE INDEX IF NOT EXISTS idx_issues_repo ON issues(repo);
+    CREATE INDEX IF NOT EXISTS idx_issues_target_repo ON issues(target_repo);
+    CREATE INDEX IF NOT EXISTS idx_issues_status ON issues(status);
     CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);
     CREATE INDEX IF NOT EXISTS idx_sessions_issue ON sessions(issue_id);
   `);
 }
 
-// --- Issue CRUD ---
+// --- Issue Types ---
 
 export interface Issue {
   id: number;
-  repo: string;
-  number: number;
+  source_type: string;
+  source_id: string;
+  target_repo: string;
   url: string;
   title: string | null;
   tmux_session: string | null;
+  status: string;
   created_at: string;
   updated_at: string;
 }
 
-export function upsertIssue(repo: string, number: number, url: string, title?: string): Issue {
+// --- Issue CRUD ---
+
+export function upsertIssue(
+  sourceType: string,
+  sourceId: string,
+  targetRepo: string,
+  url: string,
+  title?: string | null,
+): Issue {
   const d = getDb();
   d.prepare(
-    `INSERT INTO issues (repo, number, url, title) VALUES (?, ?, ?, ?)
-     ON CONFLICT(repo, number) DO UPDATE SET url = excluded.url, title = excluded.title, updated_at = datetime('now')`
-  ).run(repo, number, url, title ?? null);
-  return d.prepare("SELECT * FROM issues WHERE repo = ? AND number = ?").get(repo, number) as Issue;
+    `INSERT INTO issues (source_type, source_id, target_repo, url, title)
+     VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(source_type, source_id) DO UPDATE SET
+       target_repo = excluded.target_repo,
+       url = excluded.url,
+       title = excluded.title,
+       updated_at = datetime('now')`
+  ).run(sourceType, sourceId, targetRepo, url, title ?? null);
+  return d.prepare("SELECT * FROM issues WHERE source_type = ? AND source_id = ?")
+    .get(sourceType, sourceId) as Issue;
 }
 
-export function getIssue(repo: string, number: number): Issue | undefined {
-  return getDb().prepare("SELECT * FROM issues WHERE repo = ? AND number = ?").get(repo, number) as Issue | undefined;
+export function getIssue(sourceType: string, sourceId: string): Issue | undefined {
+  return getDb().prepare("SELECT * FROM issues WHERE source_type = ? AND source_id = ?")
+    .get(sourceType, sourceId) as Issue | undefined;
 }
 
-export function getIssuesByRepo(repo: string): Issue[] {
-  return getDb().prepare("SELECT * FROM issues WHERE repo = ? ORDER BY number DESC").all(repo) as Issue[];
+export function getIssueById(id: number): Issue | undefined {
+  return getDb().prepare("SELECT * FROM issues WHERE id = ?").get(id) as Issue | undefined;
+}
+
+export function getIssuesByTargetRepo(targetRepo: string): Issue[] {
+  return getDb().prepare("SELECT * FROM issues WHERE target_repo = ? ORDER BY updated_at DESC")
+    .all(targetRepo) as Issue[];
 }
 
 export function getAllIssues(): Issue[] {
   return getDb().prepare("SELECT * FROM issues ORDER BY updated_at DESC").all() as Issue[];
 }
 
-export function updateIssueTmux(repo: string, number: number, tmuxSession: string | null): void {
-  getDb().prepare("UPDATE issues SET tmux_session = ?, updated_at = datetime('now') WHERE repo = ? AND number = ?")
-    .run(tmuxSession, repo, number);
+export function updateIssueTmux(sourceType: string, sourceId: string, tmuxSession: string | null): void {
+  getDb().prepare("UPDATE issues SET tmux_session = ?, updated_at = datetime('now') WHERE source_type = ? AND source_id = ?")
+    .run(tmuxSession, sourceType, sourceId);
 }
 
-// --- Session CRUD ---
+export function updateIssueStatus(sourceType: string, sourceId: string, status: string): void {
+  getDb().prepare("UPDATE issues SET status = ?, updated_at = datetime('now') WHERE source_type = ? AND source_id = ?")
+    .run(status, sourceType, sourceId);
+}
+
+// --- Session Types ---
 
 export interface Session {
   id: number;
@@ -99,6 +139,8 @@ export interface Session {
   started_at: string;
   finished_at: string | null;
 }
+
+// --- Session CRUD ---
 
 export function createSession(issueId: number, tmuxSession: string): Session {
   const d = getDb();
@@ -112,15 +154,26 @@ export function getRunningSessions(): Session[] {
 }
 
 export function getSessionsByIssue(issueId: number): Session[] {
-  return getDb().prepare("SELECT * FROM sessions WHERE issue_id = ? ORDER BY started_at DESC").all(issueId) as Session[];
+  return getDb().prepare("SELECT * FROM sessions WHERE issue_id = ? ORDER BY started_at DESC")
+    .all(issueId) as Session[];
 }
 
 export function updateSessionStatus(
   sessionId: number,
   status: "done" | "failed",
-  prUrl?: string,
-  error?: string
+  prUrl?: string | null,
+  error?: string | null,
 ): void {
   getDb().prepare("UPDATE sessions SET status = ?, pr_url = ?, error = ?, finished_at = datetime('now') WHERE id = ?")
     .run(status, prUrl ?? null, error ?? null, sessionId);
+}
+
+/** Get running sessions joined with their issue info */
+export function getRunningSessionsWithIssues(): (Session & { source_type: string; source_id: string; target_repo: string })[] {
+  return getDb().prepare(`
+    SELECT s.*, i.source_type, i.source_id, i.target_repo
+    FROM sessions s
+    JOIN issues i ON s.issue_id = i.id
+    WHERE s.status = 'running'
+  `).all() as (Session & { source_type: string; source_id: string; target_repo: string })[];
 }

@@ -6,7 +6,8 @@ import { loadConfig } from "./config.js";
 import { getDb } from "./db/index.js";
 import { registerApiRoutes, startPoller } from "./routes/api.js";
 import { checkTmux } from "./services/tmux.js";
-import { getEnabledRepos } from "./config.js";
+import { getEnabledSources } from "./config.js";
+import { resolvePlugin } from "./plugins/loader.js";
 import { createLogger } from "./services/logger.js";
 
 const log = createLogger("server");
@@ -17,11 +18,34 @@ async function main() {
 
   const config = loadConfig();
 
-  // Initialize DB
+  // Initialize DB (handles old schema cleanup)
   getDb();
   log.info(`SQLite initialized at ${config.dbPath}`);
 
-  const repos = getEnabledRepos();
+  // Initialize plugins for each enabled source
+  const sources = getEnabledSources();
+  for (const source of sources) {
+    try {
+      const plugin = await resolvePlugin(source.type);
+      const ctx = { config: source.config, logger: createLogger(`plugin:${source.type}`) };
+
+      log.info(`Initializing plugin "${source.type}"...`);
+      await plugin.init(ctx);
+
+      const healthy = await plugin.test(ctx);
+      if (!healthy) {
+        log.warn(`Plugin "${source.type}" health check failed — source may not work correctly`);
+      } else {
+        log.info(`Plugin "${source.type}" initialized and healthy`);
+      }
+    } catch (err: any) {
+      log.error(`Plugin "${source.type}" failed to initialize: ${err.message}`);
+      source.enabled = false;
+      log.warn(`Source "${source.type}" has been disabled due to initialization failure`);
+    }
+  }
+
+  const enabledSources = sources.filter((s) => s.enabled);
 
   const app = Fastify({ logger: false });
 
@@ -58,10 +82,14 @@ async function main() {
   log.info(`🚀 Talos Loop running on http://localhost:${config.port}`);
   log.info(`📊 Dashboard: http://localhost:${config.port}`);
   log.info(`📡 API: http://localhost:${config.port}/api/status`);
-  log.info(`⏱  Polling every ${config.pollInterval / 1000}s for ${repos.length} repo(s)`);
+  log.info(`⏱  Polling every ${config.pollInterval / 1000}s for ${enabledSources.length} source(s)`);
+  log.info(`Sources:`);
+  for (const source of enabledSources) {
+    log.info(`  - ${source.type} (enabled: ${source.enabled})`);
+  }
   log.info(`Repos:`);
-  for (const repo of repos) {
-    log.info(`  - ${repo.github} (${repo.path})`);
+  for (const repo of config.repos) {
+    log.info(`  - ${repo.name} (${repo.path})`);
   }
 
   // Start the poller

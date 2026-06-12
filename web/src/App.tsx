@@ -14,12 +14,12 @@ import {
 
 interface Issue {
   id: number;
-  repo: string;
-  number: number;
+  source_type: string;
+  source_id: string;
+  target_repo: string;
   url: string;
   title: string | null;
   status: string;
-  githubLabels: string[];
   tmux_session: string | null;
   sessions: Session[];
   created_at: string;
@@ -43,6 +43,7 @@ interface Status {
   lastPollAt: string | null;
   nextPollAt: string | null;
   pollInterval: number;
+  sources?: { type: string; enabled: boolean }[];
 }
 
 const API = "";
@@ -61,6 +62,18 @@ function StatusBadge({ status }: { status: string }) {
     <span className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-medium ${c.cls}`}>
       <Icon className={`h-3 w-3 ${status === "processing" ? "animate-spin" : ""}`} />
       {c.label}
+    </span>
+  );
+}
+
+function SourceTypeBadge({ type }: { type: string }) {
+  const colors: Record<string, string> = {
+    github: "bg-gray-100 text-gray-700",
+  };
+  const cls = colors[type] || "bg-purple-100 text-purple-700";
+  return (
+    <span className={`inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide ${cls}`}>
+      {type}
     </span>
   );
 }
@@ -137,9 +150,9 @@ export default function App() {
     return () => clearInterval(interval);
   }, [fetchData]);
 
-  // Group issues by repo
+  // Group issues by target_repo
   const byRepo = issues.reduce<Record<string, Issue[]>>((acc, issue) => {
-    (acc[issue.repo] ??= []).push(issue);
+    (acc[issue.target_repo] ??= []).push(issue);
     return acc;
   }, {});
 
@@ -184,7 +197,7 @@ export default function App() {
             <GitBranch className="mx-auto mb-3 h-10 w-10 text-gray-400" />
             <p className="text-gray-500">No issues found yet.</p>
             <p className="mt-1 text-sm text-gray-400">
-              Label issues with <code className="rounded bg-gray-100 px-1">ready-for-agent</code> to
+              Configure sources in <code className="rounded bg-gray-100 px-1">config.json</code> to
               get started.
             </p>
           </div>
@@ -201,6 +214,7 @@ export default function App() {
                   <thead>
                     <tr className="border-b bg-gray-50">
                       <th className="px-4 py-2 text-left font-medium text-gray-600">Issue</th>
+                      <th className="px-4 py-2 text-left font-medium text-gray-600">Source</th>
                       <th className="px-4 py-2 text-left font-medium text-gray-600">Status</th>
                       <th className="px-4 py-2 text-left font-medium text-gray-600">PR</th>
                       <th className="px-4 py-2 text-left font-medium text-gray-600">Updated</th>
@@ -219,10 +233,13 @@ export default function App() {
                               rel="noopener noreferrer"
                               className="inline-flex items-center gap-1 text-blue-600 hover:underline"
                             >
-                              #{issue.number}
+                              #{issue.source_id}
                               <ExternalLink className="h-3 w-3" />
                             </a>
                             <span className="ml-2 text-gray-700">{issue.title}</span>
+                          </td>
+                          <td className="px-4 py-3">
+                            <SourceTypeBadge type={issue.source_type} />
                           </td>
                           <td className="px-4 py-3">
                             <StatusBadge status={issue.status} />
