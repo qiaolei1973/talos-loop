@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { GitHubIssueSourcePlugin } from "../index.js";
-import type { SourceContext } from "../../../types/plugin.js";
+import type { SourceContext, RepoRef } from "../../../types/plugin.js";
 
 // Mock child_process
 vi.mock("child_process", () => ({
@@ -21,22 +21,28 @@ import { execSync } from "child_process";
 
 const mockExecSync = execSync as unknown as ReturnType<typeof vi.fn>;
 
-function makeCtx(configOverrides: Record<string, unknown> = {}): SourceContext {
+const defaultRepo: RepoRef = {
+  name: "test-repo",
+  path: "/tmp/test-repo",
+  remote: "test/repo",
+};
+
+/**
+ * Build a SourceContext. By default it provides ctx.repo (so owner/repo and
+ * targetRepo are derived) and an empty config (default labels apply).
+ */
+function makeCtx(opts: {
+  repo?: RepoRef | null;
+  config?: Record<string, unknown>;
+} = {}): SourceContext {
   return {
-    config: {
-      repo: "test/repo",
-      targetRepo: "test-repo",
-      triggerLabel: "ready-for-agent",
-      processingLabel: "agent-processing",
-      doneLabel: "agent-done",
-      failedLabel: "agent-failed",
-      ...configOverrides,
-    },
+    config: opts.config ?? {},
     logger: {
       info: vi.fn(),
       warn: vi.fn(),
       error: vi.fn(),
     },
+    repo: opts.repo === null ? undefined : opts.repo ?? defaultRepo,
   };
 }
 
@@ -55,14 +61,17 @@ describe("GitHubIssueSourcePlugin", () => {
   });
 
   describe("init()", () => {
-    it("should create labels via gh CLI", async () => {
+    it("should create the four default labels via gh CLI against ctx.repo.remote", async () => {
       mockExecSync.mockReturnValue("");
       await plugin.init(makeCtx());
 
       const calls = mockExecSync.mock.calls.filter(
-        (c: any[]) => typeof c[0] === "string" && c[0].includes("gh label create")
+        (c: any[]) => typeof c[0] === "string" && c[0].includes("gh label create"),
       );
       expect(calls.length).toBe(4);
+      for (const c of calls) {
+        expect(c[0]).toContain("--repo test/repo");
+      }
     });
   });
 
@@ -98,6 +107,10 @@ describe("GitHubIssueSourcePlugin", () => {
       const byId = Object.fromEntries(issues.map((i) => [i.sourceId, i]));
       expect(byId["1"].state).toBe("queued");
       expect(byId["2"].state).toBe("processing");
+      // targetRepo comes from ctx.repo.name, not from config
+      expect(issues.every((i) => i.targetRepo === "test-repo")).toBe(true);
+      // gh commands target the resolved owner/repo
+      expect(mockExecSync.mock.calls.some((c: any[]) => c[0]?.includes?.("--repo test/repo"))).toBe(true);
       expect((issues[0] as any).metadata).toBeUndefined();
     });
 
@@ -121,6 +134,22 @@ describe("GitHubIssueSourcePlugin", () => {
         throw new Error("gh CLI error");
       });
       expect(await plugin.discover(makeCtx())).toEqual([]);
+    });
+
+    it("should honor config.repo overriding ctx.repo.remote", async () => {
+      const ctx = makeCtx({ config: { repo: "override/owner-repo" } });
+      mockExecSync.mockImplementation((cmd: string) => {
+        if (cmd.includes("agent-processing")) return "[]";
+        if (cmd.includes("ready-for-agent")) return "[]";
+        return "[]";
+      });
+      await plugin.discover(ctx);
+      const listCalls = mockExecSync.mock.calls.filter(
+        (c: any[]) => typeof c[0] === "string" && c[0].includes("gh issue list"),
+      );
+      for (const c of listCalls) {
+        expect(c[0]).toContain("--repo override/owner-repo");
+      }
     });
   });
 
@@ -164,6 +193,7 @@ describe("GitHubIssueSourcePlugin", () => {
 
       const cmd = mockExecSync.mock.calls.at(-1)![0] as string;
       expect(cmd).toContain("gh issue edit 42");
+      expect(cmd).toContain("--repo test/repo");
       expect(cmd).toContain(`--remove-label "ready-for-agent"`);
       expect(cmd).toContain(`--add-label "agent-processing"`);
     });
@@ -178,15 +208,29 @@ describe("GitHubIssueSourcePlugin", () => {
     });
   });
 
+  describe("resolveRuntime() error paths", () => {
+    it("should throw when neither config.repo nor ctx.repo.remote is available", async () => {
+      const ctx = makeCtx({ repo: { name: "r", path: "/tmp/r" } }); // remote omitted
+      await expect(plugin.discover(ctx)).rejects.toThrow(/owner\/repo/);
+    });
+
+    it("should throw when not bound to a repo (no owner/repo resolvable)", async () => {
+      const ctx = makeCtx({ repo: null });
+      // No ctx.repo → no remote to infer; error surfaces before the explicit repo check.
+      await expect(plugin.discover(ctx)).rejects.toThrow(/owner\/repo/);
+    });
+  });
+
   describe("onComment()", () => {
     it("should write temp file and call gh issue comment", async () => {
       mockExecSync.mockReturnValue("");
       await plugin.onComment(makeCtx(), "42", "✅ Done!");
 
       const commentCall = mockExecSync.mock.calls.find(
-        (c: any[]) => typeof c[0] === "string" && c[0].includes("gh issue comment")
+        (c: any[]) => typeof c[0] === "string" && c[0].includes("gh issue comment"),
       );
       expect(commentCall).toBeDefined();
+      expect((commentCall![0] as string)).toContain("--repo test/repo");
     });
   });
 });

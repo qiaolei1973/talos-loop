@@ -1,5 +1,5 @@
 import { FastifyInstance } from "fastify";
-import { loadConfig, getEnabledSources } from "../config.js";
+import { loadConfig, getEnabledSources, loadRepos, buildSourceContextForRepo } from "../config.js";
 import { getAllIssues, getIssuesByTargetRepo, getSessionsByIssue, getIssueById, type Issue } from "../db/index.js";
 import { pollAll } from "../services/poller.js";
 import { dispatch } from "../services/dispatcher.js";
@@ -80,8 +80,7 @@ export async function registerApiRoutes(app: FastifyInstance): Promise<void> {
 
   // List repos
   app.get("/api/repos", async () => {
-    const config = loadConfig();
-    return config.repos.map((r) => ({
+    return loadRepos().map((r) => ({
       name: r.name,
       remote: r.remote,
       path: r.path,
@@ -117,8 +116,7 @@ export async function registerApiRoutes(app: FastifyInstance): Promise<void> {
 
     try {
       const plugin = await resolvePlugin(issue.source_type);
-      const source = loadConfig().sources.find((s) => s.type === issue.source_type);
-      const ctx = { config: source?.config ?? {}, logger: log };
+      const ctx = buildSourceContextForRepo(issue.target_repo, log);
 
       await plugin.transition(ctx, issue.source_id, { from: "failed", to: "queued" });
       return { success: true };

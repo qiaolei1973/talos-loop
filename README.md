@@ -49,24 +49,24 @@ npm install
 
 ## 配置
 
-`config.json` 不纳入版本控制（含本地路径等环境相关信息），仓库提供了 `config.example.json` 作为模板：
+配置拆成两个文件，都不纳入版本控制（含本地路径等环境相关信息），仓库各提供一份 `*.example.json` 模板：
 
 ```bash
-cp config.example.json config.json   # 复制模板，再按自己的仓库修改
+cp config.example.json config.json   # 运行参数 + sources
+cp repos.example.json   repos.json   # 代码仓库（Claude 运行的地方）
 ```
+
+### `config.json` — 运行参数 + Issue 来源
 
 ```jsonc
 {
-  "repos": [                          // 代码仓库 —— Claude 运行的地方
-    { "name": "my-project", "remote": "owner/repo", "path": "/abs/path/to/local/clone" }
-  ],
-  "sources": [                        // Issue 来源 —— 每个 source 对应一个插件
+  "sources": [                        // Issue 来源 —— 每个 source 绑定一个 repo
     {
       "type": "github",               // 内置插件 "github"；外部插件填 npm 包名或本地路径
       "enabled": true,
-      "config": {                     // 插件特定配置（github 插件字段见下）
-        "repo": "owner/repo",
-        "targetRepo": "my-project",
+      "repo": "talos-deploy",         // 引用 repos.json 中的 repo（取 path 的 basename）
+      "config": {                     // 可选：插件特定覆盖（默认无需配置，见下）
+        "repo": "owner/repo",         //   可选：覆盖该 source 的 GitHub owner/repo
         "triggerLabel": "ready-for-agent",
         "processingLabel": "agent-processing",
         "doneLabel": "agent-done",
@@ -91,6 +91,23 @@ cp config.example.json config.json   # 复制模板，再按自己的仓库修�
 | `claudeTimeout` | `600` | Claude 会话超时（秒） |
 | `dbPath` | `<root>/server/data/talos-loop.db` | SQLite 数据库路径 |
 
+**`source.config`（GitHub 插件，全部可选）**：默认即可，无需声明。内置四态标签 `ready-for-agent` / `agent-processing` / `agent-done` / `agent-failed` 是默认值；GitHub 的 `owner/repo` 默认取该 source 绑定 repo 的 `remote`。只有想覆盖标签名、或把一个 source 指向另一个 GitHub 仓库时，才需要填写对应字段。
+
+### `repos.json` — 代码仓库
+
+一个数组，每项只需本地路径（`name` 取路径 basename，`remote` 从该路径的 `git remote` 自动推断为 `owner/repo`）：
+
+```jsonc
+[
+  { "path": "/abs/path/to/local/clone" },
+  { "path": "/path/to/other-repo", "remote": "owner/other-repo" }   // remote 可选覆盖
+]
+```
+
+`source.repo` 用 basename 引用此处的仓库；启动时若引用了未声明的 repo，该 source 会被跳过并告警。
+
+> **迁移（旧版 → 新版）**：把旧的 `config.json` 中 `repos` 数组整体搬到 `repos.json`（每项去掉 `name`，只保留 `path`，`remote` 可选）；把每个 `source.config.repo`（GitHub owner/repo）与 `source.config.targetRepo`（旧字段，已废弃）去掉，改为顶层 `source.repo` = basename；标签字段若与默认值一致可直接删除。数据库无需迁移（`target_repo` 仍存 basename）。
+
 ### 插件（Issue Source）
 
 `source.type` 决定使用哪个插件：
@@ -100,7 +117,7 @@ cp config.example.json config.json   # 复制模板，再按自己的仓库修�
 
 `type`（包名）仅用于加载/注册；每个插件在自身声明 `name`（alias），日志输出和 Dashboard 展示都使用这个 `name`。例如 `@acme/source-jira` 包加载后，日志与界面会显示 `jira`。
 
-插件还负责 Issue 状态的双向翻译——把源机制（GitHub 标签、Jira 状态等）映射到 talos-loop 的四个标准状态（见下文「Issue 状态生命周期」）。核心代码只读 `type`/`enabled` 这类基础字段，其余插件配置完全由插件自身解释。
+插件还负责 Issue 状态的双向翻译——把源机制（GitHub 标签、Jira 状态等）映射到 talos-loop 的四个标准状态（见下文「Issue 状态生命周期」）。核心代码只读 `type`/`enabled`/`repo` 这类基础字段，其余插件配置完全由插件自身解释。
 
 ## 运行
 
@@ -156,7 +173,8 @@ npm start            # 启动服务，监听 0.0.0.0:3100
 
 ```
 talos-loop/
-├── config.example.json          # 配置模板（config.json 不纳入版本控制）
+├── config.example.json          # 运行参数 + sources 模板（config.json 不纳入版本控制）
+├── repos.example.json           # 代码仓库模板（repos.json 不纳入版本控制）
 ├── package.json                 # 根 workspace（concurrently）
 ├── server/
 │   ├── package.json
@@ -203,7 +221,7 @@ queued ──► processing ──┬──► done     (PR 创建成功)
 - 派发前 Dispatcher 会实时复查 Issue 状态，只对仍处于 `queued` 的 Issue 派发，防止过期数据触发重复处理。
 - 状态迁移通过插件的 `transition({ from, to })` 由核心发起、插件执行；`getStatus()` 用于派发前的实时复查，返回 `null` 表示该 Issue 已不在管线任一状态。
 
-对 GitHub 插件，这四个状态分别由 `ready-for-agent` / `agent-processing` / `agent-done` / `agent-failed` 标签承载（标签名在插件自身的 `config` 中配置，核心不读取）。
+对 GitHub 插件，这四个状态默认由 `ready-for-agent` / `agent-processing` / `agent-done` / `agent-failed` 标签承载（无需声明，需要时可在 `source.config` 中按需覆盖，核心不读取）。
 
 ## 日志
 

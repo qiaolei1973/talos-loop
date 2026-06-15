@@ -1,0 +1,4 @@
+[
+  { "path": "/home/agent/talos-deploy" },
+  { "path": "/home/agent/skills", "remote": "qiaolei1973/skills" }
+]

@@ -2,7 +2,7 @@ import { execSync } from "child_process";
 import fs from "fs";
 import os from "os";
 import path from "path";
-import { loadConfig, getRepoByName } from "../config.js";
+import { loadConfig, buildSourceContextForRepo } from "../config.js";
 import {
   getDb,
   getRunningSessionsWithIssues,
@@ -13,7 +13,6 @@ import {
 } from "../db/index.js";
 import { resolvePlugin } from "../plugins/loader.js";
 import type { PollResult, IssueEntry } from "./poller.js";
-import type { SourceContext } from "../types/plugin.js";
 import * as tmux from "./tmux.js";
 import { createLogger } from "./logger.js";
 
@@ -58,16 +57,6 @@ function findPrUrl(remote: string, sourceId: string): string | null {
   }
 }
 
-/** Build SourceContext for a given source type by looking up its config */
-function buildSourceContext(sourceType: string): SourceContext {
-  const config = loadConfig();
-  const source = config.sources.find((s) => s.type === sourceType);
-  return {
-    config: source?.config ?? {},
-    logger: log,
-  };
-}
-
 /** Check running sessions, detect completions */
 async function checkRunningSessions(): Promise<{ completed: number; failed: number }> {
   const running = getRunningSessionsWithIssues();
@@ -82,18 +71,17 @@ async function checkRunningSessions(): Promise<{ completed: number; failed: numb
       continue;
     }
 
-    // Resolve repo info for PR search
-    const repo = getRepoByName(target_repo);
-    const remote = repo?.remote ?? target_repo;
+    // Get plugin for status callbacks, resolving the bound repo for the context
+    const plugin = await resolvePlugin(source_type);
+    const ctx = buildSourceContextForRepo(target_repo, log);
+    const sourceName = plugin.name;
+
+    // Resolve remote for PR search (fall back to the repo-name key)
+    const remote = ctx.repo?.remote ?? target_repo;
 
     // Session has exited — determine result
     const prMatch = lastOutput.match(/https:\/\/github\.com\/[^/\s]+\/[^/\s]+\/pull\/\d+/);
     const prUrl = prMatch ? prMatch[0] : findPrUrl(remote, source_id);
-
-    // Get plugin for status callbacks
-    const plugin = await resolvePlugin(source_type);
-    const ctx = buildSourceContext(source_type);
-    const sourceName = plugin.name;
 
     if (prUrl) {
       log.info(`✅ ${sourceName}:${source_id} done — ${prUrl}`);
@@ -157,11 +145,12 @@ async function dispatchNew(pollResults: PollResult[]): Promise<number> {
 
     // Resolve plugin + context up front so the display name is available in logs
     const plugin = await resolvePlugin(sourceType);
-    const ctx = buildSourceContext(sourceType);
+    const ctx = buildSourceContextForRepo(targetRepo, log);
     const sourceName = plugin.name;
 
-    // Resolve repo for path and remote
-    const repo = getRepoByName(targetRepo);
+    // Resolve repo path for the worktree. ctx.repo is undefined when the repo
+    // isn't declared in repos.json (config drift) — can't dispatch without a path.
+    const repo = ctx.repo;
     if (!repo) {
       log.error(`Repo "${targetRepo}" not found for ${sourceName}:${sourceId}`);
       continue;

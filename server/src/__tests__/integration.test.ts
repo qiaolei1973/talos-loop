@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from "vitest";
 import type {
   IssueSourcePlugin,
   SourceContext,
+  RepoRef,
   RawIssue,
   IssueStatus,
   IssueState,
@@ -90,5 +91,24 @@ describe("Issue-state contract", () => {
     expect(calls).toEqual([{ from: "queued", to: "processing" }]);
 
     expect(await plugin.test(ctx)).toBe(true);
+  });
+
+  it("SourceContext optionally carries a resolved repo (name/path/remote)", () => {
+    const repo: RepoRef = { name: "talos-deploy", path: "/home/agent/talos-deploy", remote: "qiaolei1973/talos-deploy" };
+    const ctx: SourceContext = {
+      config: {},
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as any,
+      repo,
+    };
+    expect(ctx.repo?.name).toBe("talos-deploy");
+    expect(ctx.repo?.path).toBe("/home/agent/talos-deploy");
+    expect(ctx.repo?.remote).toBe("qiaolei1973/talos-deploy");
+
+    // repo is optional — a context without it still satisfies the interface
+    const bareCtx: SourceContext = {
+      config: {},
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as any,
+    };
+    expect(bareCtx.repo).toBeUndefined();
   });
 });
