@@ -8,6 +8,7 @@ import {
   getIssue,
   getRunningSessions,
   markSessionSkipped,
+  setSessionPrUrl,
   updateIssueStatus,
   updateIssueTmux,
   type Issue,
@@ -131,11 +132,13 @@ export async function registerApiRoutes(app: FastifyInstance): Promise<void> {
     return getSessionsByIssue(parseInt(id, 10));
   });
 
-  // Agent signal: skip the issue (cannot complete the task).
-  app.post("/api/projects/:projectId/issues/:sourceId/skip", async (request) => {
-    const { projectId, sourceId } = request.params as { projectId: string; sourceId: string };
-    const { reason, targetRepo } = (request.body ?? {}) as { reason?: string; targetRepo?: string };
-    if (!targetRepo) return { error: "targetRepo required" };
+  // Unified agent-signal route. `:action` dispatches to the matching plugin
+  // method. New capabilities need no new route — a plugin just declares them via
+  // capabilities() and (for non-standard actions) the dispatcher grows a case.
+  app.post("/api/projects/:projectId/issues/:sourceId/actions/:action", async (request, reply) => {
+    const { projectId, sourceId, action } = request.params as { projectId: string; sourceId: string; action: string };
+    const body = (request.body ?? {}) as Record<string, unknown>;
+    const targetRepo = body.targetRepo as string | undefined;
 
     const project = getProjectById(projectId);
     if (!project) return { error: `Unknown projectId "${projectId}"` };
@@ -143,39 +146,48 @@ export async function registerApiRoutes(app: FastifyInstance): Promise<void> {
     try {
       const plugin = await resolvePlugin(project.projectType);
       const ctx = buildProjectContext(project, log);
-      await plugin.skip(ctx, sourceId, targetRepo, reason ?? "No reason provided");
 
-      // Finalize locally: mark the running session skipped, return the issue to
-      // queued (Ready), and clear the tmux session pointer.
-      const issue = getIssue(projectId, sourceId);
-      if (issue) {
-        markSessionSkipped(issue.id, reason ?? "No reason provided");
-        updateIssueStatus(projectId, sourceId, "queued");
-        updateIssueTmux(projectId, sourceId, null);
+      switch (action) {
+        case "submit-pr": {
+          const branch = body.branch as string | undefined;
+          if (!targetRepo || !branch) return { error: "targetRepo and branch required" };
+          if (!plugin.submitPr) return { error: "Plugin does not support submit-pr" };
+          // Single responsibility: the plugin creates the PR and returns its URL;
+          // we only persist it so checkRunningSessions finds it on the session.
+          const prUrl = await plugin.submitPr(ctx, sourceId, branch, targetRepo);
+          const issue = getIssue(projectId, sourceId);
+          if (issue) setSessionPrUrl(issue.id, prUrl);
+          return { success: true, prUrl };
+        }
+        case "comment": {
+          const message = body.message as string | undefined;
+          if (!targetRepo || !message) return { error: "targetRepo and message required" };
+          if (!plugin.onComment) return { error: "Plugin does not support comments" };
+          await plugin.onComment(ctx, sourceId, message, targetRepo);
+          return { success: true };
+        }
+        case "skip": {
+          if (!targetRepo) return { error: "targetRepo required" };
+          const reason = (body.reason as string | undefined) ?? "No reason provided";
+          await plugin.skip(ctx, sourceId, targetRepo, reason);
+          // Coordination DB ops (intentional, route-layer glue): mark the running
+          // session skipped, return the issue to queued (Ready), and clear the
+          // tmux pointer — otherwise checkRunningSessions would double-process an
+          // already-resolved session.
+          const issue = getIssue(projectId, sourceId);
+          if (issue) {
+            markSessionSkipped(issue.id, reason);
+            updateIssueStatus(projectId, sourceId, "queued");
+            updateIssueTmux(projectId, sourceId, null);
+          }
+          return { success: true };
+        }
+        default:
+          reply.code(400);
+          return { error: `Unknown action "${action}"` };
       }
-      return { success: true };
     } catch (err: any) {
-      log.error(`Skip failed for ${projectId}/${sourceId}: ${err.message}`);
-      return { error: err.message };
-    }
-  });
-
-  // Agent signal: post a comment on the issue.
-  app.post("/api/projects/:projectId/issues/:sourceId/comment", async (request) => {
-    const { projectId, sourceId } = request.params as { projectId: string; sourceId: string };
-    const { message, targetRepo } = (request.body ?? {}) as { message?: string; targetRepo?: string };
-    if (!targetRepo || !message) return { error: "targetRepo and message required" };
-
-    const project = getProjectById(projectId);
-    if (!project) return { error: `Unknown projectId "${projectId}"` };
-
-    try {
-      const plugin = await resolvePlugin(project.projectType);
-      if (!plugin.onComment) return { error: "Plugin does not support comments" };
-      const ctx = buildProjectContext(project, log);
-      await plugin.onComment(ctx, sourceId, message, targetRepo);
-      return { success: true };
-    } catch (err: any) {
+      log.error(`Action ${action} failed for ${projectId}/${sourceId}: ${err.message}`);
       return { error: err.message };
     }
   });

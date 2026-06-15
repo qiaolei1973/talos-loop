@@ -10,6 +10,7 @@ import type {
   IssueStatus,
   IssueState,
   StatusTransition,
+  PluginCapability,
 } from "../../types/plugin.js";
 
 /**
@@ -252,6 +253,33 @@ export class GitHubIssueSourcePlugin implements IssueSourcePlugin {
 
     // Return the board status to Ready (the issue stays parked via the skip label).
     await this.transition(ctx, sourceId, { from: "processing", to: "queued" }, targetRepo);
+  }
+
+  capabilities(): PluginCapability[] {
+    return [
+      { action: "submit-pr", description: "完成编码后提交 PR", params: [{ name: "branch", description: "PR 源分支名" }] },
+      { action: "comment", description: "在工作项留言", params: [{ name: "message", description: "留言内容" }] },
+      { action: "skip", description: "放弃任务", params: [{ name: "reason", description: "跳过原因" }] },
+    ];
+  }
+
+  async submitPr(ctx: ProjectContext, sourceId: string, branch: string, targetRepo: string): Promise<string> {
+    const repo = this.repoByName(ctx, targetRepo);
+    if (!repo?.remote) {
+      throw new Error(`submitPr: repo "${targetRepo}" has no remote`);
+    }
+    // Single responsibility: create the PR and return its URL. The dispatcher
+    // performs session finalization (transition, comment, status) once it reads
+    // this URL back from the stored session.
+    const title = `Closes #${sourceId}`;
+    const raw = execSync(
+      `gh pr create --head ${branch} --base main --title "${title}" --repo ${repo.remote} --json url`,
+      { encoding: "utf-8", timeout: 30_000, stdio: "pipe" },
+    );
+    const url = (JSON.parse(raw) as { url?: string }).url;
+    if (!url) throw new Error(`submitPr: could not parse PR URL from gh output for ${repo.remote}#${sourceId}`);
+    ctx.logger.info(`Created PR for ${repo.remote}#${sourceId} from branch ${branch}: ${url}`);
+    return url;
   }
 
   // --- internals ---

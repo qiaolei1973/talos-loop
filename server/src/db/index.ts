@@ -193,6 +193,18 @@ export function markSessionSkipped(issueId: number, reason: string): void {
   ).run(reason, issueId);
 }
 
+/**
+ * Record the PR URL on an issue's currently-running session. Called by the
+ * submit-pr action handler so checkRunningSessions classifies the (eventually
+ * dead) session as done from stored state — without parsing tmux output. The
+ * session stays `running` until checkRunningSessions performs the done-flow
+ * finalization, which is how double-processing is prevented.
+ */
+export function setSessionPrUrl(issueId: number, prUrl: string): void {
+  getDb().prepare("UPDATE sessions SET pr_url = ? WHERE issue_id = ? AND status = 'running'")
+    .run(prUrl, issueId);
+}
+
 /** Get running sessions joined with their issue info */
 export function getRunningSessionsWithIssues(): (Session & { project_id: string; project_type: string; source_id: string; target_repo: string })[] {
   return getDb().prepare(`

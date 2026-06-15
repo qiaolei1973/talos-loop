@@ -1,4 +1,3 @@
-import { execSync } from "child_process";
 import * as fs from "fs";
 import os from "os";
 import path from "path";
@@ -12,6 +11,7 @@ import {
   updateIssueStatus,
 } from "../db/index.js";
 import { resolvePlugin } from "../plugins/loader.js";
+import type { IssueSourcePlugin, PluginCapability } from "../types/plugin.js";
 import type { PollResult, IssueEntry } from "./poller.js";
 import * as tmux from "./tmux.js";
 import { createLogger } from "./logger.js";
@@ -25,6 +25,11 @@ export interface DispatchResult {
   idle: boolean;
 }
 
+/** A plugin's declared capabilities, or an empty list if it declares none. */
+function pluginCapabilities(plugin: IssueSourcePlugin): PluginCapability[] {
+  return plugin.capabilities?.() ?? [];
+}
+
 function buildPrompt(
   sourceId: string,
   url: string,
@@ -32,12 +37,19 @@ function buildPrompt(
   projectId: string,
   serverBaseUrl: string,
   targetRepo: string,
+  capabilities: PluginCapability[],
 ): string {
   // projectId is "owner/number" — its "/" is a path delimiter, so it must be
   // percent-encoded here or the route (/api/projects/:projectId/...) won't match.
   const encodedProject = encodeURIComponent(projectId);
-  const skipUrl = `${serverBaseUrl}/api/projects/${encodedProject}/issues/${sourceId}/skip`;
-  const commentUrl = `${serverBaseUrl}/api/projects/${encodedProject}/issues/${sourceId}/comment`;
+  const actionsBase = `${serverBaseUrl}/api/projects/${encodedProject}/issues/${sourceId}/actions`;
+  // The API block is rendered from the plugin's declared capabilities, so the
+  // prompt is always in sync with what the plugin supports — no dispatcher edit
+  // is needed to surface a new action.
+  const actionLines = capabilities.map((cap) => {
+    const params = cap.params.map((p) => p.name).join(", ");
+    return `- ${cap.action}：${cap.description}${params ? ` | 参数：${params}` : ""}`;
+  });
   return [
     `你是一个自动化编码代理。请实现以下 Issue: ${url}`,
     ``,
@@ -45,30 +57,12 @@ function buildPrompt(
     `- 阅读并理解 issue 内容`,
     `- 使用 git worktree 隔离工作（自行决定 worktree 路径和分支名，请使用语义化的分支名）`,
     `- 在 worktree 中完成所有开发工作`,
-    `- 完成后提交代码，推送分支，并创建 Pull Request 关联 Issue`,
+    `- 完成后提交代码并推送分支，再调用 submit-pr 操作创建关联 Issue 的 Pull Request（传入你的分支名）`,
     `- 最后清理 worktree：cd ${repoPath} && git worktree remove <你的worktree路径>`,
     ``,
-    `与 talos-loop 通信（JSON body，targetRepo 固定为 "${targetRepo}"）：`,
-    `- 若判定无法完成该任务（需求不足、仓库错误等），调用 skip 接口放弃（不要硬编码跳过）：`,
-    `    curl -s -X POST ${skipUrl} -H 'Content-Type: application/json' -d '{"reason":"<跳过原因>","targetRepo":"${targetRepo}"}'`,
-    `- 如需在 issue 留言：`,
-    `    curl -s -X POST ${commentUrl} -H 'Content-Type: application/json' -d '{"message":"<内容>","targetRepo":"${targetRepo}"}'`,
-    ``,
-    `完成后在输出中单独一行输出 PR 的 URL。`,
+    `与 talos-loop 通信（POST ${actionsBase}/{action}，JSON body 含 targetRepo: "${targetRepo}"）：`,
+    ...actionLines.map((line) => `    ${line}`),
   ].join("\n");
-}
-
-/** Use gh CLI to find a PR that references the issue (any state: open, merged, closed) */
-function findPrUrl(remote: string, sourceId: string): string | null {
-  try {
-    const result = execSync(
-      `gh pr list --repo ${remote} --state all --search "fixes #${sourceId}" --json url --jq '.[0].url'`,
-      { timeout: 15_000, encoding: "utf-8", stdio: "pipe" },
-    ).trim();
-    return result || null;
-  } catch {
-    return null;
-  }
 }
 
 /** Check running sessions; for each that has exited, classify the outcome. */
@@ -78,30 +72,24 @@ export async function checkRunningSessions(): Promise<{ completed: number; faile
   let failed = 0;
 
   for (const { project_id, project_type, source_id, target_repo, ...session } of running) {
-    // Capture pane output while the session is still alive (before the isAlive check).
-    const lastOutput = tmux.captureOutput(session.tmux_session);
     if (tmux.isAlive(session.tmux_session)) continue;
 
-    // Sessions skipped via the HTTP API are no longer 'running' (the handler moved
-    // them to 'skipped' and returned the issue to Ready), so they do not appear
-    // here — the skip path needs no further transition or comment.
+    // Sessions skipped or completed via the HTTP API are no longer 'running'
+    // (skip → 'skipped'; submit-pr leaves status 'running' but records pr_url),
+    // so the pr_url set by the submit-pr action is the single source of truth for
+    // completion — tmux output is no longer parsed for a PR URL.
 
     const plugin = await resolvePlugin(project_type);
     const ctx = buildProjectContextForIssue(project_id, log);
     const sourceName = plugin.name;
-    const repo = ctx.repos.find((r) => r.name === target_repo);
-    const remote = repo?.remote ?? target_repo;
 
-    const prMatch = lastOutput.match(/https:\/\/github\.com\/[^/\s]+\/[^/\s]+\/pull\/\d+/);
-    const prUrl = prMatch ? prMatch[0] : findPrUrl(remote, source_id);
-
-    if (prUrl) {
-      log.info(`✅ ${sourceName}:${source_id} done — ${prUrl}`);
-      updateSessionStatus(session.id, "done", prUrl);
+    if (session.pr_url) {
+      log.info(`✅ ${sourceName}:${source_id} done — ${session.pr_url}`);
+      updateSessionStatus(session.id, "done", session.pr_url);
       updateIssueStatus(project_id, source_id, "done");
       await plugin.transition(ctx, source_id, { from: "processing", to: "done" }, target_repo);
       if (plugin.onComment) {
-        await plugin.onComment(ctx, source_id, `✅ Agent completed. PR: ${prUrl}`, target_repo);
+        await plugin.onComment(ctx, source_id, `✅ Agent completed. PR: ${session.pr_url}`, target_repo);
       }
       updateIssueTmux(project_id, source_id, null);
       completed++;
@@ -109,6 +97,7 @@ export async function checkRunningSessions(): Promise<{ completed: number; faile
       // Infrastructure failure: silently return the issue to Ready so the next
       // poll auto-retries. The error tail is recorded on the session and surfaced
       // in the dashboard only — no comment is posted.
+      const lastOutput = tmux.captureOutput(session.tmux_session);
       const tail = lastOutput.trim().slice(-500) || "Session exited without creating a PR";
       log.warn(`⚠️ ${sourceName}:${source_id} infrastructure failure — returning to Ready (error in dashboard)`);
       updateSessionStatus(session.id, "failed", undefined, tail);
@@ -167,7 +156,8 @@ export async function dispatchNew(pollResults: PollResult[]): Promise<number> {
     }
 
     const session = tmux.sessionName(sourceName, targetRepo, sourceId);
-    const prompt = buildPrompt(sourceId, issue.url, repo.path, projectId, config.serverBaseUrl, targetRepo);
+    const capabilities = pluginCapabilities(plugin);
+    const prompt = buildPrompt(sourceId, issue.url, repo.path, projectId, config.serverBaseUrl, targetRepo, capabilities);
 
     const promptFile = path.join(os.tmpdir(), `tl-prompt-${session}.txt`);
     fs.writeFileSync(promptFile, prompt, "utf-8");

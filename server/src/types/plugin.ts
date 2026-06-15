@@ -24,6 +24,31 @@ import type { Logger } from "../services/logger.js";
  */
 export type IssueState = "queued" | "processing" | "done";
 
+/**
+ * A single named parameter of a plugin action, surfaced to the agent in the
+ * prompt so it knows which body fields to send. `description` is for future
+ * tooling; the prompt renders only the `name`s.
+ */
+export interface PluginCapabilityParam {
+  name: string;
+  description: string;
+}
+
+/**
+ * A self-described action a plugin exposes to the agent. The unified
+ * `/actions/:action` route dispatches by `action`; `buildPrompt` renders the
+ * full list so the prompt stays in sync with what the plugin supports without
+ * any dispatcher changes. `params` are the JSON body fields beyond the shared
+ * `targetRepo`.
+ */
+export interface PluginCapability {
+  /** Route segment under /actions/:action, e.g. "submit-pr", "comment", "skip". */
+  action: string;
+  /** Human-readable summary shown in the agent prompt. */
+  description: string;
+  params: PluginCapabilityParam[];
+}
+
 export interface IssueSourcePlugin {
   /** Display name / alias. Shown in logs and the UI. The package name (config `projectType`) is only used to load the plugin. */
   name: string;
@@ -56,6 +81,22 @@ export interface IssueSourcePlugin {
    * issue lives in (a project may span multiple repos).
    */
   onComment?(ctx: ProjectContext, sourceId: string, comment: string, targetRepo: string): Promise<void>;
+  /**
+   * Declare the actions this plugin exposes to the agent. The unified
+   * `/actions/:action` route dispatches by the capability `action`, and
+   * `buildPrompt` renders this list verbatim. Intentionally static (no context):
+   * action URLs follow a fixed pattern derivable from projectId/sourceId, so the
+   * plugin only describes *what* it can do, not *where*. Omit if the plugin has
+   * no agent-facing actions.
+   */
+  capabilities?(): PluginCapability[];
+  /**
+   * Create a pull request for `branch` against the project's target branch and
+   * return its URL. Single responsibility: create the PR and return the URL —
+   * all session finalization (transition, comment, DB updates) stays in the
+   * dispatcher/route layer. Invoked via the `submit-pr` action.
+   */
+  submitPr?(ctx: ProjectContext, sourceId: string, branch: string, targetRepo: string): Promise<string>;
   /**
    * The agent has determined it cannot complete the task (insufficient
    * requirements, wrong repo, ...). The plugin should make this durable and
