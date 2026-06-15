@@ -1,0 +1,12 @@
+[
+  {
+    "projectId": "owner/1",
+    "projectType": "github",
+    "enabled": true,
+    "repos": [
+      { "path": "/abs/path/to/local/clone" },
+      { "path": "/abs/path/to/other-repo", "remote": "owner/other-repo" }
+    ],
+    "config": {}
+  }
+]

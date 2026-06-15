@@ -1,13 +1,7 @@
 {
-  "sources": [
-    {
-      "type": "github",
-      "enabled": true,
-      "repo": "talos-deploy"
-    }
-  ],
   "port": 3100,
   "pollInterval": 60000,
   "maxParallel": 1,
-  "claudeTimeout": 600
+  "claudeTimeout": 600,
+  "serverBaseUrl": "http://127.0.0.1:3100"
 }
