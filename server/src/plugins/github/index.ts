@@ -4,7 +4,8 @@ import os from "os";
 import path from "path";
 import type {
   IssueSourcePlugin,
-  SourceContext,
+  ProjectContext,
+  RepoRef,
   RawIssue,
   IssueStatus,
   IssueState,
@@ -12,124 +13,164 @@ import type {
 } from "../../types/plugin.js";
 
 /**
- * Default label vocabulary. Used as-is unless overridden per-source via the flat
- * optional fields below. Core never reads these — they live entirely in the plugin.
+ * Default label vocabulary. `ready-for-agent` is a permanent eligibility
+ * marker set during PRD authoring (never modified by talos-loop); `skipped`
+ * is the durable skip marker the plugin applies. Both may be overridden via
+ * project `config`. Core never reads these — they live entirely in the plugin.
  */
 const DEFAULT_TRIGGER = "ready-for-agent";
-const DEFAULT_PROCESSING = "agent-processing";
-const DEFAULT_DONE = "agent-done";
-const DEFAULT_FAILED = "agent-failed";
+const DEFAULT_SKIP = "skipped";
 
-/** GitHub plugin config shape — everything optional (defaults apply); `repo` overrides the bound repo's remote. */
+/** Per-project cached metadata resolved once from the GitHub Projects API. */
+interface ProjectMeta {
+  projectNodeId: string;             // PVT_xxx
+  statusFieldId: string;             // PVTSSF_xxx (the "Status" single-select field)
+  options: Map<string, string>;      // normalized option name → option id
+}
+
 interface GitHubConfig {
-  repo?: string;                // "owner/repo" override; defaults to ctx.repo.remote
   triggerLabel?: string;
-  processingLabel?: string;
-  doneLabel?: string;
-  failedLabel?: string;
+  skipLabel?: string;
 }
 
-interface GitHubRuntime {
-  repo: string;                 // resolved "owner/repo"
-  triggerLabel: string;
-  processingLabel: string;
-  doneLabel: string;
-  failedLabel: string;
-  repoName: string;             // ctx.repo.name (RawIssue.targetRepo)
-}
-
-/** Resolve runtime config: merge flat overrides with defaults, derive "owner/repo" and targetRepo from ctx. */
-function resolveRuntime(ctx: SourceContext): GitHubRuntime {
+/** Resolve the trigger/skip labels from config (defaults apply). */
+function resolveLabels(ctx: ProjectContext): { trigger: string; skip: string } {
   const c = (ctx.config ?? {}) as GitHubConfig;
-  const repo = c.repo ?? ctx.repo?.remote;
-  if (!repo) {
-    throw new Error(
-      "GitHub source cannot resolve 'owner/repo': set `repo` in source.config or bind a repo whose `git remote` can be inferred.",
-    );
-  }
-  if (!ctx.repo) {
-    throw new Error("GitHub source is not bound to a repo — check the source's `repo` field and repos.json.");
-  }
   return {
-    repo,
-    repoName: ctx.repo.name,
-    triggerLabel: c.triggerLabel ?? DEFAULT_TRIGGER,
-    processingLabel: c.processingLabel ?? DEFAULT_PROCESSING,
-    doneLabel: c.doneLabel ?? DEFAULT_DONE,
-    failedLabel: c.failedLabel ?? DEFAULT_FAILED,
+    trigger: c.triggerLabel ?? DEFAULT_TRIGGER,
+    skip: c.skipLabel ?? DEFAULT_SKIP,
   };
 }
 
-interface GhIssue {
-  number: number;
-  title: string;
-  url: string;
-  labels: { name: string }[];
+interface GhItem {
+  id: string;                  // PVTI_xxx item node id
+  status: string;              // option name (e.g. "Ready", "In progress")
+  content: {
+    number: number;
+    title: string;
+    url: string;
+    repository: string;        // "owner/repo"
+    type: string;
+  } | null;
 }
+
+/** Normalize a project status name for tolerant matching: "In progress" → "inprogress". */
+function norm(name: string): string {
+  return name.toLowerCase().replace(/\s+/g, "");
+}
+
+/** Parse "owner/number" → { owner, number }. Throws on malformed input. */
+function parseProjectId(projectId: string): { owner: string; number: number } {
+  const m = projectId.match(/^([^/]+)\/(\d+)$/);
+  if (!m) throw new Error(`Invalid projectId "${projectId}" — expected "owner/number" (e.g. "qiaolei1973/1")`);
+  return { owner: m[1], number: parseInt(m[2], 10) };
+}
+
+/** Map a core state to the GitHub Projects status option name. */
+function stateToStatusName(state: IssueState): string {
+  switch (state) {
+    case "queued": return "Ready";
+    case "processing": return "In progress";
+    case "done": return "In review";
+  }
+}
+
+/** Marker embedded in config-drift comments so we don't spam an issue every poll. */
+const DRIFT_MARKER = "talos-loop config-drift";
 
 export class GitHubIssueSourcePlugin implements IssueSourcePlugin {
   name = "github";
 
-  async init(ctx: SourceContext): Promise<void> {
-    const rt = resolveRuntime(ctx);
-    const labels = [
-      { name: rt.triggerLabel, color: "0075CA", desc: "Ready for agent to process" },
-      { name: rt.processingLabel, color: "FBCA04", desc: "Agent is processing this issue" },
-      { name: rt.doneLabel, color: "0E8A16", desc: "Agent completed, PR created" },
-      { name: rt.failedLabel, color: "E1141B", desc: "Agent processing failed" },
-    ];
-    for (const label of labels) {
+  /** Per-project cache keyed by projectId. The plugin is a singleton (one per type). */
+  private cache = new Map<string, ProjectMeta>();
+
+  async init(ctx: ProjectContext): Promise<void> {
+    this.ensureCache(ctx);
+
+    const { skip } = resolveLabels(ctx);
+    // Create the skipped label on every repo that has a resolvable remote.
+    for (const repo of ctx.repos) {
+      if (!repo.remote) {
+        ctx.logger.warn(`Repo "${repo.name}" has no remote — cannot ensure "${skip}" label`);
+        continue;
+      }
       try {
         execSync(
-          `gh label create "${label.name}" --repo ${rt.repo} --color ${label.color} --description "${label.desc}" --force`,
-          { timeout: 10_000 }
+          `gh label create "${skip}" --repo ${repo.remote} --color BFD4F2 --description "Agent skipped this issue" --force`,
+          { timeout: 10_000, stdio: "pipe" },
         );
       } catch {
-        // label might already exist
+        // label likely already exists
       }
     }
-    ctx.logger.info(`GitHub plugin initialized for ${rt.repo}`);
+    ctx.logger.info(`GitHub plugin initialized for project ${ctx.projectId}`);
   }
 
-  async discover(ctx: SourceContext): Promise<RawIssue[]> {
-    const rt = resolveRuntime(ctx);
+  async discover(ctx: ProjectContext): Promise<RawIssue[]> {
+    const { owner, number } = parseProjectId(ctx.projectId);
+    try {
+      this.ensureCache(ctx);
+    } catch (err: any) {
+      ctx.logger.error(`discover: failed to resolve project meta: ${err.message}`);
+      return [];
+    }
+    const { trigger, skip } = resolveLabels(ctx);
+
+    // Server-side filter: only items carrying the trigger label and NOT the skip
+    // label (item-list content carries no labels, so we lean on --query).
+    const items = this.ghItemList(owner, number, `label:${trigger} -label:${skip}`);
     const results: RawIssue[] = [];
-    const seen = new Set<number>();
 
-    // Processing issues first so a mid-transition issue (carrying both the
-    // trigger and processing markers) is classified as processing, which wins
-    // over queued per the priority rule.
-    for (const gh of this.ghIssueList(rt.repo, rt.processingLabel)) {
-      if (seen.has(gh.number)) continue;
-      seen.add(gh.number);
-      results.push(this.toRaw(gh, rt, "processing"));
-    }
-    for (const gh of this.ghIssueList(rt.repo, rt.triggerLabel)) {
-      if (seen.has(gh.number)) continue;
-      seen.add(gh.number);
-      results.push(this.toRaw(gh, rt, "queued"));
+    for (const item of items) {
+      // Only Ready items are actionable; In progress / In review / Done are tracked
+      // elsewhere (sessions table) and must not be re-dispatched.
+      if (norm(item.status ?? "") !== "ready") continue;
+      if (!item.content) continue;
+
+      const remote = item.content.repository;
+      const repo = ctx.repos.find((r) => r.remote === remote);
+      if (!repo) {
+        // Config drift: the issue's repo isn't declared in projects.json.
+        ctx.logger.warn(
+          `Issue #${item.content.number} (${remote}) is in project ${ctx.projectId} but its repo is not declared in projects.json — ignoring`,
+        );
+        this.commentIfMissing(remote, item.content.number, ctx);
+        continue;
+      }
+
+      results.push({
+        sourceId: String(item.content.number),
+        url: item.content.url,
+        title: item.content.title,
+        targetRepo: repo.name,
+        state: "queued",
+      });
     }
 
-    ctx.logger.info(`${rt.repo}: discovered ${results.length} issues`);
+    ctx.logger.info(`${ctx.projectId}: discovered ${results.length} ready issue(s)`);
     return results;
   }
 
-  async getStatus(ctx: SourceContext, sourceId: string): Promise<IssueStatus> {
-    const rt = resolveRuntime(ctx);
+  async getStatus(ctx: ProjectContext, sourceId: string, targetRepo: string): Promise<IssueStatus> {
+    const repo = this.repoByName(ctx, targetRepo);
+    if (!repo?.remote) return { state: null };
+    const { trigger, skip } = resolveLabels(ctx);
     try {
       const raw = execSync(
-        `gh issue view ${sourceId} --repo ${rt.repo} --json labels`,
-        { encoding: "utf-8", timeout: 15_000 }
+        `gh issue view ${sourceId} --repo ${repo.remote} --json labels`,
+        { encoding: "utf-8", timeout: 15_000, stdio: "pipe" },
       );
       const data = JSON.parse(raw);
-      const labels: string[] = data.labels.map((l: { name: string }) => l.name);
-      return { state: this.labelsToState(labels, rt) };
+      const labels: string[] = (data.labels ?? []).map((l: { name: string }) => l.name);
+      // Actionable iff it still carries the eligibility marker and has not been skipped.
+      if (labels.includes(trigger) && !labels.includes(skip)) return { state: "queued" };
+      return { state: null };
     } catch {
       return { state: null };
     }
   }
 
-  async test(ctx: SourceContext): Promise<boolean> {
+  async test(_ctx: ProjectContext): Promise<boolean> {
     try {
       execSync("gh auth status", { timeout: 10_000, stdio: "pipe" });
       return true;
@@ -138,74 +179,167 @@ export class GitHubIssueSourcePlugin implements IssueSourcePlugin {
     }
   }
 
-  async transition(ctx: SourceContext, sourceId: string, transition: StatusTransition): Promise<void> {
-    const rt = resolveRuntime(ctx);
-    const fromLabel = this.stateToLabel(transition.from, rt);
-    const toLabel = this.stateToLabel(transition.to, rt);
+  async transition(ctx: ProjectContext, sourceId: string, transition: StatusTransition, targetRepo: string): Promise<void> {
+    const meta = this.ensureCache(ctx);
+    const { owner, number } = parseProjectId(ctx.projectId);
+    const repo = this.repoByName(ctx, targetRepo);
+    if (!repo?.remote) {
+      ctx.logger.error(`transition: repo "${targetRepo}" has no remote`);
+      return;
+    }
+
+    const optionId = meta.options.get(norm(stateToStatusName(transition.to)));
+    if (!optionId) {
+      ctx.logger.error(`transition: no project option maps to state "${transition.to}"`);
+      return;
+    }
+
+    const item = this.findItem(owner, number, sourceId, repo.remote);
+    if (!item) {
+      ctx.logger.error(`transition: project item for ${repo.remote}#${sourceId} not found`);
+      return;
+    }
+
     try {
       execSync(
-        `gh issue edit ${sourceId} --repo ${rt.repo} --remove-label "${fromLabel}" --add-label "${toLabel}"`,
-        { timeout: 15_000 }
+        `gh project item-edit --id ${item.id} --field-id ${meta.statusFieldId} --project-id ${meta.projectNodeId} --single-select-option-id ${optionId}`,
+        { timeout: 15_000, stdio: "pipe" },
       );
     } catch (err: any) {
-      ctx.logger.error(
-        `Failed to transition ${rt.repo}#${sourceId} (${transition.from}→${transition.to}): ${err.message}`
-      );
+      ctx.logger.error(`transition failed for ${repo.remote}#${sourceId}: ${err.message}`);
     }
   }
 
-  async onComment(ctx: SourceContext, sourceId: string, comment: string): Promise<void> {
-    const rt = resolveRuntime(ctx);
+  async onComment(ctx: ProjectContext, sourceId: string, comment: string, targetRepo: string): Promise<void> {
+    const repo = this.repoByName(ctx, targetRepo);
+    if (!repo?.remote) {
+      ctx.logger.error(`onComment: repo "${targetRepo}" has no remote`);
+      return;
+    }
     try {
       const tmpFile = path.join(os.tmpdir(), `tl-comment-${Date.now()}.md`);
       fs.writeFileSync(tmpFile, comment, "utf-8");
-      execSync(`gh issue comment ${sourceId} --repo ${rt.repo} --body-file "${tmpFile}"`, {
+      execSync(`gh issue comment ${sourceId} --repo ${repo.remote} --body-file "${tmpFile}"`, {
         timeout: 15_000,
+        stdio: "pipe",
       });
       fs.unlinkSync(tmpFile);
     } catch (err: any) {
-      ctx.logger.error(`Failed to comment on ${rt.repo}#${sourceId}: ${err.message}`);
+      ctx.logger.error(`Failed to comment on ${repo.remote}#${sourceId}: ${err.message}`);
     }
   }
 
-  private ghIssueList(repo: string, label: string): GhIssue[] {
+  async skip(ctx: ProjectContext, sourceId: string, targetRepo: string, reason: string): Promise<void> {
+    const repo = this.repoByName(ctx, targetRepo);
+    if (!repo?.remote) {
+      ctx.logger.error(`skip: repo "${targetRepo}" has no remote`);
+      return;
+    }
+    const { skip: skipLabel } = resolveLabels(ctx);
+
     try {
+      execSync(`gh issue edit ${sourceId} --repo ${repo.remote} --add-label "${skipLabel}"`, {
+        timeout: 15_000,
+        stdio: "pipe",
+      });
+    } catch (err: any) {
+      ctx.logger.error(`skip: failed to add "${skipLabel}" label on ${repo.remote}#${sourceId}: ${err.message}`);
+    }
+
+    if (this.onComment) {
+      await this.onComment(ctx, sourceId, `⏭️ Agent skipped this issue.\n\nReason: ${reason}`, targetRepo);
+    }
+
+    // Return the board status to Ready (the issue stays parked via the skip label).
+    await this.transition(ctx, sourceId, { from: "processing", to: "queued" }, targetRepo);
+  }
+
+  // --- internals ---
+
+  /** Resolve (and cache) project metadata: node id, status field id, option ids. */
+  private ensureCache(ctx: ProjectContext): ProjectMeta {
+    const existing = this.cache.get(ctx.projectId);
+    if (existing) return existing;
+
+    const { owner, number } = parseProjectId(ctx.projectId);
+
+    const projectRaw = execSync(`gh project view ${number} --owner ${owner} --format json`, {
+      encoding: "utf-8",
+      timeout: 15_000,
+      stdio: "pipe",
+    });
+    const projectNodeId = (JSON.parse(projectRaw) as { id?: string }).id;
+    if (!projectNodeId) throw new Error(`Could not resolve project node id for ${ctx.projectId}`);
+
+    const fieldRaw = execSync(`gh project field-list ${number} --owner ${owner} --format json`, {
+      encoding: "utf-8",
+      timeout: 15_000,
+      stdio: "pipe",
+    });
+    const fields = (JSON.parse(fieldRaw) as { fields: Array<{ id: string; name: string; type: string; options?: Array<{ id: string; name: string }> }> }).fields;
+    const statusField = fields.find((f) => f.name === "Status" && f.type === "ProjectV2SingleSelectField" && Array.isArray(f.options));
+    if (!statusField || !statusField.options) throw new Error(`Status single-select field not found in project ${ctx.projectId}`);
+
+    const options = new Map<string, string>();
+    for (const opt of statusField.options) {
+      options.set(norm(opt.name), opt.id);
+    }
+
+    const meta: ProjectMeta = { projectNodeId, statusFieldId: statusField.id, options };
+    this.cache.set(ctx.projectId, meta);
+    return meta;
+  }
+
+  private ghItemList(owner: string, number: number, query?: string): GhItem[] {
+    try {
+      const q = query ? ` --query "${query}"` : "";
       const raw = execSync(
-        `gh issue list --repo ${repo} --label "${label}" --state open --json number,title,url,labels --limit 50`,
-        { encoding: "utf-8", timeout: 30_000 }
+        `gh project item-list ${number} --owner ${owner} --format json --limit 100${q}`,
+        { encoding: "utf-8", timeout: 30_000, stdio: "pipe" },
       );
-      return JSON.parse(raw);
+      return (JSON.parse(raw) as { items?: GhItem[] }).items ?? [];
     } catch {
       return [];
     }
   }
 
-  private toRaw(gh: GhIssue, rt: GitHubRuntime, state: IssueState): RawIssue {
-    return {
-      sourceId: String(gh.number),
-      url: gh.url,
-      title: gh.title,
-      targetRepo: rt.repoName,
-      state,
-    };
+  private findItem(owner: string, number: number, sourceId: string, remote: string): GhItem | undefined {
+    return this.ghItemList(owner, number).find(
+      (it) => it.content && String(it.content.number) === String(sourceId) && it.content.repository === remote,
+    );
   }
 
-  /** Resolve a set of GitHub labels to a single standard state.
-   *  Priority: terminal states over in-flight; failure over success. */
-  private labelsToState(labels: string[], rt: GitHubRuntime): IssueState | null {
-    if (labels.includes(rt.failedLabel)) return "failed";
-    if (labels.includes(rt.doneLabel)) return "done";
-    if (labels.includes(rt.processingLabel)) return "processing";
-    if (labels.includes(rt.triggerLabel)) return "queued";
-    return null;
+  private repoByName(ctx: ProjectContext, targetRepo: string): RepoRef | undefined {
+    return ctx.repos.find((r) => r.name === targetRepo);
   }
 
-  private stateToLabel(state: IssueState, rt: GitHubRuntime): string {
-    switch (state) {
-      case "queued": return rt.triggerLabel;
-      case "processing": return rt.processingLabel;
-      case "done": return rt.doneLabel;
-      case "failed": return rt.failedLabel;
+  /** Post a one-time config-drift comment so we don't spam the issue every poll cycle. */
+  private commentIfMissing(remote: string, issueNumber: number, ctx: ProjectContext): void {
+    try {
+      const raw = execSync(`gh issue view ${issueNumber} --repo ${remote} --json comments`, {
+        encoding: "utf-8",
+        timeout: 15_000,
+        stdio: "pipe",
+      });
+      const comments = (JSON.parse(raw) as { comments?: Array<{ body?: string }> }).comments ?? [];
+      if (comments.some((c) => c.body?.includes(DRIFT_MARKER))) return; // already notified
+    } catch {
+      // proceed to attempt the comment anyway
+    }
+    try {
+      const tmpFile = path.join(os.tmpdir(), `tl-comment-${Date.now()}.md`);
+      fs.writeFileSync(
+        tmpFile,
+        `<!-- ${DRIFT_MARKER} -->\n⚠️ This issue's repository \`${remote}\` is not declared in talos-loop's \`projects.json\`, so it will not be processed. Add the repo to the relevant project entry to enable it.`,
+        "utf-8",
+      );
+      execSync(`gh issue comment ${issueNumber} --repo ${remote} --body-file "${tmpFile}"`, {
+        timeout: 15_000,
+        stdio: "pipe",
+      });
+      fs.unlinkSync(tmpFile);
+    } catch (err: any) {
+      ctx.logger.error(`Failed to post config-drift comment on ${remote}#${issueNumber}: ${err.message}`);
     }
   }
 }

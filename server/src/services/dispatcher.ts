@@ -1,10 +1,10 @@
 import { execSync } from "child_process";
-import fs from "fs";
+import * as fs from "fs";
 import os from "os";
 import path from "path";
-import { loadConfig, buildSourceContextForRepo } from "../config.js";
+import { loadConfig, buildProjectContextForIssue } from "../config.js";
 import {
-  getDb,
+  getRunningSessions,
   getRunningSessionsWithIssues,
   createSession,
   updateSessionStatus,
@@ -29,7 +29,15 @@ function buildPrompt(
   sourceId: string,
   url: string,
   repoPath: string,
+  projectId: string,
+  serverBaseUrl: string,
+  targetRepo: string,
 ): string {
+  // projectId is "owner/number" — its "/" is a path delimiter, so it must be
+  // percent-encoded here or the route (/api/projects/:projectId/...) won't match.
+  const encodedProject = encodeURIComponent(projectId);
+  const skipUrl = `${serverBaseUrl}/api/projects/${encodedProject}/issues/${sourceId}/skip`;
+  const commentUrl = `${serverBaseUrl}/api/projects/${encodedProject}/issues/${sourceId}/comment`;
   return [
     `你是一个自动化编码代理。请实现以下 Issue: ${url}`,
     ``,
@@ -40,6 +48,12 @@ function buildPrompt(
     `- 完成后提交代码，推送分支，并创建 Pull Request 关联 Issue`,
     `- 最后清理 worktree：cd ${repoPath} && git worktree remove <你的worktree路径>`,
     ``,
+    `与 talos-loop 通信（JSON body，targetRepo 固定为 "${targetRepo}"）：`,
+    `- 若判定无法完成该任务（需求不足、仓库错误等），调用 skip 接口放弃（不要硬编码跳过）：`,
+    `    curl -s -X POST ${skipUrl} -H 'Content-Type: application/json' -d '{"reason":"<跳过原因>","targetRepo":"${targetRepo}"}'`,
+    `- 如需在 issue 留言：`,
+    `    curl -s -X POST ${commentUrl} -H 'Content-Type: application/json' -d '{"message":"<内容>","targetRepo":"${targetRepo}"}'`,
+    ``,
     `完成后在输出中单独一行输出 PR 的 URL。`,
   ].join("\n");
 }
@@ -49,7 +63,7 @@ function findPrUrl(remote: string, sourceId: string): string | null {
   try {
     const result = execSync(
       `gh pr list --repo ${remote} --state all --search "fixes #${sourceId}" --json url --jq '.[0].url'`,
-      { timeout: 15_000, encoding: "utf-8" },
+      { timeout: 15_000, encoding: "utf-8", stdio: "pipe" },
     ).trim();
     return result || null;
   } catch {
@@ -57,56 +71,50 @@ function findPrUrl(remote: string, sourceId: string): string | null {
   }
 }
 
-/** Check running sessions, detect completions */
-async function checkRunningSessions(): Promise<{ completed: number; failed: number }> {
+/** Check running sessions; for each that has exited, classify the outcome. */
+export async function checkRunningSessions(): Promise<{ completed: number; failed: number }> {
   const running = getRunningSessionsWithIssues();
   let completed = 0;
   let failed = 0;
 
-  for (const { source_type, source_id, target_repo, ...session } of running) {
-    // Capture pane output while session is still alive (before isAlive check)
+  for (const { project_id, project_type, source_id, target_repo, ...session } of running) {
+    // Capture pane output while the session is still alive (before the isAlive check).
     const lastOutput = tmux.captureOutput(session.tmux_session);
+    if (tmux.isAlive(session.tmux_session)) continue;
 
-    if (tmux.isAlive(session.tmux_session)) {
-      continue;
-    }
+    // Sessions skipped via the HTTP API are no longer 'running' (the handler moved
+    // them to 'skipped' and returned the issue to Ready), so they do not appear
+    // here — the skip path needs no further transition or comment.
 
-    // Get plugin for status callbacks, resolving the bound repo for the context
-    const plugin = await resolvePlugin(source_type);
-    const ctx = buildSourceContextForRepo(target_repo, log);
+    const plugin = await resolvePlugin(project_type);
+    const ctx = buildProjectContextForIssue(project_id, log);
     const sourceName = plugin.name;
+    const repo = ctx.repos.find((r) => r.name === target_repo);
+    const remote = repo?.remote ?? target_repo;
 
-    // Resolve remote for PR search (fall back to the repo-name key)
-    const remote = ctx.repo?.remote ?? target_repo;
-
-    // Session has exited — determine result
     const prMatch = lastOutput.match(/https:\/\/github\.com\/[^/\s]+\/[^/\s]+\/pull\/\d+/);
     const prUrl = prMatch ? prMatch[0] : findPrUrl(remote, source_id);
 
     if (prUrl) {
       log.info(`✅ ${sourceName}:${source_id} done — ${prUrl}`);
       updateSessionStatus(session.id, "done", prUrl);
-      updateIssueStatus(source_type, source_id, "done");
-
-      await plugin.transition(ctx, source_id, { from: "processing", to: "done" });
+      updateIssueStatus(project_id, source_id, "done");
+      await plugin.transition(ctx, source_id, { from: "processing", to: "done" }, target_repo);
       if (plugin.onComment) {
-        await plugin.onComment(ctx, source_id, `✅ Agent completed. PR: ${prUrl}`);
+        await plugin.onComment(ctx, source_id, `✅ Agent completed. PR: ${prUrl}`, target_repo);
       }
-
-      updateIssueTmux(source_type, source_id, null);
+      updateIssueTmux(project_id, source_id, null);
       completed++;
     } else {
+      // Infrastructure failure: silently return the issue to Ready so the next
+      // poll auto-retries. The error tail is recorded on the session and surfaced
+      // in the dashboard only — no comment is posted.
       const tail = lastOutput.trim().slice(-500) || "Session exited without creating a PR";
-      log.info(`❌ ${sourceName}:${source_id} failed`);
+      log.warn(`⚠️ ${sourceName}:${source_id} infrastructure failure — returning to Ready (error in dashboard)`);
       updateSessionStatus(session.id, "failed", undefined, tail);
-      updateIssueStatus(source_type, source_id, "failed");
-
-      await plugin.transition(ctx, source_id, { from: "processing", to: "failed" });
-      if (plugin.onComment) {
-        await plugin.onComment(ctx, source_id, `❌ Agent processing failed.\n\n\`\`\`\n${tail.slice(0, 1000)}\n\`\`\``);
-      }
-
-      updateIssueTmux(source_type, source_id, null);
+      updateIssueStatus(project_id, source_id, "queued");
+      await plugin.transition(ctx, source_id, { from: "processing", to: "queued" }, target_repo);
+      updateIssueTmux(project_id, source_id, null);
       failed++;
     }
   }
@@ -117,7 +125,6 @@ async function checkRunningSessions(): Promise<{ completed: number; failed: numb
 /** Dispatch new issues from poll results */
 export async function dispatchNew(pollResults: PollResult[]): Promise<number> {
   const config = loadConfig();
-  const { getRunningSessions } = await import("../db/index.js");
   const runningCount = getRunningSessions().length;
 
   if (runningCount >= config.maxParallel) {
@@ -125,9 +132,7 @@ export async function dispatchNew(pollResults: PollResult[]): Promise<number> {
     return 0;
   }
 
-  // Collect all discovered (queued) issues across sources
-  const candidates: IssueEntry[] = pollResults
-    .flatMap((r) => r.discovered);
+  const candidates: IssueEntry[] = pollResults.flatMap((r) => r.discovered);
 
   // Sort by sourceId (for GitHub, lower number = older = higher priority)
   candidates.sort((a, b) => {
@@ -142,33 +147,28 @@ export async function dispatchNew(pollResults: PollResult[]): Promise<number> {
 
   for (const candidate of candidates) {
     if (dispatched >= slotsAvailable) break; // count actual dispatches, not iterations
-    const { issue, sourceType, sourceId, targetRepo } = candidate;
+    const { issue, projectId, projectType, sourceId, targetRepo } = candidate;
 
-    // Resolve plugin + context up front so the display name is available in logs
-    const plugin = await resolvePlugin(sourceType);
-    const ctx = buildSourceContextForRepo(targetRepo, log);
+    const plugin = await resolvePlugin(projectType);
+    const ctx = buildProjectContextForIssue(projectId, log);
     const sourceName = plugin.name;
 
-    // Resolve repo path for the worktree. ctx.repo is undefined when the repo
-    // isn't declared in repos.json (config drift) — can't dispatch without a path.
-    const repo = ctx.repo;
+    const repo = ctx.repos.find((r) => r.name === targetRepo);
     if (!repo) {
       log.error(`Repo "${targetRepo}" not found for ${sourceName}:${sourceId}`);
       continue;
     }
 
-    // Real-time state verification — guard against stale poll data. Only
-    // dispatch issues still in the queued state.
-    const current = await plugin.getStatus(ctx, sourceId);
+    // Real-time freshness check — only dispatch issues still actionable.
+    const current = await plugin.getStatus(ctx, sourceId, targetRepo);
     if (current.state !== "queued") {
-      log.info(`Skipping ${sourceName}:${sourceId} — state is ${current.state ?? "null"}, not queued`);
+      log.info(`Skipping ${sourceName}:${sourceId} — not actionable (state ${current.state ?? "null"})`);
       continue;
     }
 
     const session = tmux.sessionName(sourceName, targetRepo, sourceId);
-    const prompt = buildPrompt(sourceId, issue.url, repo.path);
+    const prompt = buildPrompt(sourceId, issue.url, repo.path, projectId, config.serverBaseUrl, targetRepo);
 
-    // Write prompt to temp file to avoid shell escaping issues
     const promptFile = path.join(os.tmpdir(), `tl-prompt-${session}.txt`);
     fs.writeFileSync(promptFile, prompt, "utf-8");
 
@@ -185,24 +185,22 @@ export async function dispatchNew(pollResults: PollResult[]): Promise<number> {
     log.info(`🚀 Dispatching ${sourceName}:${sourceId} → session ${session}`);
 
     try {
-      // Update status via plugin
-      await plugin.transition(ctx, sourceId, { from: "queued", to: "processing" });
+      await plugin.transition(ctx, sourceId, { from: "queued", to: "processing" }, targetRepo);
       if (plugin.onComment) {
-        await plugin.onComment(ctx, sourceId, "🤖 Agent has started processing this issue...");
+        await plugin.onComment(ctx, sourceId, "🤖 Agent has started processing this issue...", targetRepo);
       }
 
-      // Create tmux session
       tmux.createSession(session, command);
 
-      // Record in DB
-      updateIssueTmux(sourceType, sourceId, session);
-      updateIssueStatus(sourceType, sourceId, "processing");
+      updateIssueTmux(projectId, sourceId, session);
+      updateIssueStatus(projectId, sourceId, "processing");
       createSession(issue.id, session);
 
       dispatched++;
     } catch (err: any) {
       log.error(`Failed to dispatch ${sourceName}:${sourceId}: ${err.message}`);
-      await plugin.transition(ctx, sourceId, { from: "processing", to: "failed" });
+      // Roll the board status back to Ready so the next poll retries.
+      await plugin.transition(ctx, sourceId, { from: "processing", to: "queued" }, targetRepo);
     }
   }
 
@@ -213,7 +211,6 @@ export async function dispatchNew(pollResults: PollResult[]): Promise<number> {
 export async function dispatch(pollResults: PollResult[]): Promise<DispatchResult> {
   const { completed, failed } = await checkRunningSessions();
   const dispatched = await dispatchNew(pollResults);
-  const { getRunningSessions } = await import("../db/index.js");
   const runningCount = getRunningSessions().length;
 
   return {

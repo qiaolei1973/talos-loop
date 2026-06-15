@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
 import type {
   IssueSourcePlugin,
-  SourceContext,
+  ProjectContext,
   RepoRef,
   RawIssue,
   IssueStatus,
@@ -41,74 +41,69 @@ describe("Issue-state contract", () => {
     expect(t.to).toBe("done");
   });
 
-  it("IssueState covers exactly the four pipeline states", () => {
-    const states: IssueState[] = ["queued", "processing", "done", "failed"];
-    expect(new Set(states).size).toBe(4);
+  it("IssueState covers exactly the three pipeline states (no failed)", () => {
+    const states: IssueState[] = ["queued", "processing", "done"];
+    expect(new Set(states).size).toBe(3);
   });
 
-  it("a mock plugin satisfies the IssueSourcePlugin interface (transition required)", async () => {
-    const calls: StatusTransition[] = [];
+  it("a mock plugin satisfies IssueSourcePlugin (skip + targetRepo)", async () => {
+    const calls: Array<{ transition: StatusTransition; targetRepo: string }> = [];
     const plugin: IssueSourcePlugin = {
       name: "mock",
 
       async init(): Promise<void> {},
 
       async discover(): Promise<RawIssue[]> {
-        return [
-          { sourceId: "1", url: "https://example.com/1", title: "Queued", targetRepo: "r", state: "queued" },
-          { sourceId: "2", url: "https://example.com/2", title: "Processing", targetRepo: "r", state: "processing" },
-        ];
+        return [{ sourceId: "1", url: "https://example.com/1", title: "Ready", targetRepo: "r", state: "queued" }];
       },
 
-      async getStatus(_ctx: SourceContext, sourceId: string): Promise<IssueStatus> {
-        return sourceId === "2" ? { state: "processing" } : { state: "queued" };
+      async getStatus(_ctx: ProjectContext, sourceId: string, _targetRepo: string): Promise<IssueStatus> {
+        return sourceId === "1" ? { state: "queued" } : { state: null };
       },
 
-      async transition(_ctx: SourceContext, _sourceId: string, t: StatusTransition): Promise<void> {
-        calls.push(t);
+      async transition(_ctx: ProjectContext, _sourceId: string, t: StatusTransition, targetRepo: string): Promise<void> {
+        calls.push({ transition: t, targetRepo });
       },
 
       async test(): Promise<boolean> {
         return true;
       },
 
-      // onComment is optional and intentionally omitted.
+      async skip(_ctx: ProjectContext, _sourceId: string, _targetRepo: string, _reason: string): Promise<void> {},
     };
 
-    const ctx: SourceContext = {
+    const ctx: ProjectContext = {
       config: {},
       logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as any,
+      repos: [{ name: "r", path: "/tmp/r", remote: "owner/r" }],
+      projectId: "owner/1",
     };
 
     await plugin.init(ctx);
     const issues = await plugin.discover(ctx);
-    expect(issues.map((i) => i.state)).toEqual(["queued", "processing"]);
+    expect(issues.map((i) => i.state)).toEqual(["queued"]);
 
-    expect((await plugin.getStatus(ctx, "1")).state).toBe("queued");
-    expect((await plugin.getStatus(ctx, "2")).state).toBe("processing");
+    expect((await plugin.getStatus(ctx, "1", "r")).state).toBe("queued");
 
-    await plugin.transition(ctx, "1", { from: "queued", to: "processing" });
-    expect(calls).toEqual([{ from: "queued", to: "processing" }]);
+    await plugin.transition(ctx, "1", { from: "queued", to: "processing" }, "r");
+    expect(calls).toEqual([{ transition: { from: "queued", to: "processing" }, targetRepo: "r" }]);
+
+    await plugin.skip(ctx, "1", "r", "not enough info");
 
     expect(await plugin.test(ctx)).toBe(true);
   });
 
-  it("SourceContext optionally carries a resolved repo (name/path/remote)", () => {
-    const repo: RepoRef = { name: "talos-deploy", path: "/home/agent/talos-deploy", remote: "qiaolei1973/talos-deploy" };
-    const ctx: SourceContext = {
+  it("ProjectContext exposes repos[] and projectId", () => {
+    const repos: RepoRef[] = [
+      { name: "talos-loop", path: "/home/agent/talos-loop", remote: "qiaolei1973/talos-loop" },
+    ];
+    const ctx: ProjectContext = {
       config: {},
       logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as any,
-      repo,
+      repos,
+      projectId: "qiaolei1973/1",
     };
-    expect(ctx.repo?.name).toBe("talos-deploy");
-    expect(ctx.repo?.path).toBe("/home/agent/talos-deploy");
-    expect(ctx.repo?.remote).toBe("qiaolei1973/talos-deploy");
-
-    // repo is optional — a context without it still satisfies the interface
-    const bareCtx: SourceContext = {
-      config: {},
-      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as any,
-    };
-    expect(bareCtx.repo).toBeUndefined();
+    expect(ctx.repos[0].name).toBe("talos-loop");
+    expect(ctx.projectId).toBe("qiaolei1973/1");
   });
 });

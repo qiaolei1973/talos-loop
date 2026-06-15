@@ -1,4 +1,4 @@
-import { getEnabledSources, buildSourceContext, type SourceConfig } from "../config.js";
+import { getEnabledProjects, buildProjectContext, type ProjectConfig } from "../config.js";
 import { upsertIssue, updateIssueStatus, type Issue } from "../db/index.js";
 import { resolvePlugin } from "../plugins/loader.js";
 import type { RawIssue } from "../types/plugin.js";
@@ -8,61 +8,54 @@ const log = createLogger("poller");
 
 export interface IssueEntry {
   issue: Issue;
-  sourceType: string;
+  projectId: string;
+  projectType: string;
   sourceId: string;
   targetRepo: string;
 }
 
 export interface PollResult {
-  sourceType: string;
+  projectId: string;
+  projectType: string;
   discovered: IssueEntry[];
-  processing: IssueEntry[];
   error?: string;
 }
 
-async function pollSource(source: SourceConfig): Promise<PollResult> {
+async function pollProject(project: ProjectConfig): Promise<PollResult> {
   const discovered: IssueEntry[] = [];
-  const processing: IssueEntry[] = [];
+  let displayName = project.projectType;
 
-  let sourceName: string = source.type;
   try {
-    const plugin = await resolvePlugin(source.type);
-    const ctx = buildSourceContext(source, log);
-    sourceName = plugin.name;
+    const plugin = await resolvePlugin(project.projectType);
+    const ctx = buildProjectContext(project, log);
+    displayName = plugin.name;
 
     const rawIssues: RawIssue[] = await plugin.discover(ctx);
 
     for (const raw of rawIssues) {
-      const issue = upsertIssue(source.type, raw.sourceId, raw.targetRepo, raw.url, raw.title);
-
-      const entry: IssueEntry = {
+      const issue = upsertIssue(project.projectId, project.projectType, raw.sourceId, raw.targetRepo, raw.url, raw.title);
+      discovered.push({
         issue,
-        sourceType: source.type,
+        projectId: project.projectId,
+        projectType: project.projectType,
         sourceId: raw.sourceId,
         targetRepo: raw.targetRepo,
-      };
-
-      // Bucket by the standard state the plugin already resolved at discovery
-      // time. Core does not read any source-specific config or re-query status.
-      if (raw.state === "processing") {
-        processing.push(entry);
-        updateIssueStatus(source.type, raw.sourceId, "processing");
-      } else if (raw.state === "queued") {
-        discovered.push(entry);
-        updateIssueStatus(source.type, raw.sourceId, "queued");
-      }
+      });
+      // discover() returns only ready-to-dispatch issues (state queued). In-flight
+      // issues are tracked by the sessions table, not re-discovered.
+      updateIssueStatus(project.projectId, raw.sourceId, "queued");
     }
   } catch (err: any) {
-    log.error(`Error polling source "${sourceName}": ${err.message}`);
-    return { sourceType: source.type, discovered, processing, error: err.message };
+    log.error(`Error polling project "${project.projectId}": ${err.message}`);
+    return { projectId: project.projectId, projectType: project.projectType, discovered, error: err.message };
   }
 
-  log.info(`[${sourceName}] ${discovered.length} queued, ${processing.length} processing`);
-  return { sourceType: source.type, discovered, processing };
+  log.info(`[${displayName}] ${discovered.length} ready issue(s)`);
+  return { projectId: project.projectId, projectType: project.projectType, discovered };
 }
 
 export async function pollAll(): Promise<PollResult[]> {
-  const sources = getEnabledSources();
-  log.info(`Polling ${sources.length} source(s)...`);
-  return Promise.all(sources.map(pollSource));
+  const projects = getEnabledProjects();
+  log.info(`Polling ${projects.length} project(s)...`);
+  return Promise.all(projects.map(pollProject));
 }

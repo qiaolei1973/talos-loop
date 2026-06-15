@@ -6,7 +6,7 @@ data/
 *.db-shm
 .env
 config.json
-repos.json
+projects.json
 server/data/
 package-lock.json
 .claude

@@ -3,19 +3,20 @@ import {
   RefreshCw,
   ExternalLink,
   Terminal,
-  RotateCcw,
   CheckCircle,
-  XCircle,
   Clock,
   Loader2,
   GitBranch,
   Check,
+  AlertTriangle,
+  SkipForward,
 } from "lucide-react";
 
 interface Issue {
   id: number;
-  source_type: string;
-  source_name: string;
+  project_id: string;
+  project_type: string;
+  project_name: string;
   source_id: string;
   target_repo: string;
   url: string;
@@ -44,18 +45,17 @@ interface Status {
   lastPollAt: string | null;
   nextPollAt: string | null;
   pollInterval: number;
-  sources?: { name: string; enabled: boolean }[];
+  projects?: { projectId: string; name: string; enabled: boolean }[];
 }
 
 const API = "";
 
 function StatusBadge({ status }: { status: string }) {
   const config: Record<string, { icon: any; label: string; cls: string }> = {
-    queued: { icon: Clock, label: "Queued", cls: "bg-yellow-100 text-yellow-800" },
-    processing: { icon: Loader2, label: "Processing", cls: "bg-blue-100 text-blue-800" },
-    done: { icon: CheckCircle, label: "Done", cls: "bg-green-100 text-green-800" },
-    failed: { icon: XCircle, label: "Failed", cls: "bg-red-100 text-red-800" },
-    other: { icon: Clock, label: "Other", cls: "bg-gray-100 text-gray-800" },
+    queued: { icon: Clock, label: "Ready", cls: "bg-yellow-100 text-yellow-800" },
+    processing: { icon: Loader2, label: "In progress", cls: "bg-blue-100 text-blue-800" },
+    done: { icon: CheckCircle, label: "In review", cls: "bg-green-100 text-green-800" },
+    other: { icon: Clock, label: status, cls: "bg-gray-100 text-gray-800" },
   };
   const c = config[status] || config.other;
   const Icon = c.icon;
@@ -67,16 +67,34 @@ function StatusBadge({ status }: { status: string }) {
   );
 }
 
-function SourceTypeBadge({ type }: { type: string }) {
-  const colors: Record<string, string> = {
-    github: "bg-gray-100 text-gray-700",
-  };
-  const cls = colors[type] || "bg-purple-100 text-purple-700";
-  return (
-    <span className={`inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide ${cls}`}>
-      {type}
-    </span>
-  );
+/**
+ * Surfaces per-session outcomes alongside the board status: infrastructure
+ * failures (recorded in dashboard only) and skips (durable, awaiting label
+ * removal on GitHub).
+ */
+function SessionIndicator({ session }: { session?: Session }) {
+  if (!session) return null;
+  if (session.status === "skipped") {
+    return (
+      <span
+        className="inline-flex items-center gap-1 rounded bg-purple-100 px-1.5 py-0.5 text-[10px] font-medium text-purple-700"
+        title={session.error ?? "Agent skipped this issue — remove the skipped label on GitHub to re-enable"}
+      >
+        <SkipForward className="h-3 w-3" /> skipped
+      </span>
+    );
+  }
+  if (session.status === "failed" || session.error) {
+    return (
+      <span
+        className="inline-flex items-center gap-1 rounded bg-red-100 px-1.5 py-0.5 text-[10px] font-medium text-red-700"
+        title={session.error ?? "Infrastructure failure — will auto-retry from Ready"}
+      >
+        <AlertTriangle className="h-3 w-3" /> infra error
+      </span>
+    );
+  }
+  return null;
 }
 
 function AttachButton({ session }: { session: string }) {
@@ -140,11 +158,6 @@ export default function App() {
     await fetchData();
   };
 
-  const retryIssue = async (id: number) => {
-    await fetch(`${API}/api/issues/${id}/retry`, { method: "POST" });
-    await fetchData();
-  };
-
   useEffect(() => {
     fetchData();
     const interval = setInterval(fetchData, 10000); // refresh every 10s
@@ -198,7 +211,7 @@ export default function App() {
             <GitBranch className="mx-auto mb-3 h-10 w-10 text-gray-400" />
             <p className="text-gray-500">No issues found yet.</p>
             <p className="mt-1 text-sm text-gray-400">
-              Configure sources in <code className="rounded bg-gray-100 px-1">config.json</code> to
+              Configure projects in <code className="rounded bg-gray-100 px-1">projects.json</code> to
               get started.
             </p>
           </div>
@@ -215,7 +228,7 @@ export default function App() {
                   <thead>
                     <tr className="border-b bg-gray-50">
                       <th className="px-4 py-2 text-left font-medium text-gray-600">Issue</th>
-                      <th className="px-4 py-2 text-left font-medium text-gray-600">Source</th>
+                      <th className="px-4 py-2 text-left font-medium text-gray-600">Project</th>
                       <th className="px-4 py-2 text-left font-medium text-gray-600">Status</th>
                       <th className="px-4 py-2 text-left font-medium text-gray-600">PR</th>
                       <th className="px-4 py-2 text-left font-medium text-gray-600">Updated</th>
@@ -240,10 +253,15 @@ export default function App() {
                             <span className="ml-2 text-gray-700">{issue.title}</span>
                           </td>
                           <td className="px-4 py-3">
-                            <SourceTypeBadge type={issue.source_name} />
+                            <span className="inline-flex items-center rounded bg-gray-100 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-gray-700">
+                              {issue.project_name}
+                            </span>
                           </td>
                           <td className="px-4 py-3">
-                            <StatusBadge status={issue.status} />
+                            <div className="flex items-center gap-1.5">
+                              <StatusBadge status={issue.status} />
+                              <SessionIndicator session={latestSession} />
+                            </div>
                           </td>
                           <td className="px-4 py-3">
                             {latestSession?.pr_url ? (
@@ -263,15 +281,6 @@ export default function App() {
                           <td className="px-4 py-3 text-right">
                             {issue.status === "processing" && issue.tmux_session && (
                               <AttachButton session={issue.tmux_session} />
-                            )}
-                            {issue.status === "failed" && (
-                              <button
-                                onClick={() => retryIssue(issue.id)}
-                                className="inline-flex items-center gap-1 rounded bg-orange-100 px-2 py-0.5 text-xs font-medium text-orange-700 hover:bg-orange-200"
-                              >
-                                <RotateCcw className="h-3 w-3" />
-                                retry
-                              </button>
                             )}
                           </td>
                         </tr>

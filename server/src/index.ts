@@ -2,7 +2,7 @@ import Fastify from "fastify";
 import cors from "@fastify/cors";
 import path from "path";
 import fs from "fs";
-import { loadConfig, getEnabledSources, getRepos, buildSourceContext } from "./config.js";
+import { loadConfig, getEnabledProjects, loadProjects, buildProjectContext } from "./config.js";
 import { getDb } from "./db/index.js";
 import { registerApiRoutes, startPoller } from "./routes/api.js";
 import { checkTmux } from "./services/tmux.js";
@@ -16,46 +16,33 @@ async function main() {
   checkTmux();
 
   const config = loadConfig();
-  const repos = getRepos();
+  const projects = loadProjects();
 
-  // Warn about sources skipped because their `repo` is missing or unresolvable.
-  const enabledSources = getEnabledSources();
-  for (const source of config.sources.filter((s) => s.enabled)) {
-    if (!source.repo) {
-      log.warn(`Source "${source.type}" has no \`repo\` field — skipping`);
-    } else if (!repos.some((r) => r.name === source.repo)) {
-      log.warn(`Source "${source.type}" references unknown repo "${source.repo}" — skipping`);
+  // Warn about enabled projects whose repos have issues (missing paths, etc.).
+  for (const project of projects.filter((p) => p.enabled)) {
+    if (project.repos.length === 0) {
+      log.warn(`Project "${project.projectId}" declares no repos — skipping`);
+    }
+    for (const repo of project.repos) {
+      if (!fs.existsSync(repo.path)) {
+        log.warn(`Project "${project.projectId}": repo "${repo.name}" path does not exist: ${repo.path}`);
+      }
+      if (!repo.remote) {
+        log.warn(`Project "${project.projectId}": repo "${repo.name}" has no resolvable remote (owner/repo)`);
+      }
     }
   }
 
-  // Initialize DB (handles old schema cleanup)
+  // Initialize DB (handles old-schema cleanup)
   getDb();
   log.info(`SQLite initialized at ${config.dbPath}`);
 
-  // Initialize plugins for each enabled source
-  for (const source of enabledSources) {
-    try {
-      const plugin = await resolvePlugin(source.type);
-      const ctx = buildSourceContext(source, createLogger(`plugin:${plugin.name}`));
-
-      log.info(`Initializing plugin "${plugin.name}" (repo ${source.repo})...`);
-      await plugin.init(ctx);
-
-      const healthy = await plugin.test(ctx);
-      if (!healthy) {
-        log.warn(`Plugin "${plugin.name}" health check failed — source may not work correctly`);
-      } else {
-        log.info(`Plugin "${plugin.name}" initialized and healthy`);
-      }
-    } catch (err: any) {
-      log.error(`Plugin "${source.type}" failed to initialize: ${err.message}`);
-      source.enabled = false;
-      log.warn(`Source "${source.type}" has been disabled due to initialization failure`);
-    }
-  }
-
-  const activeSources = enabledSources.filter((s) => s.enabled);
-
+  // --- Start the HTTP server BEFORE plugin init. ---
+  // Plugin init() shells out to `gh` synchronously (execSync blocks the event
+  // loop for several seconds). If we init before listen(), nothing is accepting
+  // connections during that window and the dashboard's early /api requests are
+  // refused with ECONNREFUSED. Listening first means the socket is open, so any
+  // request that lands during init simply queues and is served once init done.
   const app = Fastify({ logger: false });
 
   await app.register(cors, { origin: true });
@@ -89,17 +76,49 @@ async function main() {
 
   await app.listen({ port: config.port, host: "0.0.0.0" });
   log.info(`🚀 Talos Loop running on http://localhost:${config.port}`);
-  log.info(`📊 Dashboard: http://localhost:${config.port}`);
-  log.info(`📡 API: http://localhost:${config.port}/api/status`);
-  log.info(`⏱  Polling every ${config.pollInterval / 1000}s for ${activeSources.length} source(s)`);
-  log.info(`Sources:`);
-  for (const source of activeSources) {
-    const name = await getPluginName(source.type);
-    log.info(`  - ${name} (repo: ${source.repo})`);
+  log.info(`📊 Dashboard: http://localhost:${config.port}`)
+  log.info(`📡 API: http://localhost:${config.port}/api/status`)
+
+  // Initialize the plugin for each enabled project. The plugin is a singleton
+  // per type, so init() must be idempotent per projectId (it populates a
+  // per-project cache); calling it once per project is correct.
+  const enabledProjects = getEnabledProjects();
+  for (const project of enabledProjects) {
+    try {
+      const plugin = await resolvePlugin(project.projectType);
+      const ctx = buildProjectContext(project, createLogger(`plugin:${plugin.name}`));
+
+      log.info(`Initializing plugin "${plugin.name}" for project ${project.projectId}...`)
+      await plugin.init(ctx)
+
+      const healthy = await plugin.test(ctx);
+      if (!healthy) {
+        log.warn(`Plugin "${plugin.name}" health check failed for ${project.projectId} — project may not work correctly`);
+      } else {
+        log.info(`Plugin "${plugin.name}" initialized and healthy for ${project.projectId}`);
+      }
+    } catch (err: any) {
+      log.error(`Plugin "${project.projectType}" failed to initialize for ${project.projectId}: ${err.message}`);
+      project.enabled = false;
+      log.warn(`Project "${project.projectId}" has been disabled due to initialization failure`);
+    }
+  }
+
+  const activeProjects = getEnabledProjects();
+  log.info(`⏱  Polling every ${config.pollInterval / 1000}s for ${activeProjects.length} project(s)`);
+  log.info(`Projects:`);
+  for (const project of activeProjects) {
+    const name = await getPluginName(project.projectType);
+    log.info(`  - ${name} (${project.projectId})`);
   }
   log.info(`Repos:`);
-  for (const repo of repos) {
-    log.info(`  - ${repo.name} (${repo.path})${repo.remote ? ` → ${repo.remote}` : ""}`);
+  const seenRepos = new Set<string>();
+  for (const project of activeProjects) {
+    for (const repo of project.repos) {
+      if (seenRepos.has(repo.name)) continue;
+      seenRepos.add(repo.name);
+      log.info(`  - ${repo.name} (${repo.path})${repo.remote ? ` → ${repo.remote}` : ""}`);
+    }
   }
 
   // Start the poller
