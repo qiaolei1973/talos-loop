@@ -115,7 +115,7 @@ async function checkRunningSessions(): Promise<{ completed: number; failed: numb
 }
 
 /** Dispatch new issues from poll results */
-async function dispatchNew(pollResults: PollResult[]): Promise<number> {
+export async function dispatchNew(pollResults: PollResult[]): Promise<number> {
   const config = loadConfig();
   const { getRunningSessions } = await import("../db/index.js");
   const runningCount = getRunningSessions().length;
@@ -140,7 +140,8 @@ async function dispatchNew(pollResults: PollResult[]): Promise<number> {
   let dispatched = 0;
   const slotsAvailable = config.maxParallel - runningCount;
 
-  for (const candidate of candidates.slice(0, slotsAvailable)) {
+  for (const candidate of candidates) {
+    if (dispatched >= slotsAvailable) break; // count actual dispatches, not iterations
     const { issue, sourceType, sourceId, targetRepo } = candidate;
 
     // Resolve plugin + context up front so the display name is available in logs
@@ -164,7 +165,7 @@ async function dispatchNew(pollResults: PollResult[]): Promise<number> {
       continue;
     }
 
-    const session = tmux.sessionName(sourceType, targetRepo, sourceId);
+    const session = tmux.sessionName(sourceName, targetRepo, sourceId);
     const prompt = buildPrompt(sourceId, issue.url, repo.path);
 
     // Write prompt to temp file to avoid shell escaping issues

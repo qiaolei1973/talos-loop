@@ -16,9 +16,16 @@ export function checkTmux(): void {
   }
 }
 
-/** Build a session name from source type, target repo, and source ID */
-export function sessionName(sourceType: string, targetRepo: string, sourceId: string): string {
-  return `${SESSION_PREFIX}-${sourceType}-${targetRepo}-${sourceId}`;
+/**
+ * Build a session name from the plugin alias (or source type), target repo, and
+ * source ID. Each segment is sanitized so scoped package names (e.g.
+ * "@talos-loop/source-dima") and display names with spaces don't inject path
+ * separators — the returned value is embedded in temp-file paths and tmux
+ * session names, so it must be a flat, shell-safe identifier.
+ */
+export function sessionName(sourceName: string, targetRepo: string, sourceId: string): string {
+  const safe = (s: string) => s.replace(/[^a-zA-Z0-9_-]/g, "_");
+  return [SESSION_PREFIX, safe(sourceName), safe(targetRepo), safe(sourceId)].join("-");
 }
 
 /** Create a new detached tmux session running a command */
