@@ -1,4 +1,4 @@
-import { getEnabledSources, type SourceConfig } from "../config.js";
+import { getEnabledSources, buildSourceContext, type SourceConfig } from "../config.js";
 import { upsertIssue, updateIssueStatus, type Issue } from "../db/index.js";
 import { resolvePlugin } from "../plugins/loader.js";
 import type { RawIssue } from "../types/plugin.js";
@@ -27,7 +27,7 @@ async function pollSource(source: SourceConfig): Promise<PollResult> {
   let sourceName: string = source.type;
   try {
     const plugin = await resolvePlugin(source.type);
-    const ctx = { config: source.config, logger: log };
+    const ctx = buildSourceContext(source, log);
     sourceName = plugin.name;
 
     const rawIssues: RawIssue[] = await plugin.discover(ctx);

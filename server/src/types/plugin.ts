@@ -40,9 +40,24 @@ export interface IssueSourcePlugin {
   onComment?(ctx: SourceContext, sourceId: string, comment: string): Promise<void>;
 }
 
+/**
+ * Reference to a code repository injected into plugin context. Resolved from the
+ * `source.repo` field against `repos.json`. `name` is the basename of the local
+ * path and doubles as the DB `target_repo` key; `remote` is the upstream
+ * "owner/repo" (inferred from `git remote`, overridable in repos.json) and may
+ * be undefined when inference fails and no override is given.
+ */
+export interface RepoRef {
+  name: string;
+  path: string;
+  remote?: string;
+}
+
 export interface SourceContext {
   config: Record<string, unknown>;
   logger: Logger;
+  /** The repo this source is bound to (resolved from `source.repo`). */
+  repo?: RepoRef;
 }
 
 export interface RawIssue {

@@ -1,34 +1,12 @@
 {
-  "repos": [
-    { "name": "talos-deploy", "remote": "qiaolei1973/talos-deploy", "path": "/home/agent/talos-deploy" },
-    { "name": "skills", "remote": "qiaolei1973/skills", "path": "/home/agent/skills" }
-  ],
   "sources": [
     {
       "type": "github",
       "enabled": true,
-      "config": {
-        "repo": "qiaolei1973/talos-deploy",
-        "targetRepo": "talos-deploy",
-        "triggerLabel": "ready-for-agent",
-        "processingLabel": "agent-processing",
-        "doneLabel": "agent-done",
-        "failedLabel": "agent-failed"
-      }
-    },
-    {
-      "type": "github",
-      "enabled": true,
-      "config": {
-        "repo": "qiaolei1973/skills",
-        "targetRepo": "skills",
-        "triggerLabel": "ready-for-agent",
-        "processingLabel": "agent-processing",
-        "doneLabel": "agent-done",
-        "failedLabel": "agent-failed"
-      }
+      "repo": "talos-deploy"
     }
   ],
+  "port": 3100,
   "pollInterval": 60000,
   "maxParallel": 1,
   "claudeTimeout": 600

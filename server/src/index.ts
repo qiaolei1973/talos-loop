@@ -2,11 +2,10 @@ import Fastify from "fastify";
 import cors from "@fastify/cors";
 import path from "path";
 import fs from "fs";
-import { loadConfig } from "./config.js";
+import { loadConfig, getEnabledSources, getRepos, buildSourceContext } from "./config.js";
 import { getDb } from "./db/index.js";
 import { registerApiRoutes, startPoller } from "./routes/api.js";
 import { checkTmux } from "./services/tmux.js";
-import { getEnabledSources } from "./config.js";
 import { resolvePlugin, getPluginName } from "./plugins/loader.js";
 import { createLogger } from "./services/logger.js";
 
@@ -17,19 +16,29 @@ async function main() {
   checkTmux();
 
   const config = loadConfig();
+  const repos = getRepos();
+
+  // Warn about sources skipped because their `repo` is missing or unresolvable.
+  const enabledSources = getEnabledSources();
+  for (const source of config.sources.filter((s) => s.enabled)) {
+    if (!source.repo) {
+      log.warn(`Source "${source.type}" has no \`repo\` field — skipping`);
+    } else if (!repos.some((r) => r.name === source.repo)) {
+      log.warn(`Source "${source.type}" references unknown repo "${source.repo}" — skipping`);
+    }
+  }
 
   // Initialize DB (handles old schema cleanup)
   getDb();
   log.info(`SQLite initialized at ${config.dbPath}`);
 
   // Initialize plugins for each enabled source
-  const sources = getEnabledSources();
-  for (const source of sources) {
+  for (const source of enabledSources) {
     try {
       const plugin = await resolvePlugin(source.type);
-      const ctx = { config: source.config, logger: createLogger(`plugin:${plugin.name}`) };
+      const ctx = buildSourceContext(source, createLogger(`plugin:${plugin.name}`));
 
-      log.info(`Initializing plugin "${plugin.name}"...`);
+      log.info(`Initializing plugin "${plugin.name}" (repo ${source.repo})...`);
       await plugin.init(ctx);
 
       const healthy = await plugin.test(ctx);
@@ -45,7 +54,7 @@ async function main() {
     }
   }
 
-  const enabledSources = sources.filter((s) => s.enabled);
+  const activeSources = enabledSources.filter((s) => s.enabled);
 
   const app = Fastify({ logger: false });
 
@@ -82,15 +91,15 @@ async function main() {
   log.info(`🚀 Talos Loop running on http://localhost:${config.port}`);
   log.info(`📊 Dashboard: http://localhost:${config.port}`);
   log.info(`📡 API: http://localhost:${config.port}/api/status`);
-  log.info(`⏱  Polling every ${config.pollInterval / 1000}s for ${enabledSources.length} source(s)`);
+  log.info(`⏱  Polling every ${config.pollInterval / 1000}s for ${activeSources.length} source(s)`);
   log.info(`Sources:`);
-  for (const source of enabledSources) {
+  for (const source of activeSources) {
     const name = await getPluginName(source.type);
-    log.info(`  - ${name} (enabled: ${source.enabled})`);
+    log.info(`  - ${name} (repo: ${source.repo})`);
   }
   log.info(`Repos:`);
-  for (const repo of config.repos) {
-    log.info(`  - ${repo.name} (${repo.path})`);
+  for (const repo of repos) {
+    log.info(`  - ${repo.name} (${repo.path})${repo.remote ? ` → ${repo.remote}` : ""}`);
   }
 
   // Start the poller

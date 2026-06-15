@@ -11,18 +11,53 @@ import type {
   StatusTransition,
 } from "../../types/plugin.js";
 
-/** GitHub plugin config shape (convention, enforced by the plugin) */
+/**
+ * Default label vocabulary. Used as-is unless overridden per-source via the flat
+ * optional fields below. Core never reads these — they live entirely in the plugin.
+ */
+const DEFAULT_TRIGGER = "ready-for-agent";
+const DEFAULT_PROCESSING = "agent-processing";
+const DEFAULT_DONE = "agent-done";
+const DEFAULT_FAILED = "agent-failed";
+
+/** GitHub plugin config shape — everything optional (defaults apply); `repo` overrides the bound repo's remote. */
 interface GitHubConfig {
-  repo: string;
-  targetRepo: string;
+  repo?: string;                // "owner/repo" override; defaults to ctx.repo.remote
+  triggerLabel?: string;
+  processingLabel?: string;
+  doneLabel?: string;
+  failedLabel?: string;
+}
+
+interface GitHubRuntime {
+  repo: string;                 // resolved "owner/repo"
   triggerLabel: string;
   processingLabel: string;
   doneLabel: string;
   failedLabel: string;
+  repoName: string;             // ctx.repo.name (RawIssue.targetRepo)
 }
 
-function getConfig(ctx: SourceContext): GitHubConfig {
-  return ctx.config as unknown as GitHubConfig;
+/** Resolve runtime config: merge flat overrides with defaults, derive "owner/repo" and targetRepo from ctx. */
+function resolveRuntime(ctx: SourceContext): GitHubRuntime {
+  const c = (ctx.config ?? {}) as GitHubConfig;
+  const repo = c.repo ?? ctx.repo?.remote;
+  if (!repo) {
+    throw new Error(
+      "GitHub source cannot resolve 'owner/repo': set `repo` in source.config or bind a repo whose `git remote` can be inferred.",
+    );
+  }
+  if (!ctx.repo) {
+    throw new Error("GitHub source is not bound to a repo — check the source's `repo` field and repos.json.");
+  }
+  return {
+    repo,
+    repoName: ctx.repo.name,
+    triggerLabel: c.triggerLabel ?? DEFAULT_TRIGGER,
+    processingLabel: c.processingLabel ?? DEFAULT_PROCESSING,
+    doneLabel: c.doneLabel ?? DEFAULT_DONE,
+    failedLabel: c.failedLabel ?? DEFAULT_FAILED,
+  };
 }
 
 interface GhIssue {
@@ -36,59 +71,59 @@ export class GitHubIssueSourcePlugin implements IssueSourcePlugin {
   name = "github";
 
   async init(ctx: SourceContext): Promise<void> {
-    const config = getConfig(ctx);
+    const rt = resolveRuntime(ctx);
     const labels = [
-      { name: config.triggerLabel, color: "0075CA", desc: "Ready for agent to process" },
-      { name: config.processingLabel, color: "FBCA04", desc: "Agent is processing this issue" },
-      { name: config.doneLabel, color: "0E8A16", desc: "Agent completed, PR created" },
-      { name: config.failedLabel, color: "E1141B", desc: "Agent processing failed" },
+      { name: rt.triggerLabel, color: "0075CA", desc: "Ready for agent to process" },
+      { name: rt.processingLabel, color: "FBCA04", desc: "Agent is processing this issue" },
+      { name: rt.doneLabel, color: "0E8A16", desc: "Agent completed, PR created" },
+      { name: rt.failedLabel, color: "E1141B", desc: "Agent processing failed" },
     ];
     for (const label of labels) {
       try {
         execSync(
-          `gh label create "${label.name}" --repo ${config.repo} --color ${label.color} --description "${label.desc}" --force`,
+          `gh label create "${label.name}" --repo ${rt.repo} --color ${label.color} --description "${label.desc}" --force`,
           { timeout: 10_000 }
         );
       } catch {
         // label might already exist
       }
     }
-    ctx.logger.info(`GitHub plugin initialized for ${config.repo}`);
+    ctx.logger.info(`GitHub plugin initialized for ${rt.repo}`);
   }
 
   async discover(ctx: SourceContext): Promise<RawIssue[]> {
-    const config = getConfig(ctx);
+    const rt = resolveRuntime(ctx);
     const results: RawIssue[] = [];
     const seen = new Set<number>();
 
     // Processing issues first so a mid-transition issue (carrying both the
     // trigger and processing markers) is classified as processing, which wins
     // over queued per the priority rule.
-    for (const gh of this.ghIssueList(config.repo, config.processingLabel)) {
+    for (const gh of this.ghIssueList(rt.repo, rt.processingLabel)) {
       if (seen.has(gh.number)) continue;
       seen.add(gh.number);
-      results.push(this.toRaw(gh, config, "processing"));
+      results.push(this.toRaw(gh, rt, "processing"));
     }
-    for (const gh of this.ghIssueList(config.repo, config.triggerLabel)) {
+    for (const gh of this.ghIssueList(rt.repo, rt.triggerLabel)) {
       if (seen.has(gh.number)) continue;
       seen.add(gh.number);
-      results.push(this.toRaw(gh, config, "queued"));
+      results.push(this.toRaw(gh, rt, "queued"));
     }
 
-    ctx.logger.info(`${config.repo}: discovered ${results.length} issues`);
+    ctx.logger.info(`${rt.repo}: discovered ${results.length} issues`);
     return results;
   }
 
   async getStatus(ctx: SourceContext, sourceId: string): Promise<IssueStatus> {
-    const config = getConfig(ctx);
+    const rt = resolveRuntime(ctx);
     try {
       const raw = execSync(
-        `gh issue view ${sourceId} --repo ${config.repo} --json labels`,
+        `gh issue view ${sourceId} --repo ${rt.repo} --json labels`,
         { encoding: "utf-8", timeout: 15_000 }
       );
       const data = JSON.parse(raw);
       const labels: string[] = data.labels.map((l: { name: string }) => l.name);
-      return { state: this.labelsToState(labels, config) };
+      return { state: this.labelsToState(labels, rt) };
     } catch {
       return { state: null };
     }
@@ -104,32 +139,32 @@ export class GitHubIssueSourcePlugin implements IssueSourcePlugin {
   }
 
   async transition(ctx: SourceContext, sourceId: string, transition: StatusTransition): Promise<void> {
-    const config = getConfig(ctx);
-    const fromLabel = this.stateToLabel(transition.from, config);
-    const toLabel = this.stateToLabel(transition.to, config);
+    const rt = resolveRuntime(ctx);
+    const fromLabel = this.stateToLabel(transition.from, rt);
+    const toLabel = this.stateToLabel(transition.to, rt);
     try {
       execSync(
-        `gh issue edit ${sourceId} --repo ${config.repo} --remove-label "${fromLabel}" --add-label "${toLabel}"`,
+        `gh issue edit ${sourceId} --repo ${rt.repo} --remove-label "${fromLabel}" --add-label "${toLabel}"`,
         { timeout: 15_000 }
       );
     } catch (err: any) {
       ctx.logger.error(
-        `Failed to transition ${config.repo}#${sourceId} (${transition.from}→${transition.to}): ${err.message}`
+        `Failed to transition ${rt.repo}#${sourceId} (${transition.from}→${transition.to}): ${err.message}`
       );
     }
   }
 
   async onComment(ctx: SourceContext, sourceId: string, comment: string): Promise<void> {
-    const config = getConfig(ctx);
+    const rt = resolveRuntime(ctx);
     try {
       const tmpFile = path.join(os.tmpdir(), `tl-comment-${Date.now()}.md`);
       fs.writeFileSync(tmpFile, comment, "utf-8");
-      execSync(`gh issue comment ${sourceId} --repo ${config.repo} --body-file "${tmpFile}"`, {
+      execSync(`gh issue comment ${sourceId} --repo ${rt.repo} --body-file "${tmpFile}"`, {
         timeout: 15_000,
       });
       fs.unlinkSync(tmpFile);
     } catch (err: any) {
-      ctx.logger.error(`Failed to comment on ${config.repo}#${sourceId}: ${err.message}`);
+      ctx.logger.error(`Failed to comment on ${rt.repo}#${sourceId}: ${err.message}`);
     }
   }
 
@@ -145,32 +180,32 @@ export class GitHubIssueSourcePlugin implements IssueSourcePlugin {
     }
   }
 
-  private toRaw(gh: GhIssue, config: GitHubConfig, state: IssueState): RawIssue {
+  private toRaw(gh: GhIssue, rt: GitHubRuntime, state: IssueState): RawIssue {
     return {
       sourceId: String(gh.number),
       url: gh.url,
       title: gh.title,
-      targetRepo: config.targetRepo,
+      targetRepo: rt.repoName,
       state,
     };
   }
 
   /** Resolve a set of GitHub labels to a single standard state.
    *  Priority: terminal states over in-flight; failure over success. */
-  private labelsToState(labels: string[], config: GitHubConfig): IssueState | null {
-    if (labels.includes(config.failedLabel)) return "failed";
-    if (labels.includes(config.doneLabel)) return "done";
-    if (labels.includes(config.processingLabel)) return "processing";
-    if (labels.includes(config.triggerLabel)) return "queued";
+  private labelsToState(labels: string[], rt: GitHubRuntime): IssueState | null {
+    if (labels.includes(rt.failedLabel)) return "failed";
+    if (labels.includes(rt.doneLabel)) return "done";
+    if (labels.includes(rt.processingLabel)) return "processing";
+    if (labels.includes(rt.triggerLabel)) return "queued";
     return null;
   }
 
-  private stateToLabel(state: IssueState, config: GitHubConfig): string {
+  private stateToLabel(state: IssueState, rt: GitHubRuntime): string {
     switch (state) {
-      case "queued": return config.triggerLabel;
-      case "processing": return config.processingLabel;
-      case "done": return config.doneLabel;
-      case "failed": return config.failedLabel;
+      case "queued": return rt.triggerLabel;
+      case "processing": return rt.processingLabel;
+      case "done": return rt.doneLabel;
+      case "failed": return rt.failedLabel;
     }
   }
 }
