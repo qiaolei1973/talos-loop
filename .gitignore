@@ -5,6 +5,7 @@ data/
 *.db-wal
 *.db-shm
 .env
+config.json
 server/data/
 package-lock.json
 .claude

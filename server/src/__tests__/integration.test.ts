@@ -1,97 +1,94 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
-import type { IssueSourcePlugin, SourceContext, RawIssue } from "../types/plugin.js";
+import { describe, it, expect, vi } from "vitest";
+import type {
+  IssueSourcePlugin,
+  SourceContext,
+  RawIssue,
+  IssueStatus,
+  IssueState,
+  StatusTransition,
+} from "../types/plugin.js";
 
 /**
- * Integration-level test: verify that a mock plugin's discover() output
- * gets correctly upserted to the database via pollSource().
+ * Contract-layer test (Seam A): verify the standard issue-state contract shape
+ * and that a mock plugin satisfies the IssueSourcePlugin interface. Conformance
+ * is enforced by the TypeScript compiler.
  */
-describe("Plugin Interface Integration", () => {
-  // We test the contract between core and plugin at the type/logic level,
-  // without spinning up the full server or making real gh CLI calls.
-
-  it("RawIssue fields map correctly to DB columns", () => {
+describe("Issue-state contract", () => {
+  it("RawIssue carries a standard state and no metadata", () => {
     const raw: RawIssue = {
-      sourceType: "github",
       sourceId: "42",
       url: "https://github.com/test/repo/issues/42",
       title: "Test issue",
       targetRepo: "test-repo",
-      metadata: { labels: ["ready-for-agent"] },
+      state: "queued",
     };
-
-    // Verify the shape matches what DB expects
-    expect(raw.sourceType).toBe("github");
     expect(raw.sourceId).toBe("42");
-    expect(raw.targetRepo).toBe("test-repo");
-    expect(raw.url).toBeTruthy();
-    expect(raw.title).toBeTruthy();
+    expect(raw.state).toBe("queued");
+    expect((raw as any).metadata).toBeUndefined();
   });
 
-  it("StatusTransition has from/to fields", () => {
-    const transition = { from: "ready-for-agent", to: "agent-processing" };
-    expect(transition.from).toBe("ready-for-agent");
-    expect(transition.to).toBe("agent-processing");
+  it("IssueStatus.state is IssueState | null", () => {
+    const active: IssueStatus = { state: "processing" };
+    const offPipeline: IssueStatus = { state: null };
+    expect(active.state).toBe("processing");
+    expect(offPipeline.state).toBeNull();
   });
 
-  it("IssueStatus has labels array", () => {
-    const status = { labels: ["agent-processing", "bug"] };
-    expect(status.labels).toContain("agent-processing");
-    expect(status.labels).toHaveLength(2);
+  it("StatusTransition uses standard states", () => {
+    const t: StatusTransition = { from: "processing", to: "done" };
+    expect(t.from).toBe("processing");
+    expect(t.to).toBe("done");
   });
 
-  it("mock plugin satisfies IssueSourcePlugin interface", async () => {
-    const mockPlugin: IssueSourcePlugin = {
+  it("IssueState covers exactly the four pipeline states", () => {
+    const states: IssueState[] = ["queued", "processing", "done", "failed"];
+    expect(new Set(states).size).toBe(4);
+  });
+
+  it("a mock plugin satisfies the IssueSourcePlugin interface (transition required)", async () => {
+    const calls: StatusTransition[] = [];
+    const plugin: IssueSourcePlugin = {
       name: "mock",
 
-      async init(ctx: SourceContext): Promise<void> {
-        // no-op
-      },
+      async init(): Promise<void> {},
 
-      async discover(ctx: SourceContext): Promise<RawIssue[]> {
+      async discover(): Promise<RawIssue[]> {
         return [
-          {
-            sourceType: "mock",
-            sourceId: "1",
-            url: "https://example.com/issues/1",
-            title: "Mock issue",
-            targetRepo: "test-repo",
-          },
+          { sourceId: "1", url: "https://example.com/1", title: "Queued", targetRepo: "r", state: "queued" },
+          { sourceId: "2", url: "https://example.com/2", title: "Processing", targetRepo: "r", state: "processing" },
         ];
       },
 
-      async getStatus(ctx: SourceContext, sourceId: string): Promise<{ labels: string[] }> {
-        return { labels: ["ready"] };
+      async getStatus(_ctx: SourceContext, sourceId: string): Promise<IssueStatus> {
+        return sourceId === "2" ? { state: "processing" } : { state: "queued" };
       },
 
-      async test(ctx: SourceContext): Promise<boolean> {
+      async transition(_ctx: SourceContext, _sourceId: string, t: StatusTransition): Promise<void> {
+        calls.push(t);
+      },
+
+      async test(): Promise<boolean> {
         return true;
       },
 
-      onStatusChange: async (ctx, sourceId, transition) => {
-        // no-op
-      },
-
-      onComment: async (ctx, sourceId, comment) => {
-        // no-op
-      },
+      // onComment is optional and intentionally omitted.
     };
-
-    expect(mockPlugin.name).toBe("mock");
 
     const ctx: SourceContext = {
       config: {},
-      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as any,
     };
 
-    await mockPlugin.init(ctx);
-    const issues = await mockPlugin.discover(ctx);
-    expect(issues).toHaveLength(1);
-    expect(issues[0].sourceType).toBe("mock");
+    await plugin.init(ctx);
+    const issues = await plugin.discover(ctx);
+    expect(issues.map((i) => i.state)).toEqual(["queued", "processing"]);
 
-    const status = await mockPlugin.getStatus(ctx, "1");
-    expect(status.labels).toContain("ready");
+    expect((await plugin.getStatus(ctx, "1")).state).toBe("queued");
+    expect((await plugin.getStatus(ctx, "2")).state).toBe("processing");
 
-    const healthy = await mockPlugin.test(ctx);
-    expect(healthy).toBe(true);
+    await plugin.transition(ctx, "1", { from: "queued", to: "processing" });
+    expect(calls).toEqual([{ from: "queued", to: "processing" }]);
+
+    expect(await plugin.test(ctx)).toBe(true);
   });
 });

@@ -4,7 +4,7 @@ import { getAllIssues, getIssuesByTargetRepo, getSessionsByIssue, getIssueById }
 import { pollAll } from "../services/poller.js";
 import { dispatch } from "../services/dispatcher.js";
 import { getRunningSessions } from "../db/index.js";
-import { resolvePlugin } from "../plugins/loader.js";
+import { resolvePlugin, getPluginName } from "../plugins/loader.js";
 import { createLogger } from "../services/logger.js";
 
 const log = createLogger("api");
@@ -61,7 +61,9 @@ export async function registerApiRoutes(app: FastifyInstance): Promise<void> {
       lastPollAt,
       nextPollAt,
       pollInterval: config.pollInterval,
-      sources: sources.map((s) => ({ type: s.type, enabled: s.enabled })),
+      sources: await Promise.all(
+        sources.map(async (s) => ({ name: await getPluginName(s.type), enabled: s.enabled })),
+      ),
     };
   });
 
@@ -85,10 +87,18 @@ export async function registerApiRoutes(app: FastifyInstance): Promise<void> {
   // All issues
   app.get("/api/issues", async () => {
     const issues = getAllIssues();
-    return issues.map((issue) => {
-      const sessions = getSessionsByIssue(issue.id);
-      return { ...issue, sessions };
-    });
+    // Resolve a friendly source name per unique source_type (falls back to the type itself)
+    const nameCache = new Map<string, string>();
+    for (const issue of issues) {
+      if (!nameCache.has(issue.source_type)) {
+        nameCache.set(issue.source_type, await getPluginName(issue.source_type));
+      }
+    }
+    return issues.map((issue) => ({
+      ...issue,
+      source_name: nameCache.get(issue.source_type),
+      sessions: getSessionsByIssue(issue.id),
+    }));
   });
 
   // Sessions for an issue
@@ -108,12 +118,7 @@ export async function registerApiRoutes(app: FastifyInstance): Promise<void> {
       const source = loadConfig().sources.find((s) => s.type === issue.source_type);
       const ctx = { config: source?.config ?? {}, logger: log };
 
-      const failedLabel = ctx.config.failedLabel as string;
-      const triggerLabel = ctx.config.triggerLabel as string;
-
-      if (plugin.onStatusChange) {
-        await plugin.onStatusChange(ctx, issue.source_id, { from: failedLabel, to: triggerLabel });
-      }
+      await plugin.transition(ctx, issue.source_id, { from: "failed", to: "queued" });
       return { success: true };
     } catch (err: any) {
       return { error: err.message };

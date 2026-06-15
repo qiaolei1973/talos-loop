@@ -2,7 +2,14 @@ import { execSync } from "child_process";
 import fs from "fs";
 import os from "os";
 import path from "path";
-import type { IssueSourcePlugin, SourceContext, RawIssue, IssueStatus, StatusTransition } from "../../types/plugin.js";
+import type {
+  IssueSourcePlugin,
+  SourceContext,
+  RawIssue,
+  IssueStatus,
+  IssueState,
+  StatusTransition,
+} from "../../types/plugin.js";
 
 /** GitHub plugin config shape (convention, enforced by the plugin) */
 interface GitHubConfig {
@@ -52,29 +59,20 @@ export class GitHubIssueSourcePlugin implements IssueSourcePlugin {
   async discover(ctx: SourceContext): Promise<RawIssue[]> {
     const config = getConfig(ctx);
     const results: RawIssue[] = [];
-
-    // Fetch issues with trigger label
-    const triggerIssues = this.ghIssueList(config.repo, config.triggerLabel);
-    // Fetch issues with processing label
-    const processingIssues = this.ghIssueList(config.repo, config.processingLabel);
-
-    // Deduplicate by issue number
     const seen = new Set<number>();
 
-    for (const gh of [...triggerIssues, ...processingIssues]) {
+    // Processing issues first so a mid-transition issue (carrying both the
+    // trigger and processing markers) is classified as processing, which wins
+    // over queued per the priority rule.
+    for (const gh of this.ghIssueList(config.repo, config.processingLabel)) {
       if (seen.has(gh.number)) continue;
       seen.add(gh.number);
-
-      results.push({
-        sourceType: "github",
-        sourceId: String(gh.number),
-        url: gh.url,
-        title: gh.title,
-        targetRepo: config.targetRepo,
-        metadata: {
-          labels: gh.labels.map((l) => l.name),
-        },
-      });
+      results.push(this.toRaw(gh, config, "processing"));
+    }
+    for (const gh of this.ghIssueList(config.repo, config.triggerLabel)) {
+      if (seen.has(gh.number)) continue;
+      seen.add(gh.number);
+      results.push(this.toRaw(gh, config, "queued"));
     }
 
     ctx.logger.info(`${config.repo}: discovered ${results.length} issues`);
@@ -89,9 +87,10 @@ export class GitHubIssueSourcePlugin implements IssueSourcePlugin {
         { encoding: "utf-8", timeout: 15_000 }
       );
       const data = JSON.parse(raw);
-      return { labels: data.labels.map((l: { name: string }) => l.name) };
+      const labels: string[] = data.labels.map((l: { name: string }) => l.name);
+      return { state: this.labelsToState(labels, config) };
     } catch {
-      return { labels: [] };
+      return { state: null };
     }
   }
 
@@ -104,15 +103,19 @@ export class GitHubIssueSourcePlugin implements IssueSourcePlugin {
     }
   }
 
-  async onStatusChange(ctx: SourceContext, sourceId: string, transition: StatusTransition): Promise<void> {
+  async transition(ctx: SourceContext, sourceId: string, transition: StatusTransition): Promise<void> {
     const config = getConfig(ctx);
+    const fromLabel = this.stateToLabel(transition.from, config);
+    const toLabel = this.stateToLabel(transition.to, config);
     try {
       execSync(
-        `gh issue edit ${sourceId} --repo ${config.repo} --remove-label "${transition.from}" --add-label "${transition.to}"`,
+        `gh issue edit ${sourceId} --repo ${config.repo} --remove-label "${fromLabel}" --add-label "${toLabel}"`,
         { timeout: 15_000 }
       );
     } catch (err: any) {
-      ctx.logger.error(`Failed to edit labels on ${config.repo}#${sourceId}: ${err.message}`);
+      ctx.logger.error(
+        `Failed to transition ${config.repo}#${sourceId} (${transition.from}→${transition.to}): ${err.message}`
+      );
     }
   }
 
@@ -139,6 +142,35 @@ export class GitHubIssueSourcePlugin implements IssueSourcePlugin {
       return JSON.parse(raw);
     } catch {
       return [];
+    }
+  }
+
+  private toRaw(gh: GhIssue, config: GitHubConfig, state: IssueState): RawIssue {
+    return {
+      sourceId: String(gh.number),
+      url: gh.url,
+      title: gh.title,
+      targetRepo: config.targetRepo,
+      state,
+    };
+  }
+
+  /** Resolve a set of GitHub labels to a single standard state.
+   *  Priority: terminal states over in-flight; failure over success. */
+  private labelsToState(labels: string[], config: GitHubConfig): IssueState | null {
+    if (labels.includes(config.failedLabel)) return "failed";
+    if (labels.includes(config.doneLabel)) return "done";
+    if (labels.includes(config.processingLabel)) return "processing";
+    if (labels.includes(config.triggerLabel)) return "queued";
+    return null;
+  }
+
+  private stateToLabel(state: IssueState, config: GitHubConfig): string {
+    switch (state) {
+      case "queued": return config.triggerLabel;
+      case "processing": return config.processingLabel;
+      case "done": return config.doneLabel;
+      case "failed": return config.failedLabel;
     }
   }
 }
