@@ -49,37 +49,56 @@ npm install
 
 ## 配置
 
-编辑项目根目录的 `config.json`：
+`config.json` 不纳入版本控制（含本地路径等环境相关信息），仓库提供了 `config.example.json` 作为模板：
+
+```bash
+cp config.example.json config.json   # 复制模板，再按自己的仓库修改
+```
 
 ```jsonc
 {
-  "port": 3100,                    // 服务监听端口
-  "pollInterval": 60000,           // 轮询间隔（毫秒）
-  "triggerLabel": "ready-for-agent",    // 触发处理的标签
-  "processingLabel": "agent-processing", // 处理中标签
-  "doneLabel": "agent-done",             // 完成标签
-  "failedLabel": "agent-failed",         // 失败标签
-  "maxParallel": 1,                // 最大并发数
-  "claudeTimeout": 600,            // Claude 会话超时（秒）
-  "repos": [
+  "repos": [                          // 代码仓库 —— Claude 运行的地方
+    { "name": "my-project", "remote": "owner/repo", "path": "/abs/path/to/local/clone" }
+  ],
+  "sources": [                        // Issue 来源 —— 每个 source 对应一个插件
     {
-      "name": "my-project",
-      "github": "owner/repo",
-      "path": "/absolute/path/to/local/clone",
-      "enabled": true
+      "type": "github",               // 内置插件 "github"；外部插件填 npm 包名或本地路径
+      "enabled": true,
+      "config": {                     // 插件特定配置（github 插件字段见下）
+        "repo": "owner/repo",
+        "targetRepo": "my-project",
+        "triggerLabel": "ready-for-agent",
+        "processingLabel": "agent-processing",
+        "doneLabel": "agent-done",
+        "failedLabel": "agent-failed"
+      }
     }
-  ]
+  ],
+  "port": 3100,                       // 服务监听端口
+  "pollInterval": 60000,              // 轮询间隔（毫秒）
+  "maxParallel": 1,                   // 最大并发数
+  "claudeTimeout": 600                // Claude 会话超时（秒）
 }
 ```
 
-**可选字段**（有默认值，可不配置）：
+**顶层可选字段**（有默认值，可不配置）：
 
 | 字段 | 默认值 | 说明 |
 |------|--------|------|
-| `processingLabel` | `agent-processing` | 处理中自动添加的标签 |
-| `doneLabel` | `agent-done` | 成功后添加的标签 |
-| `failedLabel` | `agent-failed` | 失败后添加的标签 |
+| `port` | `3100` | 服务监听端口 |
+| `pollInterval` | `60000` | 轮询间隔（毫秒） |
+| `maxParallel` | `1` | 最大并发处理数 |
+| `claudeTimeout` | `600` | Claude 会话超时（秒） |
 | `dbPath` | `<root>/server/data/talos-loop.db` | SQLite 数据库路径 |
+
+### 插件（Issue Source）
+
+`source.type` 决定使用哪个插件：
+
+- `"github"` —— 内置插件，随 talos-loop 一起发布，开箱即用。
+- 其他字符串 —— 按包名/本地路径直接加载（`require(type)`），例如 `"@acme/source-jira"` 或 `"./plugins/my-source"`。
+
+`type`（包名）仅用于加载/注册；每个插件在自身声明 `name`（alias），日志输出和 Dashboard 展示都使用这个 `name`。例如 `@acme/source-jira` 包加载后，日志与界面会显示 `jira`。
 
 ## 运行
 
@@ -135,7 +154,7 @@ npm start            # 启动服务，监听 0.0.0.0:3100
 
 ```
 talos-loop/
-├── config.json                  # 运行时配置
+├── config.example.json          # 配置模板（config.json 不纳入版本控制）
 ├── package.json                 # 根 workspace（concurrently）
 ├── server/
 │   ├── package.json

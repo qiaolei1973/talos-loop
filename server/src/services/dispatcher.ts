@@ -12,7 +12,7 @@ import {
   updateIssueStatus,
 } from "../db/index.js";
 import { resolvePlugin } from "../plugins/loader.js";
-import type { PollResult, DiscoveredIssue } from "./poller.js";
+import type { PollResult, IssueEntry } from "./poller.js";
 import type { SourceContext } from "../types/plugin.js";
 import * as tmux from "./tmux.js";
 import { createLogger } from "./logger.js";
@@ -93,20 +93,14 @@ async function checkRunningSessions(): Promise<{ completed: number; failed: numb
     // Get plugin for status callbacks
     const plugin = await resolvePlugin(source_type);
     const ctx = buildSourceContext(source_type);
-
-    // Read processing/done/failed labels from source config
-    const processingLabel = ctx.config.processingLabel as string;
-    const doneLabel = ctx.config.doneLabel as string;
-    const failedLabel = ctx.config.failedLabel as string;
+    const sourceName = plugin.name;
 
     if (prUrl) {
-      log.info(`✅ ${source_type}:${source_id} done — ${prUrl}`);
+      log.info(`✅ ${sourceName}:${source_id} done — ${prUrl}`);
       updateSessionStatus(session.id, "done", prUrl);
       updateIssueStatus(source_type, source_id, "done");
 
-      if (plugin.onStatusChange) {
-        await plugin.onStatusChange(ctx, source_id, { from: processingLabel, to: doneLabel });
-      }
+      await plugin.transition(ctx, source_id, { from: "processing", to: "done" });
       if (plugin.onComment) {
         await plugin.onComment(ctx, source_id, `✅ Agent completed. PR: ${prUrl}`);
       }
@@ -115,13 +109,11 @@ async function checkRunningSessions(): Promise<{ completed: number; failed: numb
       completed++;
     } else {
       const tail = lastOutput.trim().slice(-500) || "Session exited without creating a PR";
-      log.info(`❌ ${source_type}:${source_id} failed`);
+      log.info(`❌ ${sourceName}:${source_id} failed`);
       updateSessionStatus(session.id, "failed", undefined, tail);
       updateIssueStatus(source_type, source_id, "failed");
 
-      if (plugin.onStatusChange) {
-        await plugin.onStatusChange(ctx, source_id, { from: processingLabel, to: failedLabel });
-      }
+      await plugin.transition(ctx, source_id, { from: "processing", to: "failed" });
       if (plugin.onComment) {
         await plugin.onComment(ctx, source_id, `❌ Agent processing failed.\n\n\`\`\`\n${tail.slice(0, 1000)}\n\`\`\``);
       }
@@ -146,7 +138,7 @@ async function dispatchNew(pollResults: PollResult[]): Promise<number> {
   }
 
   // Collect all discovered (queued) issues across sources
-  const candidates: DiscoveredIssue[] = pollResults
+  const candidates: IssueEntry[] = pollResults
     .flatMap((r) => r.discovered);
 
   // Sort by sourceId (for GitHub, lower number = older = higher priority)
@@ -163,28 +155,23 @@ async function dispatchNew(pollResults: PollResult[]): Promise<number> {
   for (const candidate of candidates.slice(0, slotsAvailable)) {
     const { issue, sourceType, sourceId, targetRepo } = candidate;
 
+    // Resolve plugin + context up front so the display name is available in logs
+    const plugin = await resolvePlugin(sourceType);
+    const ctx = buildSourceContext(sourceType);
+    const sourceName = plugin.name;
+
     // Resolve repo for path and remote
     const repo = getRepoByName(targetRepo);
     if (!repo) {
-      log.error(`Repo "${targetRepo}" not found for ${sourceType}:${sourceId}`);
+      log.error(`Repo "${targetRepo}" not found for ${sourceName}:${sourceId}`);
       continue;
     }
 
-    // Real-time label verification — guard against stale poll data
-    const plugin = await resolvePlugin(sourceType);
-    const ctx = buildSourceContext(sourceType);
-    const currentStatus = await plugin.getStatus(ctx, sourceId);
-
-    const triggerLabel = ctx.config.triggerLabel as string;
-    const processingLabel = ctx.config.processingLabel as string;
-    const doneLabel = ctx.config.doneLabel as string;
-
-    if (!currentStatus.labels.includes(triggerLabel)) {
-      log.info(`Skipping ${sourceType}:${sourceId} — trigger label no longer present`);
-      continue;
-    }
-    if (currentStatus.labels.includes(processingLabel) || currentStatus.labels.includes(doneLabel)) {
-      log.warn(`Skipping ${sourceType}:${sourceId} — unexpected labels: ${currentStatus.labels.join(", ")}`);
+    // Real-time state verification — guard against stale poll data. Only
+    // dispatch issues still in the queued state.
+    const current = await plugin.getStatus(ctx, sourceId);
+    if (current.state !== "queued") {
+      log.info(`Skipping ${sourceName}:${sourceId} — state is ${current.state ?? "null"}, not queued`);
       continue;
     }
 
@@ -205,13 +192,11 @@ async function dispatchNew(pollResults: PollResult[]): Promise<number> {
     fs.chmodSync(scriptFile, 0o755);
     const command = scriptFile;
 
-    log.info(`🚀 Dispatching ${sourceType}:${sourceId} → session ${session}`);
+    log.info(`🚀 Dispatching ${sourceName}:${sourceId} → session ${session}`);
 
     try {
       // Update status via plugin
-      if (plugin.onStatusChange) {
-        await plugin.onStatusChange(ctx, sourceId, { from: triggerLabel, to: processingLabel });
-      }
+      await plugin.transition(ctx, sourceId, { from: "queued", to: "processing" });
       if (plugin.onComment) {
         await plugin.onComment(ctx, sourceId, "🤖 Agent has started processing this issue...");
       }
@@ -226,11 +211,8 @@ async function dispatchNew(pollResults: PollResult[]): Promise<number> {
 
       dispatched++;
     } catch (err: any) {
-      log.error(`Failed to dispatch ${sourceType}:${sourceId}: ${err.message}`);
-      if (plugin.onStatusChange) {
-        const failedLabel = ctx.config.failedLabel as string;
-        await plugin.onStatusChange(ctx, sourceId, { from: processingLabel, to: failedLabel });
-      }
+      log.error(`Failed to dispatch ${sourceName}:${sourceId}: ${err.message}`);
+      await plugin.transition(ctx, sourceId, { from: "processing", to: "failed" });
     }
   }
 

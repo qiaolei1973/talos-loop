@@ -2,6 +2,7 @@ import Database from "better-sqlite3";
 import fs from "fs";
 import path from "path";
 import { loadConfig } from "../config.js";
+import type { IssueState } from "../types/plugin.js";
 
 let db: Database.Database;
 
@@ -71,7 +72,7 @@ export interface Issue {
   url: string;
   title: string | null;
   tmux_session: string | null;
-  status: string;
+  status: IssueState;
   created_at: string;
   updated_at: string;
 }
@@ -122,7 +123,7 @@ export function updateIssueTmux(sourceType: string, sourceId: string, tmuxSessio
     .run(tmuxSession, sourceType, sourceId);
 }
 
-export function updateIssueStatus(sourceType: string, sourceId: string, status: string): void {
+export function updateIssueStatus(sourceType: string, sourceId: string, status: IssueState): void {
   getDb().prepare("UPDATE issues SET status = ?, updated_at = datetime('now') WHERE source_type = ? AND source_id = ?")
     .run(status, sourceType, sourceId);
 }

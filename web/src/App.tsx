@@ -15,6 +15,7 @@ import {
 interface Issue {
   id: number;
   source_type: string;
+  source_name?: string;
   source_id: string;
   target_repo: string;
   url: string;
@@ -43,7 +44,7 @@ interface Status {
   lastPollAt: string | null;
   nextPollAt: string | null;
   pollInterval: number;
-  sources?: { type: string; enabled: boolean }[];
+  sources?: { name: string; enabled: boolean }[];
 }
 
 const API = "";
@@ -239,7 +240,7 @@ export default function App() {
                             <span className="ml-2 text-gray-700">{issue.title}</span>
                           </td>
                           <td className="px-4 py-3">
-                            <SourceTypeBadge type={issue.source_type} />
+                            <SourceTypeBadge type={issue.source_name ?? issue.source_type} />
                           </td>
                           <td className="px-4 py-3">
                             <StatusBadge status={issue.status} />

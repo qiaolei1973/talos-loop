@@ -7,7 +7,7 @@ import { getDb } from "./db/index.js";
 import { registerApiRoutes, startPoller } from "./routes/api.js";
 import { checkTmux } from "./services/tmux.js";
 import { getEnabledSources } from "./config.js";
-import { resolvePlugin } from "./plugins/loader.js";
+import { resolvePlugin, getPluginName } from "./plugins/loader.js";
 import { createLogger } from "./services/logger.js";
 
 const log = createLogger("server");
@@ -27,16 +27,16 @@ async function main() {
   for (const source of sources) {
     try {
       const plugin = await resolvePlugin(source.type);
-      const ctx = { config: source.config, logger: createLogger(`plugin:${source.type}`) };
+      const ctx = { config: source.config, logger: createLogger(`plugin:${plugin.name}`) };
 
-      log.info(`Initializing plugin "${source.type}"...`);
+      log.info(`Initializing plugin "${plugin.name}"...`);
       await plugin.init(ctx);
 
       const healthy = await plugin.test(ctx);
       if (!healthy) {
-        log.warn(`Plugin "${source.type}" health check failed — source may not work correctly`);
+        log.warn(`Plugin "${plugin.name}" health check failed — source may not work correctly`);
       } else {
-        log.info(`Plugin "${source.type}" initialized and healthy`);
+        log.info(`Plugin "${plugin.name}" initialized and healthy`);
       }
     } catch (err: any) {
       log.error(`Plugin "${source.type}" failed to initialize: ${err.message}`);
@@ -85,7 +85,8 @@ async function main() {
   log.info(`⏱  Polling every ${config.pollInterval / 1000}s for ${enabledSources.length} source(s)`);
   log.info(`Sources:`);
   for (const source of enabledSources) {
-    log.info(`  - ${source.type} (enabled: ${source.enabled})`);
+    const name = await getPluginName(source.type);
+    log.info(`  - ${name} (enabled: ${source.enabled})`);
   }
   log.info(`Repos:`);
   for (const repo of config.repos) {

@@ -57,11 +57,8 @@ describe("GitHubIssueSourcePlugin", () => {
   describe("init()", () => {
     it("should create labels via gh CLI", async () => {
       mockExecSync.mockReturnValue("");
-      const ctx = makeCtx();
+      await plugin.init(makeCtx());
 
-      await plugin.init(ctx);
-
-      // Should call gh label create for each of 4 labels
       const calls = mockExecSync.mock.calls.filter(
         (c: any[]) => typeof c[0] === "string" && c[0].includes("gh label create")
       );
@@ -72,127 +69,119 @@ describe("GitHubIssueSourcePlugin", () => {
   describe("test()", () => {
     it("should return true when gh auth succeeds", async () => {
       mockExecSync.mockReturnValue("");
-      const ctx = makeCtx();
-
-      const result = await plugin.test(ctx);
-      expect(result).toBe(true);
+      expect(await plugin.test(makeCtx())).toBe(true);
     });
 
     it("should return false when gh auth fails", async () => {
       mockExecSync.mockImplementation(() => {
         throw new Error("not authenticated");
       });
-      const ctx = makeCtx();
-
-      const result = await plugin.test(ctx);
-      expect(result).toBe(false);
+      expect(await plugin.test(makeCtx())).toBe(false);
     });
   });
 
   describe("discover()", () => {
-    it("should parse gh issue list output and return RawIssue[]", async () => {
+    it("should tag each RawIssue with its standard state and carry no metadata", async () => {
       const ctx = makeCtx();
-      const ghResponse = JSON.stringify([
-        {
-          number: 42,
-          title: "Test issue",
-          url: "https://github.com/test/repo/issues/42",
-          labels: [{ name: "ready-for-agent" }],
-        },
-      ]);
+      const triggerIssue = { number: 1, title: "Queued", url: "u1", labels: [{ name: "ready-for-agent" }] };
+      const processingIssue = { number: 2, title: "Processing", url: "u2", labels: [{ name: "agent-processing" }] };
 
       mockExecSync.mockImplementation((cmd: string) => {
-        if (cmd.includes("gh issue list")) return ghResponse;
+        if (cmd.includes("agent-processing")) return JSON.stringify([processingIssue]);
+        if (cmd.includes("ready-for-agent")) return JSON.stringify([triggerIssue]);
         return "[]";
       });
 
       const issues = await plugin.discover(ctx);
+      expect(issues).toHaveLength(2);
 
+      const byId = Object.fromEntries(issues.map((i) => [i.sourceId, i]));
+      expect(byId["1"].state).toBe("queued");
+      expect(byId["2"].state).toBe("processing");
+      expect((issues[0] as any).metadata).toBeUndefined();
+    });
+
+    it("should dedupe, preferring processing over queued when an issue carries both markers", async () => {
+      const ctx = makeCtx();
+      const both = {
+        number: 1,
+        title: "Dupe",
+        url: "u1",
+        labels: [{ name: "ready-for-agent" }, { name: "agent-processing" }],
+      };
+      mockExecSync.mockImplementation(() => JSON.stringify([both]));
+
+      const issues = await plugin.discover(ctx);
       expect(issues).toHaveLength(1);
-      expect(issues[0]).toEqual({
-        sourceType: "github",
-        sourceId: "42",
-        url: "https://github.com/test/repo/issues/42",
-        title: "Test issue",
-        targetRepo: "test-repo",
-        metadata: { labels: ["ready-for-agent"] },
-      });
+      expect(issues[0].state).toBe("processing");
     });
 
     it("should return empty array when gh fails", async () => {
       mockExecSync.mockImplementation(() => {
         throw new Error("gh CLI error");
       });
-      const ctx = makeCtx();
-
-      const issues = await plugin.discover(ctx);
-      expect(issues).toEqual([]);
-    });
-
-    it("should deduplicate issues across trigger and processing labels", async () => {
-      const ctx = makeCtx();
-      const issue = {
-        number: 1,
-        title: "Dupe",
-        url: "https://github.com/test/repo/issues/1",
-        labels: [{ name: "ready-for-agent" }, { name: "agent-processing" }],
-      };
-
-      let callCount = 0;
-      mockExecSync.mockImplementation(() => {
-        callCount++;
-        // First call = trigger label, second call = processing label
-        return JSON.stringify([issue]);
-      });
-
-      const issues = await plugin.discover(ctx);
-      // Should only return one issue (deduped by number)
-      expect(issues).toHaveLength(1);
+      expect(await plugin.discover(makeCtx())).toEqual([]);
     });
   });
 
   describe("getStatus()", () => {
-    it("should return labels from gh issue view", async () => {
-      const ctx = makeCtx();
-      mockExecSync.mockReturnValue(JSON.stringify({
-        labels: [{ name: "agent-processing" }, { name: "bug" }],
-      }));
+    const viewReturns = (labels: string[]) =>
+      mockExecSync.mockReturnValue(JSON.stringify({ labels: labels.map((name) => ({ name })) }));
 
-      const status = await plugin.getStatus(ctx, "42");
-      expect(status.labels).toEqual(["agent-processing", "bug"]);
+    it("should map the trigger label to queued", async () => {
+      viewReturns(["ready-for-agent", "bug"]);
+      expect((await plugin.getStatus(makeCtx(), "1")).state).toBe("queued");
     });
 
-    it("should return empty labels on failure", async () => {
-      const ctx = makeCtx();
+    it("should resolve priority: failed > done > processing > queued", async () => {
+      viewReturns(["ready-for-agent", "agent-processing"]);
+      expect((await plugin.getStatus(makeCtx(), "1")).state).toBe("processing");
+
+      viewReturns(["ready-for-agent", "agent-done"]);
+      expect((await plugin.getStatus(makeCtx(), "1")).state).toBe("done");
+
+      viewReturns(["agent-done", "agent-failed"]);
+      expect((await plugin.getStatus(makeCtx(), "1")).state).toBe("failed");
+    });
+
+    it("should return null when no pipeline label is present", async () => {
+      viewReturns(["bug", "question"]);
+      expect((await plugin.getStatus(makeCtx(), "1")).state).toBeNull();
+    });
+
+    it("should return null on gh failure", async () => {
       mockExecSync.mockImplementation(() => {
         throw new Error("not found");
       });
-
-      const status = await plugin.getStatus(ctx, "999");
-      expect(status.labels).toEqual([]);
+      expect((await plugin.getStatus(makeCtx(), "999")).state).toBeNull();
     });
   });
 
-  describe("onStatusChange()", () => {
-    it("should call gh issue edit to swap labels", async () => {
-      const ctx = makeCtx();
+  describe("transition()", () => {
+    it("should remove the from-state label and add the to-state label", async () => {
       mockExecSync.mockReturnValue("");
+      await plugin.transition(makeCtx(), "42", { from: "queued", to: "processing" });
 
-      await plugin.onStatusChange(ctx, "42", { from: "ready-for-agent", to: "agent-processing" });
+      const cmd = mockExecSync.mock.calls.at(-1)![0] as string;
+      expect(cmd).toContain("gh issue edit 42");
+      expect(cmd).toContain(`--remove-label "ready-for-agent"`);
+      expect(cmd).toContain(`--add-label "agent-processing"`);
+    });
 
-      const lastCall = mockExecSync.mock.calls.at(-1)!;
-      expect(lastCall[0]).toContain("gh issue edit 42");
-      expect(lastCall[0]).toContain("--remove-label");
-      expect(lastCall[0]).toContain("--add-label");
+    it("should map done/failed states to their labels", async () => {
+      mockExecSync.mockReturnValue("");
+      await plugin.transition(makeCtx(), "7", { from: "processing", to: "failed" });
+
+      const cmd = mockExecSync.mock.calls.at(-1)![0] as string;
+      expect(cmd).toContain(`--remove-label "agent-processing"`);
+      expect(cmd).toContain(`--add-label "agent-failed"`);
     });
   });
 
   describe("onComment()", () => {
     it("should write temp file and call gh issue comment", async () => {
-      const ctx = makeCtx();
       mockExecSync.mockReturnValue("");
-
-      await plugin.onComment(ctx, "42", "✅ Done!");
+      await plugin.onComment(makeCtx(), "42", "✅ Done!");
 
       const commentCall = mockExecSync.mock.calls.find(
         (c: any[]) => typeof c[0] === "string" && c[0].includes("gh issue comment")
