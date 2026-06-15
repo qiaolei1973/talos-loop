@@ -15,7 +15,7 @@ import {
 interface Issue {
   id: number;
   source_type: string;
-  source_name?: string;
+  source_name: string;
   source_id: string;
   target_repo: string;
   url: string;
@@ -240,7 +240,7 @@ export default function App() {
                             <span className="ml-2 text-gray-700">{issue.title}</span>
                           </td>
                           <td className="px-4 py-3">
-                            <SourceTypeBadge type={issue.source_name ?? issue.source_type} />
+                            <SourceTypeBadge type={issue.source_name} />
                           </td>
                           <td className="px-4 py-3">
                             <StatusBadge status={issue.status} />

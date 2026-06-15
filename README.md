@@ -5,16 +5,16 @@ Autonomous GitHub Issue processing agent — 监控 GitHub Issues，自动调度
 ## 工作流程
 
 ```
-GitHub Issue (ready-for-agent)
+Issue (queued)
         │
         ▼
    ┌──────────┐   60s 轮询
-   │  Poller   │ ◄── gh issue list
+   │  Poller   │ ◄── discover()
    └────┬─────┘
-        │ 发现新 Issue
+        │ 发现新 Issue（带标准状态）
         ▼
    ┌────────────┐  并发控制 (maxParallel)
-   │ Dispatcher  │ ── 标签验证 ── 生成 Prompt
+   │ Dispatcher  │ ── 状态校验 ── 生成 Prompt
    └────┬───────┘
         │
         ▼
@@ -24,10 +24,10 @@ GitHub Issue (ready-for-agent)
    └────┬─────────────────┘
         │ 完成后解析 PR URL
         ▼
-  ┌───────────────────────────────────┐
-  │ 成功 → agent-done  + 评论 PR 链接  │
-  │ 失败 → agent-failed + 评论日志摘要 │
-  └───────────────────────────────────┘
+  ┌──────────────────────────────────┐
+  │ 成功 → done    + 评论 PR 链接     │
+  │ 失败 → failed  + 评论日志摘要     │
+  └──────────────────────────────────┘
 ```
 
 ## 前置依赖
@@ -99,6 +99,8 @@ cp config.example.json config.json   # 复制模板，再按自己的仓库修�
 - 其他字符串 —— 按包名/本地路径直接加载（`require(type)`），例如 `"@acme/source-jira"` 或 `"./plugins/my-source"`。
 
 `type`（包名）仅用于加载/注册；每个插件在自身声明 `name`（alias），日志输出和 Dashboard 展示都使用这个 `name`。例如 `@acme/source-jira` 包加载后，日志与界面会显示 `jira`。
+
+插件还负责 Issue 状态的双向翻译——把源机制（GitHub 标签、Jira 状态等）映射到 talos-loop 的四个标准状态（见下文「Issue 状态生命周期」）。核心代码只读 `type`/`enabled` 这类基础字段，其余插件配置完全由插件自身解释。
 
 ## 运行
 
@@ -186,14 +188,22 @@ talos-loop/
 
 **基础设施：** tmux · GitHub CLI · Claude Code CLI
 
-## 标签生命周期
+## Issue 状态生命周期
+
+talos-loop 用四个标准状态驱动整个流程，核心代码只与插件交流这些状态，不依赖任何源特定的标识（如 GitHub 标签名）。每个插件负责在自己的源机制与这四个状态之间双向翻译。
 
 ```
-ready-for-agent ──► agent-processing ──┬──► agent-done     (PR 创建成功)
-                                        └──► agent-failed  (超时或无 PR)
+queued ──► processing ──┬──► done     (PR 创建成功)
+                         └──► failed  (超时或无 PR)
+   ▲                        │
+   └──────── 重试 ──────────┘
 ```
 
-Dispatcher 在调度前会实时验证 GitHub 标签，防止过期数据触发重复处理。
+- `discover()` 发现 Issue 时即返回其标准状态，Poller 据此分桶（`queued` 待派发、`processing` 进行中）。
+- 派发前 Dispatcher 会实时复查 Issue 状态，只对仍处于 `queued` 的 Issue 派发，防止过期数据触发重复处理。
+- 状态迁移通过插件的 `transition({ from, to })` 由核心发起、插件执行；`getStatus()` 用于派发前的实时复查，返回 `null` 表示该 Issue 已不在管线任一状态。
+
+对 GitHub 插件，这四个状态分别由 `ready-for-agent` / `agent-processing` / `agent-done` / `agent-failed` 标签承载（标签名在插件自身的 `config` 中配置，核心不读取）。
 
 ## 日志
 

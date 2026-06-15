@@ -1,6 +1,6 @@
 import { FastifyInstance } from "fastify";
 import { loadConfig, getEnabledSources } from "../config.js";
-import { getAllIssues, getIssuesByTargetRepo, getSessionsByIssue, getIssueById } from "../db/index.js";
+import { getAllIssues, getIssuesByTargetRepo, getSessionsByIssue, getIssueById, type Issue } from "../db/index.js";
 import { pollAll } from "../services/poller.js";
 import { dispatch } from "../services/dispatcher.js";
 import { getRunningSessions } from "../db/index.js";
@@ -12,6 +12,17 @@ const log = createLogger("api");
 let lastPollAt: Date | null = null;
 let nextPollAt: Date | null = null;
 let pollTimer: ReturnType<typeof setTimeout> | null = null;
+
+/** Attach the plugin display name (source_name) to each issue. */
+async function withSourceName(issues: Issue[]): Promise<(Issue & { source_name: string })[]> {
+  const nameCache = new Map<string, string>();
+  for (const issue of issues) {
+    if (!nameCache.has(issue.source_type)) {
+      nameCache.set(issue.source_type, await getPluginName(issue.source_type));
+    }
+  }
+  return issues.map((issue) => ({ ...issue, source_name: nameCache.get(issue.source_type)! }));
+}
 
 export function startPoller(): void {
   const config = loadConfig();
@@ -80,23 +91,14 @@ export async function registerApiRoutes(app: FastifyInstance): Promise<void> {
   // Issues for a specific repo
   app.get("/api/repos/:name/issues", async (request) => {
     const { name } = request.params as { name: string };
-    const issues = getIssuesByTargetRepo(name);
-    return issues;
+    return withSourceName(getIssuesByTargetRepo(name));
   });
 
   // All issues
   app.get("/api/issues", async () => {
-    const issues = getAllIssues();
-    // Resolve a friendly source name per unique source_type (falls back to the type itself)
-    const nameCache = new Map<string, string>();
-    for (const issue of issues) {
-      if (!nameCache.has(issue.source_type)) {
-        nameCache.set(issue.source_type, await getPluginName(issue.source_type));
-      }
-    }
+    const issues = await withSourceName(getAllIssues());
     return issues.map((issue) => ({
       ...issue,
-      source_name: nameCache.get(issue.source_type),
       sessions: getSessionsByIssue(issue.id),
     }));
   });
