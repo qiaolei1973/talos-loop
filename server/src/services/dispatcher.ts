@@ -7,12 +7,11 @@ import {
   getRunningSessionsWithIssues,
   createSession,
   updateSessionStatus,
-  updateIssueTmux,
-  updateIssueStatus,
 } from "../db/index.js";
 import { resolvePlugin } from "../plugins/loader.js";
 import type { IssueSourcePlugin, PluginCapability } from "../types/plugin.js";
 import type { PollResult, IssueEntry } from "./poller.js";
+import { setBoardStatus } from "./boardSnapshot.js";
 import * as tmux from "./tmux.js";
 import { createLogger } from "./logger.js";
 
@@ -86,12 +85,13 @@ export async function checkRunningSessions(): Promise<{ completed: number; faile
     if (session.pr_url) {
       log.info(`✅ ${sourceName}:${source_id} done — ${session.pr_url}`);
       updateSessionStatus(session.id, "done", session.pr_url);
-      updateIssueStatus(project_id, source_id, "done");
       await plugin.transition(ctx, source_id, { from: "processing", to: "done" }, target_repo);
       if (plugin.onComment) {
         await plugin.onComment(ctx, source_id, `✅ Agent completed. PR: ${session.pr_url}`, target_repo);
       }
-      updateIssueTmux(project_id, source_id, null);
+      // Optimistically mirror the board move (processing → "In review") so the
+      // dashboard shows done before the next poll re-reads the board.
+      setBoardStatus(project_id, source_id, "In review");
       completed++;
     } else {
       // Infrastructure failure: silently return the issue to Ready so the next
@@ -101,9 +101,9 @@ export async function checkRunningSessions(): Promise<{ completed: number; faile
       const tail = lastOutput.trim().slice(-500) || "Session exited without creating a PR";
       log.warn(`⚠️ ${sourceName}:${source_id} infrastructure failure — returning to Ready (error in dashboard)`);
       updateSessionStatus(session.id, "failed", undefined, tail);
-      updateIssueStatus(project_id, source_id, "queued");
       await plugin.transition(ctx, source_id, { from: "processing", to: "queued" }, target_repo);
-      updateIssueTmux(project_id, source_id, null);
+      // Optimistically mirror the board rollback (→ "Ready") for a snappy dashboard.
+      setBoardStatus(project_id, source_id, "Ready");
       failed++;
     }
   }
@@ -182,9 +182,10 @@ export async function dispatchNew(pollResults: PollResult[]): Promise<number> {
 
       tmux.createSession(session, command);
 
-      updateIssueTmux(projectId, sourceId, session);
-      updateIssueStatus(projectId, sourceId, "processing");
       createSession(issue.id, session);
+      // Optimistically flip the board snapshot to "In progress" so the dashboard
+      // reflects processing between this dispatch and the next poll (issue #13).
+      setBoardStatus(projectId, sourceId, "In progress");
 
       dispatched++;
     } catch (err: any) {

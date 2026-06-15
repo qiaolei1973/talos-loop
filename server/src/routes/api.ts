@@ -9,13 +9,13 @@ import {
   getRunningSessions,
   markSessionSkipped,
   setSessionPrUrl,
-  updateIssueStatus,
-  updateIssueTmux,
   type Issue,
 } from "../db/index.js";
 import { pollAll } from "../services/poller.js";
 import { dispatch } from "../services/dispatcher.js";
 import { resolvePlugin, getPluginName } from "../plugins/loader.js";
+import { getBoardStatus, setBoardStatus } from "../services/boardSnapshot.js";
+import { deriveDisplayState, liveSessionName } from "../services/displayState.js";
 import { createLogger } from "../services/logger.js";
 
 const log = createLogger("api");
@@ -117,13 +117,21 @@ export async function registerApiRoutes(app: FastifyInstance): Promise<void> {
     return withProjectName(getIssuesByTargetRepo(name));
   });
 
-  // All issues
+  // All issues — `status` and `tmux_session` are DERIVED (issue #13), never read
+  // from a persisted column: status comes from the board snapshot + live session
+  // check; the attach target is the alive running session's name, if any.
   app.get("/api/issues", async () => {
     const issues = await withProjectName(getAllIssues());
-    return issues.map((issue) => ({
-      ...issue,
-      sessions: getSessionsByIssue(issue.id),
-    }));
+    return issues.map((issue) => {
+      const sessions = getSessionsByIssue(issue.id);
+      const boardStatus = getBoardStatus(issue.project_id, issue.source_id);
+      return {
+        ...issue,
+        status: deriveDisplayState(sessions, boardStatus),
+        tmux_session: liveSessionName(sessions),
+        sessions,
+      };
+    });
   });
 
   // Sessions for an issue
@@ -170,15 +178,14 @@ export async function registerApiRoutes(app: FastifyInstance): Promise<void> {
           if (!targetRepo) return { error: "targetRepo required" };
           const reason = (body.reason as string | undefined) ?? "No reason provided";
           await plugin.skip(ctx, sourceId, targetRepo, reason);
-          // Coordination DB ops (intentional, route-layer glue): mark the running
-          // session skipped, return the issue to queued (Ready), and clear the
-          // tmux pointer — otherwise checkRunningSessions would double-process an
-          // already-resolved session.
+          // Coordination: mark the running session skipped so checkRunningSessions
+          // doesn't double-process an already-resolved session. Workflow status is
+          // not persisted (issue #13) — the board move happened in plugin.skip(),
+          // and we optimistically mirror it to "Ready" for a snappy dashboard.
           const issue = getIssue(projectId, sourceId);
           if (issue) {
             markSessionSkipped(issue.id, reason);
-            updateIssueStatus(projectId, sourceId, "queued");
-            updateIssueTmux(projectId, sourceId, null);
+            setBoardStatus(projectId, sourceId, "Ready");
           }
           return { success: true };
         }

@@ -2,7 +2,6 @@ import Database from "better-sqlite3";
 import fs from "fs";
 import path from "path";
 import { loadConfig } from "../config.js";
-import type { IssueState } from "../types/plugin.js";
 
 let db: Database.Database;
 
@@ -19,13 +18,17 @@ export function getDb(): Database.Database {
 }
 
 function migrate(db: Database.Database) {
-  // Clean break: if the issues table predates the GitHub Projects integration
-  // (has the old `source_type` column but no `project_id`), drop both tables and
-  // recreate. Existing data is discarded (issue #9 mandates a clean break).
+  // Clean break: drop & recreate if the issues table carries columns removed by
+  // issue #13 (the persisted `status` / `tmux_session` workflow columns — now
+  // derived) or predates the GitHub Projects schema from #9 (`source_type`
+  // without `project_id`). This is an internal system; a data reset is
+  // acceptable (issues #9 and #13 both mandate clean breaks).
   const cols = db.prepare("PRAGMA table_info(issues)").all() as Array<{ name: string }>;
-  const hasSourceType = cols.some((c) => c.name === "source_type");
-  const hasProjectId = cols.some((c) => c.name === "project_id");
-  if (hasSourceType && !hasProjectId) {
+  const hasCol = (name: string) => cols.some((c) => c.name === name);
+  const legacy =
+    cols.length > 0 &&
+    (hasCol("status") || hasCol("tmux_session") || (hasCol("source_type") && !hasCol("project_id")));
+  if (legacy) {
     db.exec("DROP TABLE IF EXISTS sessions");
     db.exec("DROP TABLE IF EXISTS issues");
   }
@@ -39,8 +42,6 @@ function migrate(db: Database.Database) {
       target_repo TEXT NOT NULL,
       url TEXT NOT NULL,
       title TEXT,
-      tmux_session TEXT,
-      status TEXT NOT NULL DEFAULT 'queued',
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       updated_at TEXT NOT NULL DEFAULT (datetime('now')),
       UNIQUE(project_id, source_id)
@@ -59,7 +60,6 @@ function migrate(db: Database.Database) {
 
     CREATE INDEX IF NOT EXISTS idx_issues_project ON issues(project_id);
     CREATE INDEX IF NOT EXISTS idx_issues_target_repo ON issues(target_repo);
-    CREATE INDEX IF NOT EXISTS idx_issues_status ON issues(status);
     CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);
     CREATE INDEX IF NOT EXISTS idx_sessions_issue ON sessions(issue_id);
   `);
@@ -68,9 +68,11 @@ function migrate(db: Database.Database) {
 // --- Issue Types ---
 
 /**
- * NOTE: `status` mirrors the plugin IssueState. `done` means the agent finished
- * and a PR was created — it maps to GitHub's **"In review"** column, NOT the
- * terminal "Done" column (which GitHub's own automation advances on merge).
+ * An issue's identity + display cache ONLY. There is no `status` or
+ * `tmux_session` column: workflow status is now DERIVED (issue #13) from the
+ * GitHub Projects board (single writer = `transition()`) plus the sessions
+ * table (running-state truth). Persisting a second copy here is what caused the
+ * board/DB drift incidents this change eliminates. See services/displayState.ts.
  */
 export interface Issue {
   id: number;
@@ -80,8 +82,6 @@ export interface Issue {
   target_repo: string;
   url: string;
   title: string | null;
-  tmux_session: string | null;
-  status: IssueState;
   created_at: string;
   updated_at: string;
 }
@@ -127,16 +127,6 @@ export function getIssuesByTargetRepo(targetRepo: string): Issue[] {
 
 export function getAllIssues(): Issue[] {
   return getDb().prepare("SELECT * FROM issues ORDER BY updated_at DESC").all() as Issue[];
-}
-
-export function updateIssueTmux(projectId: string, sourceId: string, tmuxSession: string | null): void {
-  getDb().prepare("UPDATE issues SET tmux_session = ?, updated_at = datetime('now') WHERE project_id = ? AND source_id = ?")
-    .run(tmuxSession, projectId, sourceId);
-}
-
-export function updateIssueStatus(projectId: string, sourceId: string, status: IssueState): void {
-  getDb().prepare("UPDATE issues SET status = ?, updated_at = datetime('now') WHERE project_id = ? AND source_id = ?")
-    .run(status, projectId, sourceId);
 }
 
 // --- Session Types ---

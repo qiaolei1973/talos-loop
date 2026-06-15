@@ -7,6 +7,7 @@ import type {
   ProjectContext,
   RepoRef,
   RawIssue,
+  BoardItem,
   IssueStatus,
   IssueState,
   StatusTransition,
@@ -152,6 +153,31 @@ export class GitHubIssueSourcePlugin implements IssueSourcePlugin {
     return results;
   }
 
+  async listBoard(ctx: ProjectContext): Promise<BoardItem[]> {
+    const { owner, number } = parseProjectId(ctx.projectId);
+    try {
+      this.ensureCache(ctx);
+    } catch (err: any) {
+      ctx.logger.error(`listBoard: failed to resolve project meta: ${err.message}`);
+      return [];
+    }
+    // ghItemList throws on read failure (issue #13: no silent empty) — the poller
+    // surfaces it as a prominent "board read failed" warning.
+    const items = this.ghItemList(owner, number);
+    const results: BoardItem[] = [];
+    for (const item of items) {
+      if (!item.content) continue;
+      results.push({
+        sourceId: String(item.content.number),
+        repository: item.content.repository,
+        boardStatus: item.status ?? "",
+        url: item.content.url,
+        title: item.content.title,
+      });
+    }
+    return results;
+  }
+
   async getStatus(ctx: ProjectContext, sourceId: string, targetRepo: string): Promise<IssueStatus> {
     const repo = this.repoByName(ctx, targetRepo);
     if (!repo?.remote) return { state: null };
@@ -166,7 +192,12 @@ export class GitHubIssueSourcePlugin implements IssueSourcePlugin {
       // Actionable iff it still carries the eligibility marker and has not been skipped.
       if (labels.includes(trigger) && !labels.includes(skip)) return { state: "queued" };
       return { state: null };
-    } catch {
+    } catch (err: any) {
+      // Distinguish a real read failure from a genuinely-not-actionable issue
+      // (issue #13): surface it prominently rather than silently masquerading as
+      // "not actionable". Behavior is unchanged (treated as not queued) so a
+      // transient gh outage doesn't dispatch stale issues.
+      ctx.logger.warn(`getStatus: issue read failed for ${repo.remote}#${sourceId} — treating as not actionable: ${err.message}`);
       return { state: null };
     }
   }
@@ -195,9 +226,18 @@ export class GitHubIssueSourcePlugin implements IssueSourcePlugin {
       return;
     }
 
-    const item = this.findItem(owner, number, sourceId, repo.remote);
+    // findItem reads the board via ghItemList, which throws on read failure
+    // (issue #13). Distinguish that transient failure from a genuinely-absent
+    // item: a read failure warns and bails; an absent item errors and bails.
+    let item: GhItem | undefined;
+    try {
+      item = this.findItem(owner, number, sourceId, repo.remote);
+    } catch (err: any) {
+      ctx.logger.warn(`transition: board read failed for ${repo.remote}#${sourceId} — cannot transition: ${err.message}`);
+      return;
+    }
     if (!item) {
-      ctx.logger.error(`transition: project item for ${repo.remote}#${sourceId} not found`);
+      ctx.logger.error(`transition: project item for ${repo.remote}#${sourceId} not found on board`);
       return;
     }
 
@@ -318,17 +358,19 @@ export class GitHubIssueSourcePlugin implements IssueSourcePlugin {
     return meta;
   }
 
+  /**
+   * Read the project item-list. Throws on read failure (issue #13) instead of
+   * silently returning [] — callers (discover / listBoard / findItem) then
+   * distinguish a real empty board from an unreadable one, so a transient gh
+   * outage or rate limit is surfaced rather than masquerading as "no items".
+   */
   private ghItemList(owner: string, number: number, query?: string): GhItem[] {
-    try {
-      const q = query ? ` --query "${query}"` : "";
-      const raw = execSync(
-        `gh project item-list ${number} --owner ${owner} --format json --limit 100${q}`,
-        { encoding: "utf-8", timeout: 30_000, stdio: "pipe" },
-      );
-      return (JSON.parse(raw) as { items?: GhItem[] }).items ?? [];
-    } catch {
-      return [];
-    }
+    const q = query ? ` --query "${query}"` : "";
+    const raw = execSync(
+      `gh project item-list ${number} --owner ${owner} --format json --limit 100${q}`,
+      { encoding: "utf-8", timeout: 30_000, stdio: "pipe" },
+    );
+    return (JSON.parse(raw) as { items?: GhItem[] }).items ?? [];
   }
 
   private findItem(owner: string, number: number, sourceId: string, remote: string): GhItem | undefined {

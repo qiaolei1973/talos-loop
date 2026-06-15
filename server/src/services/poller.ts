@@ -1,7 +1,8 @@
 import { getEnabledProjects, buildProjectContext, type ProjectConfig } from "../config.js";
-import { upsertIssue, updateIssueStatus, type Issue } from "../db/index.js";
+import { upsertIssue, type Issue } from "../db/index.js";
 import { resolvePlugin } from "../plugins/loader.js";
-import type { RawIssue } from "../types/plugin.js";
+import type { BoardItem, ProjectContext, RawIssue } from "../types/plugin.js";
+import { setProjectBoard } from "./boardSnapshot.js";
 import { createLogger } from "./logger.js";
 
 const log = createLogger("poller");
@@ -19,6 +20,35 @@ export interface PollResult {
   projectType: string;
   discovered: IssueEntry[];
   error?: string;
+}
+
+/**
+ * Rebuild the in-memory board snapshot for one project from the plugin's full
+ * board listing. Only items whose repo is declared are tracked (others have no
+ * issues-table row to derive against — discover() already comments on the drift).
+ * A board-read failure is logged prominently rather than swallowed; the snapshot
+ * simply isn't refreshed this cycle.
+ */
+async function refreshBoardSnapshot(
+  ctx: ProjectContext,
+  plugin: { listBoard(ctx: ProjectContext): Promise<BoardItem[]> },
+  projectId: string,
+): Promise<void> {
+  let items: BoardItem[];
+  try {
+    items = await plugin.listBoard(ctx);
+  } catch (err: any) {
+    log.warn(`[${projectId}] board read failed — snapshot not refreshed: ${err.message}`);
+    return;
+  }
+
+  const slice = new Map<string, string>();
+  for (const item of items) {
+    const repo = ctx.repos.find((r) => r.remote === item.repository);
+    if (!repo) continue; // config drift — discover() already notified
+    slice.set(item.sourceId, item.boardStatus);
+  }
+  setProjectBoard(projectId, slice);
 }
 
 async function pollProject(project: ProjectConfig): Promise<PollResult> {
@@ -42,9 +72,14 @@ async function pollProject(project: ProjectConfig): Promise<PollResult> {
         targetRepo: raw.targetRepo,
       });
       // discover() returns only ready-to-dispatch issues (state queued). In-flight
-      // issues are tracked by the sessions table, not re-discovered.
-      updateIssueStatus(project.projectId, raw.sourceId, "queued");
+      // issues are tracked by the sessions table, not re-discovered. Workflow
+      // status is no longer persisted here (issue #13) — it is derived from the
+      // board snapshot refreshed below + the sessions table.
     }
+
+    // The board is the single source of workflow truth; refresh the in-memory
+    // snapshot every cycle so the dashboard derives live status.
+    await refreshBoardSnapshot(ctx, plugin, project.projectId);
   } catch (err: any) {
     log.error(`Error polling project "${project.projectId}": ${err.message}`);
     return { projectId: project.projectId, projectType: project.projectType, discovered, error: err.message };

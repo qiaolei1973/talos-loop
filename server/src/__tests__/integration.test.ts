@@ -4,6 +4,7 @@ import type {
   ProjectContext,
   RepoRef,
   RawIssue,
+  BoardItem,
   IssueStatus,
   IssueState,
   StatusTransition,
@@ -57,6 +58,10 @@ describe("Issue-state contract", () => {
         return [{ sourceId: "1", url: "https://example.com/1", title: "Ready", targetRepo: "r", state: "queued" }];
       },
 
+      async listBoard(): Promise<BoardItem[]> {
+        return [{ sourceId: "1", repository: "owner/r", boardStatus: "Ready", url: "https://example.com/1", title: "Ready" }];
+      },
+
       async getStatus(_ctx: ProjectContext, sourceId: string, _targetRepo: string): Promise<IssueStatus> {
         return sourceId === "1" ? { state: "queued" } : { state: null };
       },
@@ -82,6 +87,12 @@ describe("Issue-state contract", () => {
     await plugin.init(ctx);
     const issues = await plugin.discover(ctx);
     expect(issues.map((i) => i.state)).toEqual(["queued"]);
+
+    // listBoard is the display-status input (issue #13): every board item carries
+    // a source-specific boardStatus column name the display layer maps.
+    const board = await plugin.listBoard(ctx);
+    expect(board[0].boardStatus).toBe("Ready");
+    expect(board[0].repository).toBe("owner/r");
 
     expect((await plugin.getStatus(ctx, "1", "r")).state).toBe("queued");
 

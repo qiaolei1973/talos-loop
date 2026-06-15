@@ -61,6 +61,16 @@ export interface IssueSourcePlugin {
    */
   discover(ctx: ProjectContext): Promise<RawIssue[]>;
   /**
+   * List every item on the project board with its current column. Used by the
+   * poller to refresh the in-memory board snapshot — the input to display-status
+   * derivation (issue #13). Unlike discover(), this returns ALL items (not just
+   * Ready) so the dashboard can show processing / done / merged issues. Read
+   * failures must THROW (not return an empty array) so the poller can surface
+   * them as a prominent "board read failed" warning instead of silently treating
+   * the board as empty.
+   */
+  listBoard(ctx: ProjectContext): Promise<BoardItem[]>;
+  /**
    * Current state of a single issue, used for the pre-dispatch freshness check.
    * Returns `null` when the issue is not actionable (e.g. no longer in Ready,
    * or the issue was closed).
@@ -142,6 +152,22 @@ export interface RawIssue {
   targetRepo: string;
   /** Standard state of this issue at discovery time (queued for a board-driven source). */
   state: IssueState;
+}
+
+/**
+ * A single item on the project board, as read for display-status derivation. The
+ * board is the single source of workflow truth (issue #13): the poller reads the
+ * full board each cycle into an in-memory snapshot, and the display layer maps
+ * the source-specific `boardStatus` column name to a standard display state.
+ */
+export interface BoardItem {
+  sourceId: string;
+  /** "owner/repo" — matched against declared repos (config-drift items are skipped). */
+  repository: string;
+  /** Raw board column name, e.g. "Ready", "In progress", "In review", "Done". */
+  boardStatus: string;
+  url: string;
+  title: string;
 }
 
 export interface IssueStatus {
