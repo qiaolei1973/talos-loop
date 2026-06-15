@@ -119,6 +119,12 @@ cp repos.example.json   repos.json   # 代码仓库（Claude 运行的地方）
 
 插件还负责 Issue 状态的双向翻译——把源机制（GitHub 标签、Jira 状态等）映射到 talos-loop 的四个标准状态（见下文「Issue 状态生命周期」）。核心代码只读 `type`/`enabled`/`repo` 这类基础字段，其余插件配置完全由插件自身解释。
 
+**编写/发布第三方插件时的约束：**
+
+- **导出形态**：`export default` 一个 class（推荐，与内置 github 插件一致）或一个现成实例均可——loader 会自动识别 class 并实例化。
+- **包入口**：必须声明 `main` 和/或 `exports` 字段，否则按目录/包名加载会 `Cannot find module`。
+- **运行时**：需 Node ≥ 22.12，且插件**不能含 top-level await**——loader 用 `require()` 加载（Node 22+ 原生支持 `require` 加载 ESM 包，因此 server 无需转 ESM）。
+
 ## 运行
 
 ### 开发模式

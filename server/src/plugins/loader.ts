@@ -17,9 +17,16 @@ export async function resolvePlugin(type: string): Promise<IssueSourcePlugin> {
     const mod = await import("./github/index.js");
     plugin = new mod.GitHubIssueSourcePlugin();
   } else {
-    // type is the package name (e.g. "@acme/source-jira") or a local path
+    // type is the package name (e.g. "@acme/source-jira") or a local path.
+    // Plugins conventionally export a class (like the built-in github plugin),
+    // but may also export a ready instance — instantiate classes accordingly.
+    // require() loads ESM-built plugins natively on Node >= 22.12; plugins must
+    // not use top-level await. (Switching to `await import()` is a no-op here:
+    // tsc lowers it back to require under module:commonjs, and it breaks
+    // directory/package specifiers under tsx.)
     const resolved: any = require(type);
-    plugin = resolved.default || resolved;
+    const exported = resolved.default || resolved;
+    plugin = typeof exported === "function" ? new exported() : exported;
   }
 
   registry.set(type, plugin);
