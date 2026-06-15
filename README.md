@@ -7,13 +7,13 @@ Autonomous GitHub Issue processing agent — 监控 GitHub Projects 看板，自
 以 **GitHub Projects** 作为 workflow 引擎。单个 Project 跨多个仓库，talos-loop 轮询看板上处于 `Ready` 且带 `ready-for-agent` 资格标签（且无 `skipped` 标签）的 issue，派发 agent，并推进看板状态：
 
 ```
-Ready(queued) ──派发──► In progress(processing) ──┬──PR 创建──► In review(done) ──PR 合并──► Done
+Ready(queued) ──派发──► In progress(processing) ──┬──agent 调 submit-pr（存 pr_url）──► In review(done) ──PR 合并──► Done
                                                     │
-                                              无 PR/异常退出
+                                              无 pr_url/异常退出
                                                     │
                                               回到 Ready（基础设施失败，下次自动重试，错误仅记在 dashboard）
 
-agent 主动放弃（skip API）──► 加 skipped 标签 + 评论 + 回 Ready（block，直到手动移除标签）
+agent 主动放弃（skip action）──► 加 skipped 标签 + 评论 + 回 Ready（block，直到手动移除标签）
 ```
 
 ```
@@ -26,20 +26,20 @@ Issue (Ready + ready-for-agent)
         │ 发现可派发 Issue
         ▼
    ┌────────────┐  并发控制 (maxParallel)
-   │ Dispatcher │ ── 状态校验 ── 生成 Prompt（注入 skip/comment 接口）
+   │ Dispatcher │ ── 状态校验 ── 生成 Prompt（注入 plugin.capabilities() 声明的 actions 接口）
    └────┬───────┘
         │
         ▼
    ┌──────────────────────┐
    │ tmux 隔离会话         │
-   │ claude -p <prompt>    │ ── worktree 隔离 ── 编码 ── 推送分支 ── 创建 PR
+   │ claude -p <prompt>    │ ── worktree 隔离 ── 编码 ── 推送分支 ── 调用 submit-pr 创建 PR
    └────┬─────────────────┘
-        │ 会话结束后解析结果
+        │ 会话结束，按存储的 pr_url 判定结果
         ▼
   ┌─────────────────────────────────────┐
-  │ PR 命中 → In review + 评论 PR 链接   │
-  │ 否则   → 回 Ready（infra 失败，静默） │
-  │ skip API → plugin 已处理（标签+评论） │
+  │ pr_url 已存 → In review + 评论 PR 链接 │
+  │ 否则       → 回 Ready（infra 失败，静默） │
+  │ skip action → plugin 已处理（标签+评论） │
   └─────────────────────────────────────┘
 ```
 
@@ -77,7 +77,7 @@ cp projects.example.json  projects.json   # Projects + 仓库（取代旧版 rep
   "pollInterval": 60000,              // 轮询间隔（毫秒）
   "maxParallel": 1,                   // 最大并发数
   "claudeTimeout": 600,               // Claude 会话超时（秒）
-  "serverBaseUrl": "http://127.0.0.1:3100"  // agent 回调 talos-loop 本地 API 的基址（skip/comment 接口）
+  "serverBaseUrl": "http://127.0.0.1:3100"  // agent 回调 talos-loop 本地 API 的基址（actions 接口）
 }
 ```
 
@@ -87,7 +87,7 @@ cp projects.example.json  projects.json   # Projects + 仓库（取代旧版 rep
 | `pollInterval` | `60000` | 轮询间隔（毫秒） |
 | `maxParallel` | `1` | 最大并发处理数 |
 | `claudeTimeout` | `600` | Claude 会话超时（秒） |
-| `serverBaseUrl` | `http://127.0.0.1:${port}` | agent 调用 skip/comment 接口的基址 |
+| `serverBaseUrl` | `http://127.0.0.1:${port}` | agent 调用 actions 接口的基址 |
 | `dbPath` | `<root>/server/data/talos-loop.db` | SQLite 数据库路径 |
 
 ### `projects.json` — Projects 与仓库
@@ -134,8 +134,12 @@ cp projects.example.json  projects.json   # Projects + 仓库（取代旧版 rep
 getStatus(ctx, sourceId, targetRepo)
 transition(ctx, sourceId, transition, targetRepo)
 onComment?(ctx, sourceId, comment, targetRepo)
-skip(ctx, sourceId, targetRepo, reason)   // 新增：加 skipped 标签 + 评论 + 回 Ready
+skip(ctx, sourceId, targetRepo, reason)   // 加 skipped 标签 + 评论 + 回 Ready
+capabilities?(): PluginCapability[]       // 声明插件暴露给 agent 的 actions（驱动 Prompt 渲染）
+submitPr?(ctx, sourceId, branch, targetRepo): Promise<string>   // 创建 PR 并返回其 URL
 ```
+
+`capabilities()` 让插件自描述其 actions（如 `submit-pr` / `comment` / `skip`）；`buildPrompt` 据此动态渲染 API 块，新增 action 无需改动 dispatcher。所有 agent 信号统一走 `POST /api/projects/:projectId/issues/:sourceId/actions/:action`（body 含 `targetRepo`）。
 
 `ProjectContext` 暴露 `repos: RepoRef[]`（多仓库）与 `projectId`（"owner/number"）。
 
@@ -185,8 +189,7 @@ npm start            # 启动服务，监听 0.0.0.0:3100
 | GET | `/api/repos/:name/issues` | 指定仓库的 Issue 列表 |
 | GET | `/api/issues` | 所有 Issue（含 sessions） |
 | GET | `/api/issues/:id/sessions` | Issue 的会话记录 |
-| POST | `/api/projects/:projectId/issues/:sourceId/skip` | agent 信号：放弃任务（写 skipped 标签 + 评论 + 回 Ready） |
-| POST | `/api/projects/:projectId/issues/:sourceId/comment` | agent 信号：在 issue 留言 |
+| POST | `/api/projects/:projectId/issues/:sourceId/actions/:action` | agent 信号：统一入口。`:action` = `submit-pr`（创建 PR，回写 session.pr_url）/ `comment`（留言）/ `skip`（写 skipped 标签 + 评论 + 回 Ready）。body 含 `targetRepo` |
 | POST | `/api/poll` | 手动触发轮询 |
 | POST | `/api/webhook` | Webhook 入口（触发一次轮询） |
 
@@ -205,7 +208,7 @@ talos-loop/
 │       ├── db/
 │       │   └── index.ts         # SQLite（WAL），issues + sessions 表
 │       ├── routes/
-│       │   └── api.ts           # REST API 路由（含 skip/comment）
+│       │   └── api.ts           # REST API 路由（统一 actions 入口）
 │       ├── plugins/
 │       │   ├── loader.ts        # 插件按 type 解析与缓存
 │       │   └── github/          # 内置 GitHub Projects 插件

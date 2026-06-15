@@ -36,6 +36,11 @@ const mockPlugin = {
   },
   onComment: vi.fn(),
   async skip() {},
+  capabilities: () => [
+    { action: "submit-pr", description: "完成编码后提交 PR", params: [{ name: "branch", description: "" }] },
+    { action: "comment", description: "在工作项留言", params: [{ name: "message", description: "" }] },
+    { action: "skip", description: "放弃任务", params: [{ name: "reason", description: "" }] },
+  ],
 };
 
 vi.mock("../config.js", () => ({
@@ -74,12 +79,6 @@ vi.mock("../services/logger.js", () => ({
   createLogger: () => ({ info: vi.fn(), warn: vi.fn(), error: vi.fn() }),
 }));
 
-// findPrUrl (infra-failure fallback) shells out via execSync. Default to "" so
-// it resolves to null — the PR-found branch supplies its URL via tmux output.
-vi.mock("child_process", () => ({
-  execSync: vi.fn(() => ""),
-}));
-
 // Stub the two filesystem writes dispatchNew performs; leave the rest of fs real.
 vi.mock("fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("fs")>();
@@ -109,11 +108,12 @@ function makeCandidate(sourceId: string): IssueEntry {
   };
 }
 
-/** A dead running session for issue #9. */
-function makeRunningSession(session: string, sourceId = "9"): any {
+/** A dead running session for issue #9. `prUrl` drives the done/failed split. */
+function makeRunningSession(session: string, sourceId = "9", prUrl: string | null = null): any {
   return {
     id: 100,
     tmux_session: session,
+    pr_url: prUrl,
     project_id: "qiaolei1973/1",
     project_type: "github",
     source_id: sourceId,
@@ -168,7 +168,7 @@ describe("dispatchNew slot accounting (issue #6)", () => {
   });
 });
 
-describe("buildPrompt percent-encodes the slash in projectId", () => {
+describe("buildPrompt percent-encodes projectId and renders capabilities", () => {
   beforeEach(() => {
     statusBySourceId = {};
     runningSessions = [];
@@ -177,7 +177,7 @@ describe("buildPrompt percent-encodes the slash in projectId", () => {
     vi.clearAllMocks();
   });
 
-  it("encodes \"owner/number\" so the skip/comment route URLs are valid", async () => {
+  it("encodes \"owner/number\" in the actions base URL and lists the plugin capabilities", async () => {
     statusBySourceId = { "1": "queued" };
     const candidates: PollResult[] = [
       {
@@ -197,15 +197,21 @@ describe("buildPrompt percent-encodes the slash in projectId", () => {
     expect(promptCall, "prompt file should have been written").toBeDefined();
     const prompt = String((promptCall as any[])[1]);
 
-    // projectId "qiaolei1973/1" → must appear percent-encoded in the URLs.
-    expect(prompt).toContain("/api/projects/qiaolei1973%2F1/issues/1/skip");
-    expect(prompt).toContain("/api/projects/qiaolei1973%2F1/issues/1/comment");
+    // projectId "qiaolei1973/1" → must appear percent-encoded in the actions URL.
+    expect(prompt).toContain("/api/projects/qiaolei1973%2F1/issues/1/actions");
     // …and the raw slash form must NOT appear in the talos-loop API path.
     expect(prompt).not.toMatch(/\/api\/projects\/qiaolei1973\/1\/issues/);
+    // The plugin's declared capabilities are rendered as the action block.
+    expect(prompt).toContain("- submit-pr：");
+    expect(prompt).toContain("- comment：");
+    expect(prompt).toContain("- skip：");
+    // The old per-action routes and the single-line PR-URL instruction are gone.
+    expect(prompt).not.toMatch(/\/issues\/\d+\/(skip|comment)\b/);
+    expect(prompt).not.toMatch(/单独一行输出 PR/);
   });
 });
 
-describe("checkRunningSessions dual-failure-path (issue #9)", () => {
+describe("checkRunningSessions outcome from stored pr_url (issue #11)", () => {
   beforeEach(() => {
     statusBySourceId = {};
     runningSessions = [];
@@ -214,17 +220,18 @@ describe("checkRunningSessions dual-failure-path (issue #9)", () => {
     vi.clearAllMocks();
   });
 
-  it("PR found → transition done, comment PR, session done, issue done", async () => {
+  it("session.pr_url set → transition done, comment PR, session done, issue done", async () => {
     const session = "tl-github-talos-loop-9";
-    runningSessions = [makeRunningSession(session)];
-    tmuxOutput[session] = "Created https://github.com/qiaolei1973/talos-loop/pull/42";
+    // Completion is read from the stored pr_url (set by the submit-pr action),
+    // NOT parsed from tmux output.
+    runningSessions = [makeRunningSession(session, "9", "https://github.com/qiaolei1973/talos-loop/pull/42")];
 
     const { checkRunningSessions } = await import("../services/dispatcher.js");
     const result = await checkRunningSessions();
 
     expect(result).toEqual({ completed: 1, failed: 0 });
 
-    // session finalized as done with the PR url
+    // session finalized as done with the stored PR url
     expect(mockUpdateSessionStatus).toHaveBeenCalledWith(100, "done", "https://github.com/qiaolei1973/talos-loop/pull/42");
     // issue → done (semantics: In review)
     expect(mockUpdateIssueStatus).toHaveBeenCalledWith("qiaolei1973/1", "9", "done");
@@ -239,10 +246,11 @@ describe("checkRunningSessions dual-failure-path (issue #9)", () => {
     expect(mockUpdateIssueTmux).toHaveBeenCalledWith("qiaolei1973/1", "9", null);
   });
 
-  it("infra failure → transition queued, NO comment, session failed+tail, issue queued", async () => {
+  it("session.pr_url null → infra failure: transition queued, NO comment, session failed+tail", async () => {
     const session = "tl-github-talos-loop-9";
-    runningSessions = [makeRunningSession(session)];
-    tmuxOutput[session] = "Error: rate limit exceeded, please retry"; // no PR url
+    runningSessions = [makeRunningSession(session, "9", null)];
+    // The error tail is still captured from tmux output for the dashboard.
+    tmuxOutput[session] = "Error: rate limit exceeded, please retry";
 
     const { checkRunningSessions } = await import("../services/dispatcher.js");
     const result = await checkRunningSessions();
@@ -266,7 +274,7 @@ describe("checkRunningSessions dual-failure-path (issue #9)", () => {
 
   it("alive sessions are left alone", async () => {
     const session = "tl-github-talos-loop-9";
-    runningSessions = [makeRunningSession(session)];
+    runningSessions = [makeRunningSession(session, "9", null)];
     tmuxAlive = new Set([session]); // still running
 
     const { checkRunningSessions } = await import("../services/dispatcher.js");

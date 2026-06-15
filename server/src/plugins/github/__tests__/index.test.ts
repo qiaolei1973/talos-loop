@@ -209,4 +209,61 @@ describe("GitHubIssueSourcePlugin", () => {
       expect(editCmds[0]).toContain("--single-select-option-id o_ready");
     });
   });
+
+  describe("capabilities()", () => {
+    it("declares submit-pr, comment, and skip with the required params", () => {
+      const caps = plugin.capabilities();
+      const byAction = new Map(caps.map((c) => [c.action, c]));
+
+      expect(byAction.has("submit-pr")).toBe(true);
+      expect(byAction.has("comment")).toBe(true);
+      expect(byAction.has("skip")).toBe(true);
+
+      for (const cap of caps) {
+        expect(typeof cap.description).toBe("string");
+        expect(cap.description.length).toBeGreaterThan(0);
+        expect(Array.isArray(cap.params)).toBe(true);
+        for (const p of cap.params) {
+          expect(typeof p.name).toBe("string");
+          expect(typeof p.description).toBe("string");
+        }
+      }
+      // submit-pr must accept the branch parameter the prompt tells the agent to send.
+      expect(byAction.get("submit-pr")!.params.map((p) => p.name)).toContain("branch");
+    });
+  });
+
+  describe("submitPr()", () => {
+    it("runs gh pr create with the branch/sourceId/repo and returns the URL", async () => {
+      mockExecSync.mockImplementation((cmd: string) => {
+        if (cmd.includes("gh pr create")) return JSON.stringify({ url: "https://github.com/qiaolei1973/talos-loop/pull/7" });
+        return "";
+      });
+
+      const url = await plugin.submitPr(makeCtx(), "9", "feat/x", "talos-loop");
+
+      expect(url).toBe("https://github.com/qiaolei1973/talos-loop/pull/7");
+      const createCmd = mockExecSync.mock.calls
+        .map((c: any[]) => c[0] as string)
+        .find((cmd) => cmd.includes("gh pr create"));
+      expect(createCmd).toBeDefined();
+      expect(createCmd).toContain("--head feat/x");
+      expect(createCmd).toContain("--base main");
+      expect(createCmd).toContain("--repo qiaolei1973/talos-loop");
+      expect(createCmd).toContain("--json url");
+      // Title references the source issue so GitHub links the PR.
+      expect(createCmd).toContain('Closes #9');
+    });
+
+    it("throws when the repo has no remote", async () => {
+      mockExecSync.mockImplementation(() => "");
+      const ctx = makeCtx({ repos: [{ name: "talos-loop", path: "/tmp/talos-loop" }] }); // no remote
+      await expect(plugin.submitPr(ctx, "9", "feat/x", "talos-loop")).rejects.toThrow(/no remote/);
+    });
+
+    it("throws when the PR URL cannot be parsed from gh output", async () => {
+      mockExecSync.mockImplementation(() => JSON.stringify({})); // no url field
+      await expect(plugin.submitPr(makeCtx(), "9", "feat/x", "talos-loop")).rejects.toThrow(/parse PR URL/);
+    });
+  });
 });
