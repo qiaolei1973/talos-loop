@@ -11,6 +11,7 @@ import {
   Check,
   AlertTriangle,
   SkipForward,
+  RotateCcw,
 } from "lucide-react";
 
 interface Issue {
@@ -41,6 +42,8 @@ interface Session {
   type?: "coding" | "review";
   /** issue #19: tmux process still alive — drives the per-session live + attach UI. */
   isLive?: boolean;
+  /** issue #21: server-determined worktree path; present when a retry is possible. */
+  worktree_path?: string | null;
 }
 
 interface Status {
@@ -190,6 +193,50 @@ function AttachButton({ session }: { session: string }) {
   );
 }
 
+/**
+ * Retry a failed coding session in place (issue #21): POST the retry action,
+ * which dispatches a fresh agent into the failed session's preserved worktree.
+ * The backend resolves the retry target (worktree + branch) from the failed
+ * session, so this only needs the issue coordinates.
+ */
+function RetryButton({ projectId, sourceId }: { projectId: string; sourceId: string }) {
+  const queryClient = useQueryClient();
+  const [busy, setBusy] = useState(false);
+
+  const handleRetry = async () => {
+    setBusy(true);
+    try {
+      const encoded = encodeURIComponent(projectId);
+      const res = await fetch(`${API}/api/projects/${encoded}/issues/${sourceId}/actions/retry`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        alert(`重试失败：${body.error ?? res.status}`);
+      } else {
+        // Refresh so the new retry session row appears in the session group.
+        await queryClient.invalidateQueries({ queryKey: ["issues"] });
+      }
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <button
+      onClick={handleRetry}
+      disabled={busy}
+      className="inline-flex items-center gap-1 rounded bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-800 hover:bg-amber-200 disabled:opacity-50 cursor-pointer"
+      title="Retry the failed session in its preserved worktree"
+    >
+      {busy ? <Loader2 className="h-3 w-3 animate-spin" /> : <RotateCcw className="h-3 w-3" />}
+      {busy ? "retrying" : "retry"}
+    </button>
+  );
+}
+
 function timeAgo(dateStr: string | null): string {
   if (!dateStr) return "-";
   // SQLite datetime('now') returns UTC without 'Z' — append it so JS parses as UTC
@@ -316,6 +363,7 @@ export default function App() {
                       <th className="px-4 py-2 text-left font-medium text-gray-600">Status</th>
                       <th className="px-4 py-2 text-left font-medium text-gray-600">Sessions</th>
                       <th className="px-4 py-2 text-left font-medium text-gray-600">PR</th>
+                      <th className="px-4 py-2 text-left font-medium text-gray-600">Actions</th>
                       <th className="px-4 py-2 text-left font-medium text-gray-600">Updated</th>
                     </tr>
                   </thead>
@@ -325,6 +373,15 @@ export default function App() {
                       // PR link: latest session that recorded a PR url (coding or
                       // review carry the same PR url; review-only rows reuse it).
                       const prSession = sessions.find((s) => s.pr_url) ?? null;
+                      // issue #21: retry is offered when the LATEST session is a
+                      // failed coding session whose worktree is preserved on disk.
+                      // sessions[] is newest-first (API returns started_at DESC).
+                      const latest = sessions[0];
+                      const retryable =
+                        !!latest &&
+                        latest.status === "failed" &&
+                        latest.type !== "review" &&
+                        !!latest.worktree_path;
                       return (
                         <tr key={issue.id} className="border-b last:border-0 hover:bg-gray-50">
                           <td className="px-4 py-3">
@@ -362,6 +419,13 @@ export default function App() {
                               >
                                 PR <ExternalLink className="h-3 w-3" />
                               </a>
+                            ) : (
+                              <span className="text-gray-400">-</span>
+                            )}
+                          </td>
+                          <td className="px-4 py-3">
+                            {retryable ? (
+                              <RetryButton projectId={issue.project_id} sourceId={issue.source_id} />
                             ) : (
                               <span className="text-gray-400">-</span>
                             )}

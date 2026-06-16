@@ -1,0 +1,87 @@
+import { execSync } from "child_process";
+import * as fs from "fs";
+import path from "path";
+import { createLogger } from "./logger.js";
+
+const log = createLogger("worktree");
+
+/**
+ * The on-disk home of every talos-loop worktree (issue #21). Lives as a sibling
+ * of each repo so worktrees are isolated from the repo working tree, discoverable
+ * in one place, and persistent across restarts (NOT /tmp, which may be cleared —
+ * a cleared worktree would defeat the "preserve for retry" guarantee).
+ */
+const WORKTREE_DIR = ".talos-worktrees";
+
+/**
+ * Deterministic worktree path for a session (issue #21). Derived from the repo
+ * path + the (per-issue stable) tmux session name, so a retry for the SAME issue
+ * resolves to the SAME path and reuses the worktree the failed session left on
+ * disk — without the agent ever reporting the path back. Different issues map to
+ * different paths (the session name carries the source id).
+ */
+export function worktreePath(repoPath: string, session: string): string {
+  return path.join(path.dirname(path.resolve(repoPath)), WORKTREE_DIR, session);
+}
+
+function run(cmd: string): void {
+  execSync(cmd, { timeout: 30_000, stdio: "pipe", encoding: "utf-8" });
+}
+
+/**
+ * Create a fresh worktree + branch from HEAD for a new coding session (issue
+ * #21). A stale path/branch from a prior issue lifecycle (e.g. an issue reopened
+ * after its PR merged) is removed first so a fresh dispatch always starts clean.
+ * Throws on a real git failure — the caller logs it and skips the dispatch.
+ */
+export function createWorktree(repoPath: string, worktree: string, branch: string): void {
+  // Best-effort cleanup of a stale worktree and branch from a prior lifecycle.
+  try {
+    run(`git -C "${repoPath}" worktree remove --force "${worktree}"`);
+  } catch {
+    // nothing stale at this path — expected on a fresh issue
+  }
+  try {
+    run(`git -C "${repoPath}" branch -D "${branch}"`);
+  } catch {
+    // branch absent — expected
+  }
+  run(`git -C "${repoPath}" worktree add -b "${branch}" "${worktree}"`);
+  log.info(`Created worktree ${worktree} on branch ${branch}`);
+}
+
+/**
+ * Ensure the worktree exists for a retry (issue #21). The failed session's
+ * worktree is normally still on disk — use it as-is. If it was removed out of
+ * band (e.g. disk cleared), recreate it on the EXISTING branch so the prior
+ * commits survive and the retry can continue from them.
+ */
+export function ensureWorktree(repoPath: string, worktree: string, branch: string): void {
+  if (fs.existsSync(worktree)) {
+    log.info(`Reusing preserved worktree ${worktree} on branch ${branch}`);
+    return;
+  }
+  run(`git -C "${repoPath}" worktree add "${worktree}" "${branch}"`);
+  log.info(`Recreated missing worktree ${worktree} on existing branch ${branch}`);
+}
+
+/**
+ * Remove a worktree (issue #21). Called as a safety net when a session SUCCEEDS
+ * (exit 0 + pr_url) so a worktree the agent forgot to clean up doesn't leak disk
+ * — the agent is still instructed to clean up, this just guarantees it. It is a
+ * deliberate NO-OP on failure, where the worktree must remain for retry. Never
+ * throws: a cleanup failure must not break the success finalization.
+ */
+export function removeWorktree(repoPath: string, worktree: string): void {
+  try {
+    run(`git -C "${repoPath}" worktree remove --force "${worktree}"`);
+    log.info(`Removed worktree ${worktree}`);
+  } catch {
+    // already gone (the agent cleaned up, or it was never created) — fine
+  }
+  try {
+    run(`git -C "${repoPath}" worktree prune`);
+  } catch {
+    // ignore — prune is best-effort metadata tidy-up
+  }
+}

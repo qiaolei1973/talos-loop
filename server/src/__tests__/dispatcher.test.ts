@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import * as fs from "fs";
 import * as db from "../db/index.js";
 import * as boardSnapshot from "../services/boardSnapshot.js";
+import * as worktree from "../services/worktree.js";
 import type { IssueEntry, PollResult } from "../services/poller.js";
 import type { Issue } from "../db/index.js";
 
@@ -12,6 +13,10 @@ const mockCreateSession = db.createSession as unknown as ReturnType<typeof vi.fn
 // Issue #13: workflow status is no longer persisted — dispatch/completion/skip
 // only optimistically flip the in-memory board snapshot.
 const mockSetBoardStatus = boardSnapshot.setBoardStatus as unknown as ReturnType<typeof vi.fn>;
+// Issue #21: worktree lifecycle stubs — the dispatcher must not run real git.
+const mockCreateWorktree = worktree.createWorktree as unknown as ReturnType<typeof vi.fn>;
+const mockEnsureWorktree = worktree.ensureWorktree as unknown as ReturnType<typeof vi.fn>;
+const mockRemoveWorktree = worktree.removeWorktree as unknown as ReturnType<typeof vi.fn>;
 
 // --- per-test controllable state ---
 // Freshness check: maps sourceId → getStatus().state.
@@ -107,6 +112,17 @@ vi.mock("../services/tmux.js", () => ({
   isAlive: (session: string) => tmuxAlive.has(session),
   exitCodePath: (session: string) => `/tmp/tl-exit-${session}.txt`,
   readExitCode: (session: string) => exitCodeBySession[session],
+}));
+
+// Issue #21: stub the worktree service so dispatch never runs real git. The
+// deterministic path helper is kept real (a pure string) so dispatch/retry can
+// be asserted on; create/ensure/remove are vi.fns (referenced via the import
+// above, like the db/boardSnapshot mocks).
+vi.mock("../services/worktree.js", () => ({
+  worktreePath: (repoPath: string, session: string) => `/tmp/talos-worktrees/${session}`,
+  createWorktree: vi.fn(),
+  ensureWorktree: vi.fn(),
+  removeWorktree: vi.fn(),
 }));
 
 vi.mock("../services/logger.js", () => ({
@@ -692,6 +708,166 @@ describe("dispatch() gates review on a slow counter (issue #19)", () => {
     // Cycle 4: tick again → a second review session (threads still unresolved).
     await mod.dispatch([]);
     expect(mockCreateSession).toHaveBeenCalledTimes(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #21: retry a failed session in place (preserved worktree + branch)
+// ---------------------------------------------------------------------------
+
+const WT = "/tmp/talos-worktrees/tl-github-talos-loop-9";
+const BRANCH = "feat/issue-9";
+
+/** A failed coding session with a preserved worktree — what getRetryableSession
+ *  returns and dispatchRetry receives. */
+function makeFailedRetryableSession(overrides: Record<string, unknown> = {}): any {
+  return {
+    id: 500,
+    issue_id: 9,
+    project_id: "qiaolei1973/1",
+    project_type: "github",
+    source_id: "9",
+    target_repo: "talos-loop",
+    url: "https://github.com/qiaolei1973/talos-loop/issues/9",
+    worktree_path: WT,
+    branch: BRANCH,
+    status: "failed",
+    type: "coding",
+    ...overrides,
+  };
+}
+
+describe("dispatchRetry() reuses the failed session's worktree + branch (issue #21)", () => {
+  beforeEach(() => {
+    statusBySourceId = {};
+    runningSessions = [];
+    tmuxOutput = {};
+    tmuxAlive = new Set();
+    exitCodeBySession = {};
+    codingSessionsWithPr = [];
+    runningReviewIssueIds = new Set();
+    boardStatusBySourceId = {};
+    unresolvedThreadsByPr = {};
+    reviewDispatchEvery = 15;
+    vi.clearAllMocks();
+  });
+
+  it("dispatches a new coding session into the PRESERVED worktree (no fresh create)", async () => {
+    const { dispatchRetry } = await import("../services/dispatcher.js");
+    await dispatchRetry(makeFailedRetryableSession());
+
+    // ensureWorktree reuses the existing worktree; createWorktree is NOT used.
+    expect(mockEnsureWorktree).toHaveBeenCalledWith("/tmp/talos-loop", WT, BRANCH);
+    expect(mockCreateWorktree).not.toHaveBeenCalled();
+    // New coding session inherits issue_id, branch, AND worktree_path.
+    expect(mockCreateSession).toHaveBeenCalledWith(9, "tl-github-talos-loop-9", {
+      type: "coding",
+      branch: BRANCH,
+      worktreePath: WT,
+    });
+  });
+
+  it("launches the agent INSIDE the existing worktree", async () => {
+    const { dispatchRetry } = await import("../services/dispatcher.js");
+    await dispatchRetry(makeFailedRetryableSession());
+
+    const scriptCall = mockWriteFileSync.mock.calls.find(
+      (c: any[]) => typeof c[0] === "string" && c[0].endsWith(".sh"),
+    );
+    expect(scriptCall, "launcher script should have been written").toBeDefined();
+    expect(String((scriptCall as any[])[1])).toContain(`cd ${WT}`);
+  });
+
+  it("writes a retry prompt that says continue, references the worktree + branch", async () => {
+    const { dispatchRetry } = await import("../services/dispatcher.js");
+    await dispatchRetry(makeFailedRetryableSession());
+
+    const promptCall = mockWriteFileSync.mock.calls.find(
+      (c: any[]) => typeof c[0] === "string" && c[0].endsWith(".txt"),
+    );
+    expect(promptCall, "retry prompt file should have been written").toBeDefined();
+    const prompt = String((promptCall as any[])[1]);
+
+    // The retry prompt names the existing environment.
+    expect(prompt).toContain(WT);
+    expect(prompt).toContain(BRANCH);
+    expect(prompt).toContain("https://github.com/qiaolei1973/talos-loop/issues/9");
+    // …tells the agent to continue, not start over…
+    expect(prompt).toMatch(/继续|当前状态/);
+    // …and is NOT the initial-dispatch prompt (which opens with "实现以下 Issue").
+    expect(prompt).not.toMatch(/请实现以下 Issue/);
+  });
+
+  it("does not touch the board (no transition, no board snapshot flip)", async () => {
+    const { dispatchRetry } = await import("../services/dispatcher.js");
+    await dispatchRetry(makeFailedRetryableSession());
+
+    expect(mockPlugin.transition).not.toHaveBeenCalled();
+    expect(mockSetBoardStatus).not.toHaveBeenCalled();
+  });
+});
+
+describe("checkRunningSessions() worktree lifecycle (issue #21)", () => {
+  beforeEach(() => {
+    statusBySourceId = {};
+    runningSessions = [];
+    tmuxOutput = {};
+    tmuxAlive = new Set();
+    exitCodeBySession = {};
+    codingSessionsWithPr = [];
+    runningReviewIssueIds = new Set();
+    boardStatusBySourceId = {};
+    unresolvedThreadsByPr = {};
+    reviewDispatchEvery = 15;
+    vi.clearAllMocks();
+  });
+
+  it("on failure, does NOT remove the worktree (preserved for retry)", async () => {
+    const session = "tl-github-talos-loop-9";
+    exitCodeBySession[session] = 1; // crashed
+    tmuxOutput[session] = "Error: rate limit exceeded";
+    runningSessions = [{
+      id: 100,
+      tmux_session: session,
+      pr_url: null,
+      type: "coding",
+      worktree_path: WT,
+      branch: BRANCH,
+      project_id: "qiaolei1973/1",
+      project_type: "github",
+      source_id: "9",
+      target_repo: "talos-loop",
+    }];
+
+    const { checkRunningSessions } = await import("../services/dispatcher.js");
+    const result = await checkRunningSessions();
+
+    expect(result).toEqual({ completed: 0, failed: 1 });
+    // The worktree stays on disk — no cleanup on the failure path.
+    expect(mockRemoveWorktree).not.toHaveBeenCalled();
+  });
+
+  it("on success (exit 0 + pr_url), removes the worktree as a safety net", async () => {
+    const session = "tl-github-talos-loop-9";
+    exitCodeBySession[session] = 0; // clean exit
+    runningSessions = [{
+      id: 100,
+      tmux_session: session,
+      pr_url: "https://github.com/qiaolei1973/talos-loop/pull/42",
+      type: "coding",
+      worktree_path: WT,
+      branch: BRANCH,
+      project_id: "qiaolei1973/1",
+      project_type: "github",
+      source_id: "9",
+      target_repo: "talos-loop",
+    }];
+
+    const { checkRunningSessions } = await import("../services/dispatcher.js");
+    await checkRunningSessions();
+
+    // Success path safety-net removes the worktree (issue #21).
+    expect(mockRemoveWorktree).toHaveBeenCalledWith("/tmp/talos-loop", WT);
   });
 });
 

@@ -10,10 +10,11 @@ import {
   markSessionSkipped,
   setSessionPrUrl,
   setSessionBranch,
+  getRetryableSession,
   type Issue,
 } from "../db/index.js";
 import { pollAll } from "../services/poller.js";
-import { dispatch } from "../services/dispatcher.js";
+import { dispatch, dispatchRetry } from "../services/dispatcher.js";
 import { resolvePlugin, getPluginName } from "../plugins/loader.js";
 import { getBoardStatus, setBoardStatus } from "../services/boardSnapshot.js";
 import { deriveDisplayState, liveSessionName, isSessionLive } from "../services/displayState.js";
@@ -208,6 +209,20 @@ export async function registerApiRoutes(app: FastifyInstance): Promise<void> {
             markSessionSkipped(issue.id, reason);
             setBoardStatus(projectId, sourceId, "Ready");
           }
+          return { success: true };
+        }
+        case "retry": {
+          // issue #21: developer-initiated retry into a failed session's preserved
+          // worktree. Unlike the agent-signal cases above, this needs no body —
+          // the retry target (worktree + branch) is resolved from the failed
+          // session. Gated on the issue's LATEST session being a failed coding
+          // session with a recorded worktree: review failures are auto-retried by
+          // the poll cycle, and a non-failed/done issue has nothing to retry.
+          const issue = getIssue(projectId, sourceId);
+          if (!issue) return { error: "Issue not found" };
+          const failed = getRetryableSession(issue.id);
+          if (!failed) return { error: "No failed session to retry (retry requires a failed coding session with a preserved worktree)" };
+          await dispatchRetry(failed);
           return { success: true };
         }
         default:
