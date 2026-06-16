@@ -64,7 +64,18 @@ function buildPrompt(
   ].join("\n");
 }
 
-/** Check running sessions; for each that has exited, classify the outcome. */
+/**
+ * Check running sessions; for each that has exited, classify it by the process's
+ * OWN exit state — not by whether the agent produced a PR (issue #20):
+ *
+ *   exit 0 + pr_url   → done, advance board (processing → done)   [the ONLY board move]
+ *   exit 0, no pr_url → done, board unchanged
+ *   non-zero / absent → failed, board unchanged
+ *
+ * Board state is driven exclusively by explicit agent actions (submit-pr, skip);
+ * a session exit — clean or crashed — never rolls the board. A developer sees the
+ * issue stay "In progress" alongside a failed-session indicator and investigates.
+ */
 export async function checkRunningSessions(): Promise<{ completed: number; failed: number }> {
   const running = getRunningSessionsWithIssues();
   let completed = 0;
@@ -74,15 +85,21 @@ export async function checkRunningSessions(): Promise<{ completed: number; faile
     if (tmux.isAlive(session.tmux_session)) continue;
 
     // Sessions skipped or completed via the HTTP API are no longer 'running'
-    // (skip → 'skipped'; submit-pr leaves status 'running' but records pr_url),
-    // so the pr_url set by the submit-pr action is the single source of truth for
-    // completion — tmux output is no longer parsed for a PR URL.
+    // (skip → 'skipped'; submit-pr leaves status 'running' but records pr_url).
+    // The exit-code sentinel written by the launcher is the source of truth for
+    // clean vs. crashed termination; a missing sentinel means the process was
+    // killed before it could record one → treat as a failure (issue #20).
+    const exitCode = tmux.readExitCode(session.tmux_session);
+    const cleanExit = exitCode === 0;
 
     const plugin = await resolvePlugin(project_type);
     const ctx = buildProjectContextForIssue(project_id, log);
     const sourceName = plugin.name;
 
-    if (session.pr_url) {
+    if (cleanExit && session.pr_url) {
+      // Success path: clean exit AND a PR was submitted → finalize as done and
+      // advance the board. This is the ONLY session-exit outcome that moves the
+      // board — it reflects the deliberate submit-pr action.
       log.info(`✅ ${sourceName}:${source_id} done — ${session.pr_url}`);
       updateSessionStatus(session.id, "done", session.pr_url);
       await plugin.transition(ctx, source_id, { from: "processing", to: "done" }, target_repo);
@@ -93,17 +110,26 @@ export async function checkRunningSessions(): Promise<{ completed: number; faile
       // dashboard shows done before the next poll re-reads the board.
       setBoardStatus(project_id, source_id, "In review");
       completed++;
+    } else if (cleanExit) {
+      // Clean exit but no PR — e.g. a review session (issue #19) or an agent that
+      // chose not to submit. The session ran successfully, so it is `done`; the
+      // board is left untouched because only an explicit submit-pr/skip advances it.
+      log.info(`✅ ${sourceName}:${source_id} done — exited cleanly with no PR (board left In progress)`);
+      updateSessionStatus(session.id, "done", undefined);
+      completed++;
     } else {
-      // Infrastructure failure: silently return the issue to Ready so the next
-      // poll auto-retries. The error tail is recorded on the session and surfaced
-      // in the dashboard only — no comment is posted.
+      // Non-zero exit OR missing sentinel → infrastructure failure. The board is
+      // intentionally left "In progress" so a developer notices and investigates
+      // (issue #20) — it is no longer auto-rolled back to Ready, and prior work
+      // (commits, worktree state) is preserved. The error tail is surfaced in the
+      // dashboard only; no comment is posted.
+      const reason = exitCode === undefined
+        ? "Session terminated unexpectedly (no exit-code sentinel)"
+        : `Session exited with code ${exitCode}`;
       const lastOutput = tmux.captureOutput(session.tmux_session);
-      const tail = lastOutput.trim().slice(-500) || "Session exited without creating a PR";
-      log.warn(`⚠️ ${sourceName}:${source_id} infrastructure failure — returning to Ready (error in dashboard)`);
+      const tail = lastOutput.trim().slice(-500) || reason;
+      log.warn(`⚠️ ${sourceName}:${source_id} ${reason} — leaving board In progress (error in dashboard)`);
       updateSessionStatus(session.id, "failed", undefined, tail);
-      await plugin.transition(ctx, source_id, { from: "processing", to: "queued" }, target_repo);
-      // Optimistically mirror the board rollback (→ "Ready") for a snappy dashboard.
-      setBoardStatus(project_id, source_id, "Ready");
       failed++;
     }
   }
@@ -162,11 +188,17 @@ export async function dispatchNew(pollResults: PollResult[]): Promise<number> {
     const promptFile = path.join(os.tmpdir(), `tl-prompt-${session}.txt`);
     fs.writeFileSync(promptFile, prompt, "utf-8");
 
+    // Issue #20: capture the agent's exit code in a sentinel file so
+    // checkRunningSessions can classify the session as done (exit 0) or failed
+    // (non-zero) independently of whether a PR was created. The path is shared
+    // with tmux.readExitCode() so the writer and reader can never disagree.
+    const exitCodeFile = tmux.exitCodePath(session);
     const scriptFile = path.join(os.tmpdir(), `tl-run-${session}.sh`);
     fs.writeFileSync(scriptFile, [
       `#!/bin/bash`,
       `cd ${repo.path}`,
       `claude "$(cat ${promptFile})" --dangerously-skip-permissions`,
+      `echo $? > "${exitCodeFile}"`,
       `rm -f "${scriptFile}" "${promptFile}"`,
     ].join("\n"), "utf-8");
     fs.chmodSync(scriptFile, 0o755);

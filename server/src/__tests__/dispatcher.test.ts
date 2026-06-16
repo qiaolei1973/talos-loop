@@ -17,10 +17,13 @@ const mockSetBoardStatus = boardSnapshot.setBoardStatus as unknown as ReturnType
 let statusBySourceId: Record<string, string | null> = {};
 // Dead sessions returned by getRunningSessionsWithIssues().
 let runningSessions: any[] = [];
-// tmux output per session name (PR-found vs infra-failure signal).
+// tmux output per session name (error tail surfaced in the dashboard on failure).
 let tmuxOutput: Record<string, string> = {};
 // Sessions still alive (must be skipped by checkRunningSessions).
 let tmuxAlive: Set<string> = new Set();
+// Issue #20: exit code read from the launcher's sentinel file per session name.
+// `undefined` (unset) models a missing sentinel (unclean termination).
+let exitCodeBySession: Record<string, number | undefined> = {};
 
 const mockPlugin = {
   name: "github",
@@ -83,6 +86,8 @@ vi.mock("../services/tmux.js", () => ({
   createSession: vi.fn(),
   captureOutput: (session: string) => tmuxOutput[session] ?? "",
   isAlive: (session: string) => tmuxAlive.has(session),
+  exitCodePath: (session: string) => `/tmp/tl-exit-${session}.txt`,
+  readExitCode: (session: string) => exitCodeBySession[session],
 }));
 
 vi.mock("../services/logger.js", () => ({
@@ -116,7 +121,11 @@ function makeCandidate(sourceId: string): IssueEntry {
   };
 }
 
-/** A dead running session for issue #9. `prUrl` drives the done/failed split. */
+/**
+ * A dead running session for issue #9. Issue #20: the done/failed split is now
+ * driven by the exit-code sentinel (exitCodeBySession), NOT by `prUrl` alone —
+ * `prUrl` only decides whether a clean exit advances the board.
+ */
 function makeRunningSession(session: string, sourceId = "9", prUrl: string | null = null): any {
   return {
     id: 100,
@@ -135,6 +144,7 @@ describe("dispatchNew slot accounting (issue #6)", () => {
     runningSessions = [];
     tmuxOutput = {};
     tmuxAlive = new Set();
+    exitCodeBySession = {};
     vi.clearAllMocks();
   });
 
@@ -182,6 +192,7 @@ describe("buildPrompt percent-encodes projectId and renders capabilities", () =>
     runningSessions = [];
     tmuxOutput = {};
     tmuxAlive = new Set();
+    exitCodeBySession = {};
     vi.clearAllMocks();
   });
 
@@ -222,19 +233,64 @@ describe("buildPrompt percent-encodes projectId and renders capabilities", () =>
   });
 });
 
-describe("checkRunningSessions outcome from stored pr_url (issue #11)", () => {
+describe("launcher script writes the exit-code sentinel (issue #20)", () => {
   beforeEach(() => {
     statusBySourceId = {};
     runningSessions = [];
     tmuxOutput = {};
     tmuxAlive = new Set();
+    exitCodeBySession = {};
     vi.clearAllMocks();
   });
 
-  it("session.pr_url set → transition done, comment PR, session done, issue done", async () => {
+  it("echoes $? to the sentinel path right after the agent exits", async () => {
+    statusBySourceId = { "1": "queued" };
+    const candidates: PollResult[] = [
+      {
+        projectId: "qiaolei1973/1",
+        projectType: "github",
+        discovered: [makeCandidate("1")],
+      },
+    ];
+
+    const { dispatchNew } = await import("../services/dispatcher.js");
+    await dispatchNew(candidates);
+
+    // Find the launcher-script write (the writeFileSync whose path ends in .sh).
+    const scriptCall = mockWriteFileSync.mock.calls.find(
+      (c: any[]) => typeof c[0] === "string" && c[0].endsWith(".sh"),
+    );
+    expect(scriptCall, "launcher script should have been written").toBeDefined();
+    const script = String((scriptCall as any[])[1]);
+
+    // The session name for github:talos-loop:1 → the sentinel path the reader expects.
+    const session = "tl-github-talos-loop-1";
+    // `$?` is captured immediately after `claude` so it reflects the agent's exit.
+    expect(script).toContain(`echo $? > "/tmp/tl-exit-${session}.txt"`);
+    // The sentinel write must come AFTER the claude invocation and BEFORE cleanup.
+    const claudeLine = script.indexOf("claude ");
+    const echoLine = script.indexOf("echo $?");
+    const rmLine = script.indexOf("rm -f");
+    expect(claudeLine).toBeGreaterThanOrEqual(0);
+    expect(echoLine).toBeGreaterThan(claudeLine);
+    expect(rmLine).toBeGreaterThan(echoLine);
+  });
+});
+
+describe("checkRunningSessions classifies by exit code, not task outcome (issue #20)", () => {
+  beforeEach(() => {
+    statusBySourceId = {};
+    runningSessions = [];
+    tmuxOutput = {};
+    tmuxAlive = new Set();
+    exitCodeBySession = {};
+    vi.clearAllMocks();
+  });
+
+  // (a) exit 0 + pr_url → session done, board advances (the ONLY board move).
+  it("exit 0 + pr_url → done, transition done, comment PR, board → In review", async () => {
     const session = "tl-github-talos-loop-9";
-    // Completion is read from the stored pr_url (set by the submit-pr action),
-    // NOT parsed from tmux output.
+    exitCodeBySession[session] = 0; // clean exit
     runningSessions = [makeRunningSession(session, "9", "https://github.com/qiaolei1973/talos-loop/pull/42")];
 
     const { checkRunningSessions } = await import("../services/dispatcher.js");
@@ -251,15 +307,36 @@ describe("checkRunningSessions outcome from stored pr_url (issue #11)", () => {
     // PR comment posted
     expect(mockPlugin.onComment).toHaveBeenCalledTimes(1);
     expect(String((mockPlugin.onComment as any).mock.calls[0][2])).toContain("pull/42");
-    // Issue #13: no persisted status — completion optimistically mirrors the board
-    // move (processing → "In review") in the snapshot for a snappy dashboard.
+    // completion optimistically mirrors the board move (processing → "In review").
     expect(mockSetBoardStatus).toHaveBeenCalledWith("qiaolei1973/1", "9", "In review");
   });
 
-  it("session.pr_url null → infra failure: transition queued, NO comment, session failed+tail", async () => {
+  // (b) exit 0 + no pr_url → done, board UNCHANGED (e.g. a review session).
+  it("exit 0 + no pr_url → done, NO transition, NO comment, board untouched", async () => {
     const session = "tl-github-talos-loop-9";
+    exitCodeBySession[session] = 0; // clean exit, but the agent never submitted a PR
     runningSessions = [makeRunningSession(session, "9", null)];
-    // The error tail is still captured from tmux output for the dashboard.
+
+    const { checkRunningSessions } = await import("../services/dispatcher.js");
+    const result = await checkRunningSessions();
+
+    expect(result).toEqual({ completed: 1, failed: 0 });
+
+    // session finalized as done with no PR url and no error
+    expect(mockUpdateSessionStatus).toHaveBeenCalledWith(100, "done", undefined);
+    // board is NOT advanced — only an explicit submit-pr/skip action moves it
+    expect(mockPlugin.transition).not.toHaveBeenCalled();
+    expect(mockPlugin.onComment).not.toHaveBeenCalled();
+    expect(mockSetBoardStatus).not.toHaveBeenCalled();
+  });
+
+  // (c) non-zero exit → failed, board UNCHANGED.
+  it("non-zero exit → failed+tail, NO transition, NO comment, board untouched", async () => {
+    const session = "tl-github-talos-loop-9";
+    exitCodeBySession[session] = 1; // crashed
+    runningSessions = [makeRunningSession(session, "9", null)];
+    // The error tail is captured from tmux output (now genuinely error output,
+    // because failed only fires on a real crash — issue #20, user story 3).
     tmuxOutput[session] = "Error: rate limit exceeded, please retry";
 
     const { checkRunningSessions } = await import("../services/dispatcher.js");
@@ -271,14 +348,33 @@ describe("checkRunningSessions outcome from stored pr_url (issue #11)", () => {
     expect(mockUpdateSessionStatus).toHaveBeenCalledWith(
       100, "failed", undefined, expect.stringContaining("rate limit exceeded"),
     );
-    // board transition processing → queued (back to Ready)
-    expect(mockPlugin.transition).toHaveBeenCalledWith(
-      expect.anything(), "9", { from: "processing", to: "queued" }, "talos-loop",
-    );
-    // NO comment posted (silent infra failure)
+    // board is intentionally left "In progress" — NOT rolled back to Ready
+    expect(mockPlugin.transition).not.toHaveBeenCalled();
     expect(mockPlugin.onComment).not.toHaveBeenCalled();
-    // Issue #13: infra failure optimistically mirrors the board rollback (→ "Ready").
-    expect(mockSetBoardStatus).toHaveBeenCalledWith("qiaolei1973/1", "9", "Ready");
+    expect(mockSetBoardStatus).not.toHaveBeenCalled();
+  });
+
+  // (d) sentinel absent → failed (unclean termination), board UNCHANGED.
+  it("missing sentinel → failed+unclean message, NO transition, board untouched", async () => {
+    const session = "tl-github-talos-loop-9";
+    // exitCodeBySession[session] deliberately unset → readExitCode returns undefined
+    runningSessions = [makeRunningSession(session, "9", null)];
+    // No captured output either (e.g. killed externally) → falls back to the reason.
+    tmuxOutput[session] = "";
+
+    const { checkRunningSessions } = await import("../services/dispatcher.js");
+    const result = await checkRunningSessions();
+
+    expect(result).toEqual({ completed: 0, failed: 1 });
+
+    // session failed with the unclean-termination message (no exit code to report)
+    expect(mockUpdateSessionStatus).toHaveBeenCalledWith(
+      100, "failed", undefined, expect.stringContaining("no exit-code sentinel"),
+    );
+    // board left "In progress" for investigation — NOT rolled back to Ready
+    expect(mockPlugin.transition).not.toHaveBeenCalled();
+    expect(mockPlugin.onComment).not.toHaveBeenCalled();
+    expect(mockSetBoardStatus).not.toHaveBeenCalled();
   });
 
   it("alive sessions are left alone", async () => {

@@ -7,11 +7,13 @@ Autonomous GitHub Issue processing agent — 监控 GitHub Projects 看板，自
 以 **GitHub Projects** 作为 workflow 引擎。单个 Project 跨多个仓库，talos-loop 轮询看板上处于 `Ready` 且带 `ready-for-agent` 资格标签（且无 `skipped` 标签）的 issue，派发 agent，并推进看板状态：
 
 ```
-Ready(queued) ──派发──► In progress(processing) ──┬──agent 调 submit-pr（存 pr_url）──► In review(done) ──PR 合并──► Done
+Ready(queued) ──派发──► In progress(processing) ──┬──exit 0 + submit-pr（存 pr_url）──► In review(done) ──PR 合并──► Done
                                                     │
-                                              无 pr_url/异常退出
+                                     exit 0（无 PR） / 异常退出（非 0 或无 sentinel）
                                                     │
-                                              回到 Ready（基础设施失败，下次自动重试，错误仅记在 dashboard）
+                                     session 标记 done / failed，看板保持 In progress
+                                     （issue #20：退出状态不再自动回退看板或自动重试，
+                                       错误仅记在 dashboard，等待人工介入/重试）
 
 agent 主动放弃（skip action）──► 加 skipped 标签 + 评论 + 回 Ready（block，直到手动移除标签）
 ```
@@ -34,13 +36,14 @@ Issue (Ready + ready-for-agent)
    │ tmux 隔离会话         │
    │ claude -p <prompt>    │ ── worktree 隔离 ── 编码 ── 推送分支 ── 调用 submit-pr 创建 PR
    └────┬─────────────────┘
-        │ 会话结束，按存储的 pr_url 判定结果
+        │ 启动脚本写 exit code 到 sentinel 文件；会话结束后按退出码判定结果（issue #20）
         ▼
-  ┌─────────────────────────────────────┐
-  │ pr_url 已存 → In review + 评论 PR 链接 │
-  │ 否则       → 回 Ready（infra 失败，静默） │
-  │ skip action → plugin 已处理（标签+评论） │
-  └─────────────────────────────────────┘
+  ┌──────────────────────────────────────────────┐
+  │ exit 0 + pr_url → In review + 评论 PR 链接      │
+  │ exit 0 无 pr_url → session done，看板不动       │
+  │ 异常退出/无 sentinel → session failed，看板不动  │
+  │ skip action → plugin 已处理（标签+评论）        │
+  └──────────────────────────────────────────────┘
 ```
 
 ## 前置依赖
@@ -177,7 +180,7 @@ npm start            # 启动服务，监听 0.0.0.0:3100
 - 手动「立即轮询」按钮
 - 每 10 秒自动刷新
 
-> 基础设施失败（LLM token 耗尽、网络错误）会静默把 issue 退回 `Ready` 并在下次轮询自动重试，错误只在本 dashboard 可见（不发 issue 评论）。
+> 基础设施失败（agent 进程崩溃 / 非零退出 / 缺少 exit-code sentinel）会把 session 标记为 `failed`，但**不再自动回退看板或自动重试**（issue #20）：issue 保持在 `In progress`，开发者看到 dashboard 的红色失败指示后自行决定是否重试或手动在看板上移动卡片。错误只在本 dashboard 可见（不发 issue 评论），agent 已完成的提交 / worktree 状态会被保留。
 
 ## API
 
@@ -235,15 +238,20 @@ talos-loop 用三个标准状态驱动流程，核心代码只与插件交流这
 
 ```
 queued(Ready) ──► processing(In progress) ──► done(In review)
-   ▲                       │
-   └── infra 失败回退 ─────┘
+                       │
+                       │ session 退出（issue #20）：
+                       │   exit 0 + pr_url → done + 推进看板
+                       │   exit 0 无 pr_url → done，看板不动
+                       │   非 0 / 无 sentinel → failed，看板不动（人工介入）
+                       │
+                   skip action ──► 回 queued(Ready) + skipped 标签
 ```
 
 - `discover()` 返回的 issue 携带其标准状态（恒为 `queued`，即看板 Ready）。进行中的 issue 由 sessions 表跟踪，不再被重新发现。
 - 派发前 Dispatcher 会实时复查 `getStatus()`，只对仍可派发的 issue 派发。
-- 状态迁移通过插件的 `transition({ from, to })` 由核心发起、插件执行（调用 `gh project item-edit`）。
+- 状态迁移通过插件的 `transition({ from, to })` 由核心发起、插件执行（调用 `gh project item-edit`）。**看板只由显式的 agent 动作推进**：`submit-pr`（exit 0 + pr_url）推进到 `done`，`skip` 退回 `queued`。会话退出本身（无论正常或崩溃）不再触发任何看板迁移（issue #20）。
 - `done`（In review）之后，PR 合并由 **GitHub 自带的项目自动化**推进到终态 `Done`，talos-loop 不参与。
-- 基础设施失败与 agent skip 都把状态退回 `queued`（Ready）：前者静默自动重试，后者附加 `skipped` 标签以阻止再次触发，直到人工移除标签。
+- 基础设施失败（进程崩溃 / 非零退出）不再回退看板：session 标记 `failed`，issue 保持 `In progress` 等待人工介入；只有 agent 主动 `skip` 才退回 `queued`（Ready）并附加 `skipped` 标签以阻止再次触发，直到人工移除标签。
 
 ## 日志
 
