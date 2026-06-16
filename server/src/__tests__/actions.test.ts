@@ -15,9 +15,14 @@ const mockGetIssue = vi.fn();
 const mockSetSessionPrUrl = vi.fn();
 const mockSetSessionBranch = vi.fn(); // issue #19: submit-pr records the PR head branch
 const mockMarkSessionSkipped = vi.fn();
+// issue #21: the retry action resolves the failed session to retry.
+const mockGetRetryableSession = vi.fn();
 // The skip action optimistically flips the in-memory board snapshot to "Ready"
 // (issue #13) — no persisted status/tmux column is written anymore.
 const mockSetBoardStatus = vi.fn();
+// issue #21: dispatchRetry is the retry dispatcher; the route hands the failed
+// session to it verbatim.
+const mockDispatchRetry = vi.fn();
 
 vi.mock("../config.js", () => ({
   loadConfig: () => ({ port: 3100, pollInterval: 60_000, maxParallel: 1, serverBaseUrl: "http://127.0.0.1:3100" }),
@@ -37,6 +42,7 @@ vi.mock("../db/index.js", () => ({
   setSessionPrUrl: mockSetSessionPrUrl,
   setSessionBranch: mockSetSessionBranch, // issue #19: submit-pr records the PR head branch
   markSessionSkipped: mockMarkSessionSkipped,
+  getRetryableSession: mockGetRetryableSession, // issue #21: retry target lookup
   // Exported by db/index but unused by the action route — present so the mock
   // satisfies api.ts's named imports.
   getAllIssues: vi.fn(),
@@ -60,7 +66,7 @@ vi.mock("../plugins/loader.js", () => ({
 
 // Keep the poller/dispatcher out of the route test entirely.
 vi.mock("../services/poller.js", () => ({ pollAll: vi.fn() }));
-vi.mock("../services/dispatcher.js", () => ({ dispatch: vi.fn() }));
+vi.mock("../services/dispatcher.js", () => ({ dispatch: vi.fn(), dispatchRetry: mockDispatchRetry }));
 vi.mock("../services/logger.js", () => ({
   createLogger: () => ({ info: vi.fn(), warn: vi.fn(), error: vi.fn() }),
 }));
@@ -225,5 +231,38 @@ describe("POST /api/projects/:projectId/issues/:sourceId/actions/:action", () =>
     });
     expect(res.statusCode).toBe(400);
     expect(res.json().error).toMatch(/Unknown action/);
+  });
+
+  // issue #21: developer-initiated retry into a failed session's preserved worktree.
+  it("retry → dispatchRetry(failedSession) when a failed session exists", async () => {
+    const failed = {
+      id: 500, issue_id: 42, source_id: "9", project_id: "qiaolei1973/1",
+      worktree_path: "/tmp/wt", branch: "feat/issue-9", status: "failed", type: "coding",
+    };
+    mockGetRetryableSession.mockReturnValue(failed);
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/api/projects/qiaolei1973%2F1/issues/9/actions/retry",
+      payload: {},
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ success: true });
+    expect(mockGetRetryableSession).toHaveBeenCalledWith(42);
+    expect(mockDispatchRetry).toHaveBeenCalledWith(failed);
+  });
+
+  it("retry rejected when no failed session exists (latest not failed)", async () => {
+    mockGetRetryableSession.mockReturnValue(undefined);
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/api/projects/qiaolei1973%2F1/issues/9/actions/retry",
+      payload: {},
+    });
+
+    expect(res.json().error).toMatch(/No failed session to retry/);
+    expect(mockDispatchRetry).not.toHaveBeenCalled();
   });
 });

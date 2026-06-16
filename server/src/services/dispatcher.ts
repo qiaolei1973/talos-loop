@@ -16,6 +16,7 @@ import type { PollResult, IssueEntry } from "./poller.js";
 import { setBoardStatus, getBoardStatus } from "./boardSnapshot.js";
 import { norm } from "./displayState.js";
 import * as tmux from "./tmux.js";
+import * as worktree from "./worktree.js";
 import { createLogger } from "./logger.js";
 
 const log = createLogger("dispatcher");
@@ -42,6 +43,8 @@ function buildPrompt(
   serverBaseUrl: string,
   targetRepo: string,
   capabilities: PluginCapability[],
+  worktreePath: string,
+  branch: string,
 ): string {
   // projectId is "owner/number" — its "/" is a path delimiter, so it must be
   // percent-encoded here or the route (/api/projects/:projectId/...) won't match.
@@ -59,10 +62,13 @@ function buildPrompt(
     ``,
     `要求：`,
     `- 阅读并理解 issue 内容`,
-    `- 使用 git worktree 隔离工作（自行决定 worktree 路径和分支名，请使用语义化的分支名）`,
+    `- 在已为你创建好的 git worktree 中工作（不要自行新建 worktree 或分支）`,
+    `  - worktree 路径：${worktreePath}`,
+    `  - 分支：${branch}`,
+    `  - 进入工作目录：cd ${worktreePath}`,
     `- 在 worktree 中完成所有开发工作`,
-    `- 完成后提交代码并推送分支，再调用 submit-pr 操作创建关联 Issue 的 Pull Request（传入你的分支名）`,
-    `- 最后清理 worktree：cd ${repoPath} && git worktree remove <你的worktree路径>`,
+    `- 完成后提交代码并推送分支 ${branch}，再调用 submit-pr 操作创建关联 Issue 的 Pull Request（传入分支名 ${branch}）`,
+    `- 最后清理 worktree：cd ${repoPath} && git worktree remove ${worktreePath}`,
     ``,
     `与 talos-loop 通信（POST ${actionsBase}/{action}，JSON body 含 targetRepo: "${targetRepo}"）：`,
     ...actionLines.map((line) => `    ${line}`),
@@ -73,16 +79,18 @@ function buildPrompt(
  * Write the agent prompt to a tmp file and the bash launcher that runs `claude`
  * on it, captures the exit code to the sentinel (issue #20), then self-deletes.
  * Shared by coding and review dispatch so both record the same exit-state
- * signal that {@link checkRunningSessions} reads.
+ * signal that {@link checkRunningSessions} reads. `workDir` is the directory the
+ * agent starts in: a coding session's pre-created worktree (issue #21), or the
+ * repo path for a review session (which spins up its own worktree).
  */
-function launchScript(repoPath: string, prompt: string, session: string): string {
+function launchScript(workDir: string, prompt: string, session: string): string {
   const promptFile = path.join(os.tmpdir(), `tl-prompt-${session}.txt`);
   fs.writeFileSync(promptFile, prompt, "utf-8");
   const exitCodeFile = tmux.exitCodePath(session);
   const scriptFile = path.join(os.tmpdir(), `tl-run-${session}.sh`);
   fs.writeFileSync(scriptFile, [
     `#!/bin/bash`,
-    `cd ${repoPath}`,
+    `cd ${workDir}`,
     `claude "$(cat ${promptFile})" --dangerously-skip-permissions`,
     `echo $? > "${exitCodeFile}"`,
     `rm -f "${scriptFile}" "${promptFile}"`,
@@ -133,6 +141,52 @@ function buildReviewPrompt(
     `6. 对每个已处理的线程调用 resolve-thread 操作（传入该线程的 threadId 和 prUrl="${prUrl}"），将其标记为已解决`,
     `7. 重新获取评审线程；如果仍有「未解决」的（包括评审者在修复期间新提出的），回到第 4 步`,
     `8. 如果全部已解决，清理 worktree 并退出：cd ${repoPath} && git worktree remove <你的worktree路径>`,
+    ``,
+    `与 talos-loop 通信（POST ${actionsBase}/{action}，JSON body 含 targetRepo: "${targetRepo}"）：`,
+    ...actionLines.map((line) => `    ${line}`),
+  ].join("\n");
+}
+
+/**
+ * Build the retry prompt (issue #21). Differs from the initial coding prompt in
+ * one key way: instead of "create a new worktree and branch", it tells the agent
+ * a worktree already exists at `<worktree>` on branch `<branch>` with partial
+ * work, and to continue from the current state, complete the implementation, and
+ * submit a PR. Full issue context is supplied, so this is a fresh Claude run (no
+ * `--resume`) that picks up from the on-disk work the failed session left behind.
+ */
+function buildRetryPrompt(
+  sourceId: string,
+  url: string,
+  repoPath: string,
+  worktreePath: string,
+  branch: string,
+  projectId: string,
+  serverBaseUrl: string,
+  targetRepo: string,
+  capabilities: PluginCapability[],
+): string {
+  const encodedProject = encodeURIComponent(projectId);
+  const actionsBase = `${serverBaseUrl}/api/projects/${encodedProject}/issues/${sourceId}/actions`;
+  const actionLines = capabilities.map((cap) => {
+    const params = cap.params.map((p) => p.name).join(", ");
+    return `- ${cap.action}：${cap.description}${params ? ` | 参数：${params}` : ""}`;
+  });
+  return [
+    `你是一个自动化编码代理。上一次针对该 Issue 的实现会话中途失败，但已完成的工作保存在一个现成的 git worktree 中。请从当前状态继续，完成实现并提交 PR。`,
+    ``,
+    `Issue: ${url}`,
+    ``,
+    `环境（已就绪，不要新建 worktree 或分支）：`,
+    `- worktree 路径：${worktreePath}`,
+    `- 分支：${branch}`,
+    ``,
+    `流程：`,
+    `- 进入工作目录：cd ${worktreePath}`,
+    `- 用 git log / git status / git diff 检查已完成的工作，理解当前进度`,
+    `- 阅读并理解 issue 内容，继续完成未完成的实现`,
+    `- 完成后提交并推送分支 ${branch}，再调用 submit-pr 操作创建关联 Issue 的 Pull Request（传入分支名 ${branch}）`,
+    `- 最后清理 worktree：cd ${repoPath} && git worktree remove ${worktreePath}`,
     ``,
     `与 talos-loop 通信（POST ${actionsBase}/{action}，JSON body 含 targetRepo: "${targetRepo}"）：`,
     ...actionLines.map((line) => `    ${line}`),
@@ -210,6 +264,13 @@ export async function checkRunningSessions(): Promise<{ completed: number; faile
       // Optimistically mirror the board move (processing → "In review") so the
       // dashboard shows done before the next poll re-reads the board.
       setBoardStatus(project_id, source_id, "In review");
+      // issue #21: success safety-net — remove the worktree so a leak the agent
+      // forgot to clean up doesn't accumulate. (The failure branch below does NOT
+      // do this: the worktree stays on disk for a manual retry.)
+      if (session.worktree_path) {
+        const repoPath = ctx.repos.find((r) => r.name === target_repo)?.path;
+        if (repoPath) worktree.removeWorktree(repoPath, session.worktree_path);
+      }
       completed++;
     } else if (cleanExit) {
       // Clean exit but no PR — a coding agent that chose not to submit. The
@@ -224,7 +285,8 @@ export async function checkRunningSessions(): Promise<{ completed: number; faile
       // intentionally left "In progress" so a developer notices and investigates
       // (issue #20) — it is no longer auto-rolled back to Ready, and prior work
       // (commits, worktree state) is preserved. The error tail is surfaced in the
-      // dashboard only; no comment is posted.
+      // dashboard only; no comment is posted. The worktree is deliberately LEFT on
+      // disk (issue #21): no removeWorktree() here, so a manual retry can resume it.
       const reason = exitCode === undefined
         ? "Session terminated unexpectedly (no exit-code sentinel)"
         : `Session exited with code ${exitCode}`;
@@ -284,12 +346,27 @@ export async function dispatchNew(pollResults: PollResult[]): Promise<number> {
     }
 
     const session = tmux.sessionName(sourceName, targetRepo, sourceId);
+
+    // issue #21: the worktree path and branch are server-determined (derived
+    // from the per-issue session name), so the path is known to the server
+    // without the agent reporting back, and a later retry resolves to the same
+    // path. The worktree is created BEFORE launch so the agent starts inside it.
+    const branch = `feat/issue-${sourceId}`;
+    const worktreePath = worktree.worktreePath(repo.path, session);
+    try {
+      worktree.createWorktree(repo.path, worktreePath, branch);
+    } catch (err: any) {
+      log.error(`Failed to create worktree for ${sourceName}:${sourceId}: ${err.message}`);
+      continue;
+    }
+
     const capabilities = pluginCapabilities(plugin);
-    const prompt = buildPrompt(sourceId, issue.url, repo.path, projectId, config.serverBaseUrl, targetRepo, capabilities);
+    const prompt = buildPrompt(sourceId, issue.url, repo.path, projectId, config.serverBaseUrl, targetRepo, capabilities, worktreePath, branch);
 
-    const command = launchScript(repo.path, prompt, session);
+    // Launch the agent INSIDE the worktree (issue #21).
+    const command = launchScript(worktreePath, prompt, session);
 
-    log.info(`🚀 Dispatching ${sourceName}:${sourceId} → session ${session}`);
+    log.info(`🚀 Dispatching ${sourceName}:${sourceId} → session ${session} (worktree ${worktreePath})`);
 
     try {
       await plugin.transition(ctx, sourceId, { from: "queued", to: "processing" }, targetRepo);
@@ -299,7 +376,7 @@ export async function dispatchNew(pollResults: PollResult[]): Promise<number> {
 
       tmux.createSession(session, command);
 
-      createSession(issue.id, session);
+      createSession(issue.id, session, { worktreePath, branch });
       // Optimistically flip the board snapshot to "In progress" so the dashboard
       // reflects processing between this dispatch and the next poll (issue #13).
       setBoardStatus(projectId, sourceId, "In progress");
@@ -307,12 +384,63 @@ export async function dispatchNew(pollResults: PollResult[]): Promise<number> {
       dispatched++;
     } catch (err: any) {
       log.error(`Failed to dispatch ${sourceName}:${sourceId}: ${err.message}`);
+      // The worktree was created before this try block — if the dispatch failed
+      // after that point, drop the unused worktree so it doesn't leak (issue #21).
+      worktree.removeWorktree(repo.path, worktreePath);
       // Roll the board status back to Ready so the next poll retries.
       await plugin.transition(ctx, sourceId, { from: "processing", to: "queued" }, targetRepo);
     }
   }
 
   return dispatched;
+}
+
+/**
+ * Retry a failed session in place (issue #21): dispatch a fresh coding agent
+ * directly into the worktree and branch the failed session left on disk, with a
+ * prompt that says "continue from here" rather than "start over".
+ *
+ * The new session record inherits the failed session's `issue_id`, `branch`, and
+ * `worktree_path`. The failed record is left as-is (`status = 'failed'`) — the
+ * retry shows up as a separate, newer row in the issue's session group. The
+ * board is NOT touched: the issue stays "In progress" (the failed session left
+ * it there per issue #20), and a successful retry advances it to "In review" via
+ * the normal submit-pr → checkRunningSessions path.
+ *
+ * The caller ({@link getRetryableSession}) guarantees `failed` is the issue's
+ * latest session and is a failed coding session with a recorded worktree+branch.
+ */
+export async function dispatchRetry(
+  failed: { issue_id: number; project_id: string; project_type: string; source_id: string; target_repo: string; url: string; worktree_path: string; branch: string },
+): Promise<void> {
+  const config = loadConfig();
+  const { issue_id, project_id, project_type, source_id, target_repo, url, worktree_path, branch } = failed;
+
+  const plugin = await resolvePlugin(project_type);
+  const ctx = buildProjectContextForIssue(project_id, log);
+  const sourceName = plugin.name;
+  const repo = ctx.repos.find((r) => r.name === target_repo);
+  if (!repo) throw new Error(`Repo "${target_repo}" not found for retry of ${sourceName}:${source_id}`);
+
+  // Reuse the preserved worktree (recreate it on the existing branch if it was
+  // removed out of band) so the partial work the failed session committed survives.
+  worktree.ensureWorktree(repo.path, worktree_path, branch);
+
+  // Same per-issue session name as the original coding dispatch → reuses the same
+  // worktree path derivation and (free-again) tmux name; the failed session's
+  // tmux process is dead by the time its status is 'failed'.
+  const session = tmux.sessionName(sourceName, target_repo, source_id);
+  const capabilities = pluginCapabilities(plugin);
+  const prompt = buildRetryPrompt(source_id, url, repo.path, worktree_path, branch, project_id, config.serverBaseUrl, target_repo, capabilities);
+  // Launch the agent INSIDE the existing worktree.
+  const command = launchScript(worktree_path, prompt, session);
+
+  log.info(`🔁 Retrying ${sourceName}:${source_id} in existing worktree ${worktree_path} → session ${session}`);
+
+  tmux.createSession(session, command);
+  // Inherit issue_id, branch, AND worktree_path from the failed session; a fresh
+  // 'running' coding row that the dashboard shows alongside the failed one.
+  createSession(issue_id, session, { type: "coding", branch, worktreePath: worktree_path });
 }
 
 /**

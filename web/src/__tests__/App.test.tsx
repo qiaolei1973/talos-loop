@@ -67,6 +67,7 @@ const statusFixture = {
 let issuesGets = 0;
 let statusGets = 0;
 let pollPosts = 0;
+let retryPosts = 0;
 
 const server = setupServer(
   http.get("/api/issues", () => {
@@ -80,6 +81,11 @@ const server = setupServer(
   http.post("/api/poll", () => {
     pollPosts += 1;
     return HttpResponse.json({ ok: true });
+  }),
+  // issue #21: the retry action endpoint the dashboard's Retry button hits.
+  http.post("/api/projects/:projectId/issues/:sourceId/actions/retry", () => {
+    retryPosts += 1;
+    return HttpResponse.json({ success: true });
   }),
 );
 
@@ -97,6 +103,7 @@ function resetCounters() {
   issuesGets = 0;
   statusGets = 0;
   pollPosts = 0;
+  retryPosts = 0;
 }
 
 // A fresh, deterministic client per render: no retries, no focus refetch, data
@@ -225,6 +232,57 @@ describe("App dashboard", () => {
 
     // The live review session offers an attach button; the (dead) coding one does not.
     expect(screen.getAllByRole("button", { name: /attach/i }).length).toBe(1);
+  });
+
+  // issue #21: a failed coding session with a preserved worktree shows a Retry
+  // button that POSTs the retry action, then refetches issues.
+  it("shows a Retry button on a failed session and POSTs the retry action on click", async () => {
+    const failedIssue = {
+      id: 4,
+      project_id: "owner/1",
+      project_type: "github",
+      project_name: "demo-project",
+      source_id: "21",
+      target_repo: "talos-loop",
+      url: "https://github.com/owner/talos-loop/issues/21",
+      title: "feat: retry failed session in place",
+      status: "processing", // board still "In progress" (issue #20: no rollback)
+      tmux_session: null,
+      sessions: [
+        {
+          id: 40,
+          tmux_session: "tl-dead-21",
+          status: "failed",
+          pr_url: null,
+          error: "Session exited with code 1",
+          started_at: "2026-06-16 00:00:00",
+          finished_at: "2026-06-16 00:05:00",
+          type: "coding",
+          isLive: false,
+          worktree_path: "/tmp/wt-21",
+        },
+      ],
+      created_at: "2026-06-16 00:00:00",
+      updated_at: "2026-06-16 00:05:00",
+    };
+    server.use(
+      http.get("/api/issues", () => {
+        issuesGets += 1;
+        return HttpResponse.json([failedIssue]);
+      }),
+    );
+
+    const user = userEvent.setup();
+    renderApp();
+
+    const retryBtn = await screen.findByRole("button", { name: /retry/i });
+    expect(retryBtn).toBeInTheDocument();
+
+    await user.click(retryBtn);
+
+    // The retry action was posted to the issue's action URL, and issues refetch.
+    await waitFor(() => expect(retryPosts).toBe(1));
+    await waitFor(() => expect(issuesGets).toBeGreaterThan(1));
   });
 });
 

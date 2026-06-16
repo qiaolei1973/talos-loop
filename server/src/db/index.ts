@@ -63,7 +63,11 @@ function migrate(db: Database.Database) {
       type TEXT NOT NULL DEFAULT 'coding',
       -- The PR head branch: written by submit-pr for coding sessions and set at
       -- dispatch for review sessions (the branch they push fixes to).
-      branch TEXT
+      branch TEXT,
+      -- issue #21: the server-determined worktree path. Written at dispatch so
+      -- the path is known to the server without the agent reporting back; a
+      -- retry session inherits it from the failed session to reuse the worktree.
+      worktree_path TEXT
     );
 
     CREATE INDEX IF NOT EXISTS idx_issues_project ON issues(project_id);
@@ -84,6 +88,10 @@ function migrate(db: Database.Database) {
   }
   if (!hasSessionCol("branch")) {
     db.exec("ALTER TABLE sessions ADD COLUMN branch TEXT");
+  }
+  // issue #21: additive migration for the server-determined worktree path.
+  if (!hasSessionCol("worktree_path")) {
+    db.exec("ALTER TABLE sessions ADD COLUMN worktree_path TEXT");
   }
 }
 
@@ -166,6 +174,8 @@ export interface Session {
   type: "coding" | "review";
   /** PR head branch — set by submit-pr (coding) or at dispatch (review). */
   branch: string | null;
+  /** issue #21: server-determined worktree path; inherited by a retry session. */
+  worktree_path: string | null;
 }
 
 // --- Session CRUD ---
@@ -186,19 +196,21 @@ export function setSessionBranch(issueId: number, branch: string): void {
  * Create a session row. Coding sessions (the default) leave type/branch empty —
  * branch is filled in later by submit-pr. Review sessions pass their PR url and
  * target branch up front (issue #19): the PR already exists, so the url is
- * known at dispatch time, not via an agent callback.
+ * known at dispatch time, not via an agent callback. Coding sessions now also
+ * carry their server-determined `worktreePath` (issue #21) so the path is known
+ * to the server without the agent reporting back, and a retry can inherit it.
  */
 export function createSession(
   issueId: number,
   tmuxSession: string,
-  init?: { type?: "coding" | "review"; branch?: string; prUrl?: string },
+  init?: { type?: "coding" | "review"; branch?: string; prUrl?: string; worktreePath?: string },
 ): Session {
   const d = getDb();
   const type = init?.type ?? "coding";
   d.prepare(
-    `INSERT INTO sessions (issue_id, tmux_session, type, branch, pr_url)
-     VALUES (?, ?, ?, ?, ?)`,
-  ).run(issueId, tmuxSession, type, init?.branch ?? null, init?.prUrl ?? null);
+    `INSERT INTO sessions (issue_id, tmux_session, type, branch, pr_url, worktree_path)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+  ).run(issueId, tmuxSession, type, init?.branch ?? null, init?.prUrl ?? null, init?.worktreePath ?? null);
   return d.prepare("SELECT * FROM sessions WHERE id = last_insert_rowid()").get() as Session;
 }
 
@@ -293,4 +305,44 @@ export function getRunningReviewIssueIds(): Set<number> {
     "SELECT DISTINCT issue_id FROM sessions WHERE type = 'review' AND status = 'running'",
   ).all() as Array<{ issue_id: number }>;
   return new Set(rows.map((r) => r.issue_id));
+}
+
+/**
+ * The session a manual retry (issue #21) targets, if any. Retry is only valid
+ * when the issue's LATEST session is a failed CODING session that recorded a
+ * worktree path — the worktree it left on disk is what the retry continues in.
+ *
+ *   latest session is failed coding + has worktree_path → return it (retry OK)
+ *   otherwise (done/running/skipped, or a failed review session) → undefined
+ *
+ * Gating on the LATEST session (not just any failed one) means an issue that has
+ * since succeeded (e.g. an earlier failed attempt later retried to success) is
+ * NOT retryable again. Review failures are excluded: those are auto-retried by
+ * the poll cycle when unresolved threads remain, so they need no manual retry.
+ *
+ * The returned `branch` and `worktree_path` are narrowed to `string` (non-null):
+ * the runtime check above guarantees both are present when a row is returned.
+ */
+export type RetryableSession = Omit<Session, "branch" | "worktree_path"> & {
+  project_id: string;
+  project_type: string;
+  source_id: string;
+  target_repo: string;
+  url: string;
+  branch: string;
+  worktree_path: string;
+};
+
+export function getRetryableSession(issueId: number): RetryableSession | undefined {
+  const latest = getDb().prepare(`
+    SELECT s.*, i.project_id, i.project_type, i.source_id, i.target_repo, i.url
+    FROM sessions s
+    JOIN issues i ON s.issue_id = i.id
+    WHERE s.issue_id = ?
+    ORDER BY s.id DESC
+    LIMIT 1
+  `).get(issueId) as RetryableSession | undefined;
+  if (!latest) return undefined;
+  if (latest.status !== "failed" || latest.type !== "coding" || !latest.worktree_path || !latest.branch) return undefined;
+  return latest;
 }
