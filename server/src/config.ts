@@ -31,6 +31,12 @@ export interface AppConfig {
   serverBaseUrl: string;
   /** GraphQL remaining capacity below which the poller skips a board read, so talos-loop doesn't collide with the dispatched agent over the shared 5000/h token budget. */
   quotaThreshold: number;
+  /**
+   * dispatchReview() fires every Nth dispatch cycle (issue #19), giving a
+   * reviewer time to batch several rounds of "Request changes" comments before
+   * the review-fix agent runs. Default 15 ≈ 15 min at the 60s poll interval.
+   */
+  reviewDispatchEvery: number;
 }
 
 const PROJECT_ROOT = path.resolve(__dirname, "../..");
@@ -58,6 +64,7 @@ function defaults(): Partial<AppConfig> {
     // Leave headroom for the dispatched agent (shares this token). A board read
     // is ~1 item-list; 200 survives a full poll plus concurrent agent traffic.
     quotaThreshold: 200,
+    reviewDispatchEvery: 15,
   };
 }
 
@@ -77,6 +84,7 @@ export function loadConfig(): AppConfig {
     dbPath: parsed.dbPath ?? def.dbPath!,
     serverBaseUrl: parsed.serverBaseUrl ?? `http://127.0.0.1:${port}`,
     quotaThreshold: parsed.quotaThreshold ?? def.quotaThreshold!,
+    reviewDispatchEvery: parsed.reviewDispatchEvery ?? def.reviewDispatchEvery!,
   };
 
   // Ensure database directory exists

@@ -40,9 +40,17 @@ const FIELD_LIST = {
   ],
 };
 
-function ghMock(opts: { items?: any[]; labels?: any[]; comments?: any[]; graphql?: { remaining?: number; limit?: number; reset?: number } } = {}) {
+function ghMock(opts: { items?: any[]; labels?: any[]; comments?: any[]; graphql?: { remaining?: number; limit?: number; reset?: number }; reviewThreads?: any[] } = {}) {
   return (cmd: string) => {
     if (cmd.includes("gh api rate_limit")) return JSON.stringify({ resources: { graphql: opts.graphql ?? { remaining: 5000, limit: 5000, reset: 1800000000 } } });
+    if (cmd.includes("gh api graphql")) {
+      // The resolveReviewThread mutation vs the reviewThreads query share one
+      // graphql endpoint — distinguish by the operation embedded in the query.
+      if (cmd.includes("resolveReviewThread")) {
+        return JSON.stringify({ data: { resolveReviewThread: { thread: { isResolved: true } } } });
+      }
+      return JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: { nodes: opts.reviewThreads ?? [] } } } } });
+    }
     if (cmd.includes("gh project view")) return JSON.stringify({ id: "PVT_test", number: 1 });
     if (cmd.includes("gh project field-list")) return JSON.stringify(FIELD_LIST);
     if (cmd.includes("gh project item-list")) return JSON.stringify({ items: opts.items ?? [] });
@@ -337,6 +345,103 @@ describe("GitHubIssueSourcePlugin", () => {
       }
       // submit-pr must accept the branch parameter the prompt tells the agent to send.
       expect(byAction.get("submit-pr")!.params.map((p) => p.name)).toContain("branch");
+    });
+
+    it("declares resolve-thread with threadId + prUrl params (issue #19)", () => {
+      const caps = plugin.capabilities();
+      const byAction = new Map(caps.map((c) => [c.action, c]));
+      expect(byAction.has("resolve-thread")).toBe(true);
+      expect(byAction.get("resolve-thread")!.params.map((p) => p.name)).toEqual(["threadId", "prUrl"]);
+    });
+  });
+
+  describe("listUnresolvedThreads() (issue #19)", () => {
+    it("returns only unresolved threads with their node id / body / path", async () => {
+      mockExecSync.mockImplementation(
+        ghMock({
+          reviewThreads: [
+            { id: "PRRT_open1", isResolved: false, path: "src/a.ts", comments: { nodes: [{ body: "rename this" }] } },
+            { id: "PRRT_done", isResolved: true, path: "src/b.ts", comments: { nodes: [{ body: "resolved one" }] } },
+            { id: "PRRT_open2", isResolved: false, path: "src/c.ts", comments: { nodes: [{ body: "add a test" }] } },
+          ],
+        }),
+      );
+
+      const threads = await plugin.listUnresolvedThreads(
+        makeCtx(),
+        "https://github.com/qiaolei1973/talos-loop/pull/9",
+      );
+
+      expect(threads).toHaveLength(2);
+      expect(threads.map((t) => t.id)).toEqual(["PRRT_open1", "PRRT_open2"]);
+      expect(threads.every((t) => t.resolved === false)).toBe(true);
+      expect(threads[0].body).toBe("rename this");
+      expect(threads[0].path).toBe("src/a.ts");
+
+      // The query inlines owner/repo/number parsed from the PR url.
+      const graphqlCmd = mockExecSync.mock.calls
+        .map((c: any[]) => c[0] as string)
+        .find((cmd) => cmd.includes("gh api graphql"));
+      expect(graphqlCmd).toContain("owner:\"qiaolei1973\"");
+      expect(graphqlCmd).toContain("name:\"talos-loop\"");
+      expect(graphqlCmd).toContain("number:9");
+      expect(graphqlCmd).toContain("reviewThreads");
+    });
+
+    it("returns [] on a GraphQL read failure (caller skips this cycle, retries next)", async () => {
+      mockExecSync.mockImplementation((cmd: string) => {
+        if (cmd.includes("gh api graphql")) throw new Error("rate limited");
+        return "";
+      });
+      const ctx = makeCtx();
+      const threads = await plugin.listUnresolvedThreads(ctx, "https://github.com/qiaolei1973/talos-loop/pull/9");
+      expect(threads).toEqual([]);
+      expect(ctx.logger.warn).toHaveBeenCalledWith(expect.stringMatching(/GraphQL read failed/i));
+    });
+
+    it("throws on a malformed PR url (never sends a malformed query)", async () => {
+      mockExecSync.mockImplementation(ghMock());
+      await expect(plugin.listUnresolvedThreads(makeCtx(), "not-a-pr-url")).rejects.toThrow(/Invalid PR url/);
+      expect(mockExecSync).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("resolveThread() (issue #19)", () => {
+    it("runs the resolveReviewThread GraphQL mutation with the thread node id", async () => {
+      mockExecSync.mockImplementation(ghMock());
+
+      await plugin.resolveThread(
+        makeCtx(),
+        "9",
+        "https://github.com/qiaolei1973/talos-loop/pull/9",
+        "PRRT_kwDOS2N8m85L2XHk",
+      );
+
+      const graphqlCmd = mockExecSync.mock.calls
+        .map((c: any[]) => c[0] as string)
+        .find((cmd) => cmd.includes("gh api graphql"));
+      expect(graphqlCmd, "expected a graphql mutation call").toBeDefined();
+      // The mutation embeds the thread id as the input.threadId literal.
+      expect(graphqlCmd).toContain("resolveReviewThread");
+      expect(graphqlCmd).toContain('threadId:"PRRT_kwDOS2N8m85L2XHk"');
+    });
+
+    it("rejects a thread id that is not a node-id shape (no injection into the mutation)", async () => {
+      mockExecSync.mockImplementation(ghMock());
+      await expect(
+        plugin.resolveThread(makeCtx(), "9", "https://github.com/qiaolei1973/talos-loop/pull/9", 'evil"; drop'),
+      ).rejects.toThrow(/invalid thread id/i);
+      expect(mockExecSync).not.toHaveBeenCalled();
+    });
+
+    it("propagates a mutation failure", async () => {
+      mockExecSync.mockImplementation((cmd: string) => {
+        if (cmd.includes("gh api graphql")) throw new Error("forbidden");
+        return "";
+      });
+      await expect(
+        plugin.resolveThread(makeCtx(), "9", "https://github.com/qiaolei1973/talos-loop/pull/9", "PRRT_ok"),
+      ).rejects.toThrow(/forbidden/);
     });
   });
 

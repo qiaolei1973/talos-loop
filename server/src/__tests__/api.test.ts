@@ -31,6 +31,7 @@ vi.mock("../db/index.js", () => ({
   getRunningSessions: () => [],
   markSessionSkipped: vi.fn(),
   setSessionPrUrl: vi.fn(),
+  setSessionBranch: vi.fn(),
 }));
 
 vi.mock("../services/boardSnapshot.js", () => ({
@@ -83,6 +84,8 @@ function makeSession(overrides: Partial<Session> = {}): Session {
     error: null,
     started_at: "",
     finished_at: null,
+    type: "coding",
+    branch: null,
     ...overrides,
   };
 }
@@ -212,4 +215,23 @@ describe("GET /api/issues — derived display status (issue #13)", () => {
     expect(body[0].target_repo).toBe("talos-loop");
     expect(body[0].project_name).toBe("github");
   });
+
+  it("surfaces an isLive flag per session (issue #19)", async () => {
+    issuesState = [makeIssue()];
+    boardByIssue["qiaolei1973/1/9"] = "In review";
+    // One coding session (done), one review session (running + alive) → live.
+    sessionsByIssue[9] = [
+      makeSession({ id: 2, status: "done", tmux_session: "tl-done", type: "coding" }),
+      makeSession({ id: 3, status: "running", tmux_session: "tl-live-review", type: "review" }),
+    ];
+    aliveSessionNames = new Set(["tl-live-review"]);
+
+    const body = await issuesJson(app);
+    const byId = new Map(body[0].sessions.map((s: any) => [s.id, s]));
+    expect((byId.get(2) as any).isLive).toBe(false); // done coding session
+    expect((byId.get(3) as any).isLive).toBe(true); // live review session
+    // …and the live review session does NOT flip the stage badge off "In review".
+    expect(body[0].status).toBe("done");
+  });
 });
+

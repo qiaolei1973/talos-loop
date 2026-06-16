@@ -9,13 +9,14 @@ import {
   getRunningSessions,
   markSessionSkipped,
   setSessionPrUrl,
+  setSessionBranch,
   type Issue,
 } from "../db/index.js";
 import { pollAll } from "../services/poller.js";
 import { dispatch } from "../services/dispatcher.js";
 import { resolvePlugin, getPluginName } from "../plugins/loader.js";
 import { getBoardStatus, setBoardStatus } from "../services/boardSnapshot.js";
-import { deriveDisplayState, liveSessionName } from "../services/displayState.js";
+import { deriveDisplayState, liveSessionName, isSessionLive } from "../services/displayState.js";
 import { createLogger } from "../services/logger.js";
 
 const log = createLogger("api");
@@ -120,6 +121,9 @@ export async function registerApiRoutes(app: FastifyInstance): Promise<void> {
   // All issues — `status` and `tmux_session` are DERIVED (issue #13), never read
   // from a persisted column: status comes from the board snapshot + live session
   // check; the attach target is the alive running session's name, if any.
+  // Each session row also carries an `isLive` flag (issue #19) so the dashboard
+  // can offer an attach button on any live session, coding or review, while the
+  // issue's stage badge stays purely board-driven.
   app.get("/api/issues", async () => {
     const issues = await withProjectName(getAllIssues());
     return issues.map((issue) => {
@@ -129,7 +133,7 @@ export async function registerApiRoutes(app: FastifyInstance): Promise<void> {
         ...issue,
         status: deriveDisplayState(sessions, boardStatus),
         tmux_session: liveSessionName(sessions),
-        sessions,
+        sessions: sessions.map((s) => ({ ...s, isLive: isSessionLive(s) })),
       };
     });
   });
@@ -164,7 +168,12 @@ export async function registerApiRoutes(app: FastifyInstance): Promise<void> {
           // we only persist it so checkRunningSessions finds it on the session.
           const prUrl = await plugin.submitPr(ctx, sourceId, branch, targetRepo);
           const issue = getIssue(projectId, sourceId);
-          if (issue) setSessionPrUrl(issue.id, prUrl);
+          // Record both the PR url AND its head branch (issue #19): a later
+          // dispatchReview() pushes fixes to this same branch.
+          if (issue) {
+            setSessionPrUrl(issue.id, prUrl);
+            setSessionBranch(issue.id, branch);
+          }
           return { success: true, prUrl };
         }
         case "comment": {
@@ -172,6 +181,18 @@ export async function registerApiRoutes(app: FastifyInstance): Promise<void> {
           if (!targetRepo || !message) return { error: "targetRepo and message required" };
           if (!plugin.onComment) return { error: "Plugin does not support comments" };
           await plugin.onComment(ctx, sourceId, message, targetRepo);
+          return { success: true };
+        }
+        case "resolve-thread": {
+          // issue #19: the review-fix agent resolves a PR review thread after
+          // addressing it. The agent supplies the PR url and the thread node id
+          // (both are in its prompt); the plugin performs the source-specific
+          // resolution (GitHub: the GraphQL resolveReviewThread mutation).
+          const prUrl = body.prUrl as string | undefined;
+          const threadId = body.threadId as string | undefined;
+          if (!targetRepo || !prUrl || !threadId) return { error: "targetRepo, prUrl and threadId required" };
+          if (!plugin.resolveThread) return { error: "Plugin does not support resolve-thread" };
+          await plugin.resolveThread(ctx, sourceId, prUrl, threadId);
           return { success: true };
         }
         case "skip": {

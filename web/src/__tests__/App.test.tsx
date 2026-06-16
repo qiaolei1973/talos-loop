@@ -29,6 +29,8 @@ const issuesFixture = [
         error: null,
         started_at: "2026-06-16 00:00:00",
         finished_at: null,
+        type: "coding",
+        isLive: true,
       },
     ],
     created_at: "2026-06-16 00:00:00",
@@ -165,4 +167,64 @@ describe("App dashboard", () => {
     await waitFor(() => expect(pollPosts).toBe(1));
     await waitFor(() => expect(issuesGets).toBe(2));
   });
+
+  // issue #19: an issue's session group shows every session (coding + review),
+  // an attach button on the live review session, and the stage badge stays
+  // board-driven ("In review") despite the live review session.
+  it("renders a coding+review session group with a live attach and a stable stage badge", async () => {
+    const reviewIssue = {
+      id: 3,
+      project_id: "owner/1",
+      project_type: "github",
+      project_name: "demo-project",
+      source_id: "19",
+      target_repo: "talos-loop",
+      url: "https://github.com/owner/talos-loop/issues/19",
+      title: "feat: auto-fix PR review comments",
+      status: "done", // board "In review" → done, NOT processing, even with a live review session
+      tmux_session: "sess-review",
+      sessions: [
+        {
+          id: 20,
+          tmux_session: "tl-dead",
+          status: "done",
+          pr_url: "https://github.com/owner/talos-loop/pull/30",
+          error: null,
+          started_at: "2026-06-15 00:00:00",
+          finished_at: "2026-06-15 00:01:00",
+          type: "coding",
+          isLive: false,
+        },
+        {
+          id: 21,
+          tmux_session: "sess-review",
+          status: "running",
+          pr_url: "https://github.com/owner/talos-loop/pull/30",
+          error: null,
+          started_at: "2026-06-16 00:00:00",
+          finished_at: null,
+          type: "review",
+          isLive: true,
+        },
+      ],
+      created_at: "2026-06-15 00:00:00",
+      updated_at: "2026-06-16 00:00:00",
+    };
+    server.use(http.get("/api/issues", () => HttpResponse.json([reviewIssue])));
+
+    renderApp();
+
+    // Stage badge stays board-driven: "In review" (done), never "In progress".
+    expect(await screen.findByText("In review")).toBeInTheDocument();
+    expect(screen.queryByText("In progress")).not.toBeInTheDocument();
+
+    // Both session types are surfaced in the group (the done coding chip shows
+    // "coding · …"; the live review chip shows "review" in its own span).
+    expect(screen.getAllByText(/^coding/).length).toBe(1);
+    expect(screen.getAllByText(/^review$/).length).toBe(1);
+
+    // The live review session offers an attach button; the (dead) coding one does not.
+    expect(screen.getAllByRole("button", { name: /attach/i }).length).toBe(1);
+  });
 });
+

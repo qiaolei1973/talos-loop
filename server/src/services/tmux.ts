@@ -37,6 +37,18 @@ export function sessionName(sourceName: string, targetRepo: string, sourceId: st
   return [SESSION_PREFIX, safe(sourceName), safe(targetRepo), safe(sourceId)].join("-");
 }
 
+/**
+ * Build a review-session name (issue #19). A coding session and its review
+ * cycles must not share a tmux name, so we suffix `-review`. The name is reused
+ * across a single issue's review cycles: only one review session runs at a time
+ * (dispatchReview skips when one is running), and a finished session's tmux
+ * process has already exited, so the name is free again — `checkRunningSessions`
+ * marks it done from the (dead) tmux state, never from name reuse.
+ */
+export function reviewSessionName(sourceName: string, targetRepo: string, sourceId: string): string {
+  return `${sessionName(sourceName, targetRepo, sourceId)}-review`;
+}
+
 /** Create a new detached tmux session running a command */
 export function createSession(name: string, command: string): void {
   execSync(`tmux new-session -d -s "${name}" -x 200 -y 50 "${command}"`, { timeout: 10_000 });

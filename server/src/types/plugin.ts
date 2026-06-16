@@ -117,6 +117,22 @@ export interface IssueSourcePlugin {
    */
   submitPr?(ctx: ProjectContext, sourceId: string, branch: string, targetRepo: string): Promise<string>;
   /**
+   * List the PR's currently-unresolved review threads (issue #19). Returns the
+   * threads the review-fix agent must address; an empty list means the PR needs
+   * no review work and `dispatchReview()` skips it. `id` is whatever token the
+   * source needs to resolve a thread — for GitHub that is the review-thread node
+   * id consumed by {@link resolveThread}. Plugins that cannot inspect review
+   * threads may omit this method, and `dispatchReview()` then skips their PRs.
+   */
+  listUnresolvedThreads?(ctx: ProjectContext, prUrl: string): Promise<ReviewThread[]>;
+  /**
+   * Mark one review thread as resolved (issue #19). For GitHub this is the
+   * GraphQL `resolveReviewThread` mutation; the `threadId` is the thread node id
+   * returned by {@link listUnresolvedThreads}. The agent calls this after fixing
+   * each thread so the PR's review state is the single source of truth.
+   */
+  resolveThread?(ctx: ProjectContext, sourceId: string, prUrl: string, threadId: string): Promise<void>;
+  /**
    * The agent has determined it cannot complete the task (insufficient
    * requirements, wrong repo, ...). The plugin should make this durable and
    * blocking: apply its skip marker (e.g. a `skipped` label), post a comment
@@ -209,4 +225,21 @@ export interface QuotaStatus {
 export interface StatusTransition {
   from: IssueState;
   to: IssueState;
+}
+
+/**
+ * A single review thread on a PR, returned by {@link IssueSourcePlugin.listUnresolvedThreads}
+ * for the review-fix agent (issue #19). `id` is the token the source needs to
+ * resolve the thread (GitHub: the review-thread node id); `body` and `path`
+ * give the agent the feedback to act on.
+ */
+export interface ReviewThread {
+  /** Token passed to the `resolve-thread` action (GitHub: thread node id). */
+  id: string;
+  /** The review feedback text, surfaced in the agent prompt. */
+  body: string;
+  /** File path the thread is attached to, when known. */
+  path?: string;
+  /** Whether the thread is already resolved (false for unresolved). */
+  resolved: boolean;
 }

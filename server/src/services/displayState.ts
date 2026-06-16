@@ -41,20 +41,36 @@ export function mapBoardStatus(boardStatus: string | null | undefined): DisplayS
 /**
  * Derive an issue's display status from the two sources of truth (issue #13).
  * The GitHub Projects board column is the sole source of workflow truth, EXCEPT
- * that a live tmux session always reads as "processing" — so a board hand-moved
- * to Ready mid-flight doesn't mis-report an actively-running agent.
+ * that a live CODING session always reads as "processing" — so a board
+ * hand-moved to Ready mid-flight doesn't mis-report an actively-running agent.
  *
- *   running session AND tmux.isAlive → processing
+ * A live REVIEW session does NOT override the board (issue #19, user story 9):
+ * review sessions are short-lived workers on a PR that is already "In review",
+ * and the stage badge must stay stable and board-driven while one runs. (Its
+ * liveness is shown separately as a per-session `isLive` indicator.)
+ *
+ *   running CODING session AND tmux.isAlive → processing
  *   otherwise mapBoardStatus(board column)
  */
 export function deriveDisplayState(
   sessions: Session[],
   boardStatus: string | null | undefined,
 ): DisplayState {
-  if (sessions.some((s) => s.status === "running" && tmux.isAlive(s.tmux_session))) {
+  if (sessions.some((s) => s.status === "running" && s.type !== "review" && tmux.isAlive(s.tmux_session))) {
     return "processing";
   }
   return mapBoardStatus(boardStatus);
+}
+
+/**
+ * Is a session currently live (issue #19, user stories 8 & 10)? True only when
+ * the session row is `running` and tmux still reports the process alive — the
+ * same invariant `deriveDisplayState` and `liveSessionName` use. Surfaced per
+ * session row in the dashboard so an attach button can be offered on any live
+ * session, coding or review, independent of the board stage badge.
+ */
+export function isSessionLive(session: Session): boolean {
+  return session.status === "running" && tmux.isAlive(session.tmux_session);
 }
 
 /**
