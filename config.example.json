@@ -4,5 +4,6 @@
   "maxParallel": 1,
   "claudeTimeout": 600,
   "serverBaseUrl": "http://127.0.0.1:3100",
-  "quotaThreshold": 200
+  "quotaThreshold": 200,
+  "reviewDispatchEvery": 15
 }

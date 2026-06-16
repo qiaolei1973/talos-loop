@@ -8,6 +8,7 @@ import type { Issue } from "../db/index.js";
 // --- spy references into the mocked modules ---
 const mockWriteFileSync = fs.writeFileSync as unknown as ReturnType<typeof vi.fn>;
 const mockUpdateSessionStatus = db.updateSessionStatus as unknown as ReturnType<typeof vi.fn>;
+const mockCreateSession = db.createSession as unknown as ReturnType<typeof vi.fn>;
 // Issue #13: workflow status is no longer persisted — dispatch/completion/skip
 // only optimistically flip the in-memory board snapshot.
 const mockSetBoardStatus = boardSnapshot.setBoardStatus as unknown as ReturnType<typeof vi.fn>;
@@ -24,6 +25,17 @@ let tmuxAlive: Set<string> = new Set();
 // Issue #20: exit code read from the launcher's sentinel file per session name.
 // `undefined` (unset) models a missing sentinel (unclean termination).
 let exitCodeBySession: Record<string, number | undefined> = {};
+// Issue #19: review-dispatch state.
+// Coding sessions with a PR that dispatchReview() inspects.
+let codingSessionsWithPr: any[] = [];
+// Issue ids that already have a running review session.
+let runningReviewIssueIds: Set<number> = new Set();
+// Board snapshot: `${projectId}/${sourceId}` → raw board column name.
+let boardStatusBySourceId: Record<string, string | undefined> = {};
+// Threads returned by plugin.listUnresolvedThreads() (keyed by prUrl).
+let unresolvedThreadsByPr: Record<string, any[]> = {};
+// dispatchReview cadence (cycles between review ticks).
+let reviewDispatchEvery = 15;
 
 const mockPlugin = {
   name: "github",
@@ -44,15 +56,18 @@ const mockPlugin = {
   },
   onComment: vi.fn(),
   async skip() {},
+  // Issue #19: unresolved review threads on a PR (keyed by prUrl per test).
+  listUnresolvedThreads: vi.fn(async (_ctx: unknown, prUrl: string) => unresolvedThreadsByPr[prUrl] ?? []),
   capabilities: () => [
     { action: "submit-pr", description: "完成编码后提交 PR", params: [{ name: "branch", description: "" }] },
     { action: "comment", description: "在工作项留言", params: [{ name: "message", description: "" }] },
     { action: "skip", description: "放弃任务", params: [{ name: "reason", description: "" }] },
+    { action: "resolve-thread", description: "解决评审线程", params: [{ name: "threadId", description: "" }, { name: "prUrl", description: "" }] },
   ],
 };
 
 vi.mock("../config.js", () => ({
-  loadConfig: () => ({ maxParallel: 1, serverBaseUrl: "http://127.0.0.1:3100" }),
+  loadConfig: () => ({ maxParallel: 1, serverBaseUrl: "http://127.0.0.1:3100", reviewDispatchEvery }),
   buildProjectContextForIssue: () => ({
     config: {},
     logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -65,6 +80,8 @@ vi.mock("../db/index.js", () => ({
   // runningCount = 0 → slotsAvailable = maxParallel (1) for every test
   getRunningSessions: () => [],
   getRunningSessionsWithIssues: () => runningSessions,
+  getCodingSessionsWithPr: () => codingSessionsWithPr,
+  getRunningReviewIssueIds: () => new Set(runningReviewIssueIds),
   createSession: vi.fn(),
   updateSessionStatus: vi.fn(),
 }));
@@ -72,7 +89,7 @@ vi.mock("../db/index.js", () => ({
 vi.mock("../services/boardSnapshot.js", () => ({
   setBoardStatus: vi.fn(),
   setProjectBoard: vi.fn(),
-  getBoardStatus: vi.fn(),
+  getBoardStatus: (projectId: string, sourceId: string) => boardStatusBySourceId[`${projectId}/${sourceId}`],
   clearBoardSnapshot: vi.fn(),
 }));
 
@@ -83,6 +100,8 @@ vi.mock("../plugins/loader.js", () => ({
 vi.mock("../services/tmux.js", () => ({
   sessionName: (sourceName: string, repo: string, sourceId: string) =>
     `tl-${sourceName}-${repo}-${sourceId}`,
+  reviewSessionName: (sourceName: string, repo: string, sourceId: string) =>
+    `tl-${sourceName}-${repo}-${sourceId}-review`,
   createSession: vi.fn(),
   captureOutput: (session: string) => tmuxOutput[session] ?? "",
   isAlive: (session: string) => tmuxAlive.has(session),
@@ -145,6 +164,11 @@ describe("dispatchNew slot accounting (issue #6)", () => {
     tmuxOutput = {};
     tmuxAlive = new Set();
     exitCodeBySession = {};
+    codingSessionsWithPr = [];
+    runningReviewIssueIds = new Set();
+    boardStatusBySourceId = {};
+    unresolvedThreadsByPr = {};
+    reviewDispatchEvery = 15;
     vi.clearAllMocks();
   });
 
@@ -193,6 +217,11 @@ describe("buildPrompt percent-encodes projectId and renders capabilities", () =>
     tmuxOutput = {};
     tmuxAlive = new Set();
     exitCodeBySession = {};
+    codingSessionsWithPr = [];
+    runningReviewIssueIds = new Set();
+    boardStatusBySourceId = {};
+    unresolvedThreadsByPr = {};
+    reviewDispatchEvery = 15;
     vi.clearAllMocks();
   });
 
@@ -240,6 +269,11 @@ describe("launcher script writes the exit-code sentinel (issue #20)", () => {
     tmuxOutput = {};
     tmuxAlive = new Set();
     exitCodeBySession = {};
+    codingSessionsWithPr = [];
+    runningReviewIssueIds = new Set();
+    boardStatusBySourceId = {};
+    unresolvedThreadsByPr = {};
+    reviewDispatchEvery = 15;
     vi.clearAllMocks();
   });
 
@@ -284,6 +318,11 @@ describe("checkRunningSessions classifies by exit code, not task outcome (issue 
     tmuxOutput = {};
     tmuxAlive = new Set();
     exitCodeBySession = {};
+    codingSessionsWithPr = [];
+    runningReviewIssueIds = new Set();
+    boardStatusBySourceId = {};
+    unresolvedThreadsByPr = {};
+    reviewDispatchEvery = 15;
     vi.clearAllMocks();
   });
 
@@ -390,3 +429,269 @@ describe("checkRunningSessions classifies by exit code, not task outcome (issue 
     expect(mockPlugin.transition).not.toHaveBeenCalled();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Issue #19: PR review auto-fix
+// ---------------------------------------------------------------------------
+
+/** A coding session that has created a PR (a dispatchReview candidate). */
+function makeCodingSessionWithPr(
+  sourceId: string,
+  overrides: Partial<{ id: number; issue_id: number; pr_url: string; branch: string }> = {},
+): any {
+  return {
+    id: 200,
+    issue_id: Number(sourceId),
+    tmux_session: `tl-github-talos-loop-${sourceId}`,
+    status: "done",
+    pr_url: `https://github.com/qiaolei1973/talos-loop/pull/${sourceId}`,
+    branch: `feat/${sourceId}`,
+    type: "coding",
+    project_id: "qiaolei1973/1",
+    project_type: "github",
+    source_id: sourceId,
+    target_repo: "talos-loop",
+    ...overrides,
+  };
+}
+
+describe("dispatchReview() (issue #19)", () => {
+  beforeEach(() => {
+    statusBySourceId = {};
+    runningSessions = [];
+    tmuxOutput = {};
+    tmuxAlive = new Set();
+    exitCodeBySession = {};
+    codingSessionsWithPr = [];
+    runningReviewIssueIds = new Set();
+    boardStatusBySourceId = {};
+    unresolvedThreadsByPr = {};
+    reviewDispatchEvery = 15;
+    vi.clearAllMocks();
+  });
+
+  // (a) dispatches when unresolved threads present and no running review session.
+  it("dispatches a review session when unresolved threads exist", async () => {
+    const PR = "https://github.com/qiaolei1973/talos-loop/pull/9";
+    codingSessionsWithPr = [makeCodingSessionWithPr("9", { pr_url: PR, branch: "feat/9" })];
+    boardStatusBySourceId["qiaolei1973/1/9"] = "In review"; // still In review
+    unresolvedThreadsByPr[PR] = [
+      { id: "PRRT_1", body: "fix this", path: "a.ts", resolved: false },
+      { id: "PRRT_2", body: "and this", path: "b.ts", resolved: false },
+    ];
+
+    const { dispatchReview } = await import("../services/dispatcher.js");
+    const reviewed = await dispatchReview();
+
+    expect(reviewed).toBe(1);
+    // listUnresolvedThreads was probed for the PR.
+    expect(mockPlugin.listUnresolvedThreads).toHaveBeenCalledWith(expect.anything(), PR);
+    // A review session was created on a worktree, recording the PR url + branch up front.
+    expect(mockCreateSession).toHaveBeenCalledWith(
+      9,
+      "tl-github-talos-loop-9-review",
+      { type: "review", branch: "feat/9", prUrl: PR },
+    );
+  });
+
+  // (b) skips when a review session is already running for the issue.
+  it("skips when a review session is already running for the issue", async () => {
+    const PR = "https://github.com/qiaolei1973/talos-loop/pull/9";
+    codingSessionsWithPr = [makeCodingSessionWithPr("9", { pr_url: PR, branch: "feat/9" })];
+    boardStatusBySourceId["qiaolei1973/1/9"] = "In review";
+    unresolvedThreadsByPr[PR] = [{ id: "PRRT_1", body: "x", resolved: false }];
+    runningReviewIssueIds = new Set([9]); // a review session is already running
+
+    const { dispatchReview } = await import("../services/dispatcher.js");
+    const reviewed = await dispatchReview();
+
+    expect(reviewed).toBe(0);
+    expect(mockCreateSession).not.toHaveBeenCalled();
+    // The probe short-circuits before even asking for threads.
+    expect(mockPlugin.listUnresolvedThreads).not.toHaveBeenCalled();
+  });
+
+  // (c) skips when all threads resolved (no unresolved threads).
+  it("skips when there are no unresolved threads", async () => {
+    const PR = "https://github.com/qiaolei1973/talos-loop/pull/9";
+    codingSessionsWithPr = [makeCodingSessionWithPr("9", { pr_url: PR, branch: "feat/9" })];
+    boardStatusBySourceId["qiaolei1973/1/9"] = "In review";
+    unresolvedThreadsByPr[PR] = []; // all resolved
+
+    const { dispatchReview } = await import("../services/dispatcher.js");
+    const reviewed = await dispatchReview();
+
+    expect(reviewed).toBe(0);
+    expect(mockCreateSession).not.toHaveBeenCalled();
+  });
+
+  it("skips when the board is no longer In review (e.g. merged → Done)", async () => {
+    const PR = "https://github.com/qiaolei1973/talos-loop/pull/9";
+    codingSessionsWithPr = [makeCodingSessionWithPr("9", { pr_url: PR, branch: "feat/9" })];
+    boardStatusBySourceId["qiaolei1973/1/9"] = "Done"; // merged — no review work
+    unresolvedThreadsByPr[PR] = [{ id: "PRRT_1", body: "x", resolved: false }];
+
+    const { dispatchReview } = await import("../services/dispatcher.js");
+    const reviewed = await dispatchReview();
+
+    expect(reviewed).toBe(0);
+    expect(mockPlugin.listUnresolvedThreads).not.toHaveBeenCalled();
+  });
+
+  it("skips when the coding session recorded no branch to push to", async () => {
+    const PR = "https://github.com/qiaolei1973/talos-loop/pull/9";
+    codingSessionsWithPr = [makeCodingSessionWithPr("9", { pr_url: PR, branch: null as unknown as string })];
+    boardStatusBySourceId["qiaolei1973/1/9"] = "In review";
+
+    const { dispatchReview } = await import("../services/dispatcher.js");
+    const reviewed = await dispatchReview();
+
+    expect(reviewed).toBe(0);
+    expect(mockCreateSession).not.toHaveBeenCalled();
+  });
+
+  it("writes a review-specific prompt that instructs the within-session loop", async () => {
+    const PR = "https://github.com/qiaolei1973/talos-loop/pull/9";
+    codingSessionsWithPr = [makeCodingSessionWithPr("9", { pr_url: PR, branch: "feat/9" })];
+    boardStatusBySourceId["qiaolei1973/1/9"] = "In review";
+    unresolvedThreadsByPr[PR] = [{ id: "PRRT_1", body: "x", resolved: false }];
+
+    const { dispatchReview } = await import("../services/dispatcher.js");
+    await dispatchReview();
+
+    // The review prompt is the .txt write; it must name the PR + branch + the
+    // resolve-thread action and the re-check loop, but must NOT mention submit-pr
+    // as the goal (review never opens a new PR).
+    const promptCall = mockWriteFileSync.mock.calls.find(
+      (c: any[]) => typeof c[0] === "string" && c[0].endsWith(".txt"),
+    );
+    expect(promptCall, "review prompt file should have been written").toBeDefined();
+    const prompt = String((promptCall as any[])[1]);
+    expect(prompt).toContain(PR);
+    expect(prompt).toContain("feat/9");
+    expect(prompt).toContain("resolve-thread");
+    expect(prompt).toContain("git worktree");
+    expect(prompt).toMatch(/重新获取评审线程|未解决/i); // the re-check loop instruction
+  });
+});
+
+describe("checkRunningSessions() review branch (issue #19)", () => {
+  beforeEach(() => {
+    statusBySourceId = {};
+    runningSessions = [];
+    tmuxOutput = {};
+    tmuxAlive = new Set();
+    exitCodeBySession = {};
+    codingSessionsWithPr = [];
+    runningReviewIssueIds = new Set();
+    boardStatusBySourceId = {};
+    unresolvedThreadsByPr = {};
+    reviewDispatchEvery = 15;
+    vi.clearAllMocks();
+  });
+
+  it("clean review exit → done, NO transition, NO comment, board untouched", async () => {
+    const session = "tl-github-talos-loop-9-review";
+    exitCodeBySession[session] = 0;
+    // A review session carries a pr_url (written at dispatch) but must NOT take
+    // the coding success-path that keys off pr_url.
+    runningSessions = [
+      {
+        id: 300,
+        tmux_session: session,
+        pr_url: "https://github.com/qiaolei1973/talos-loop/pull/42",
+        type: "review",
+        branch: "feat/9",
+        project_id: "qiaolei1973/1",
+        project_type: "github",
+        source_id: "9",
+        target_repo: "talos-loop",
+      },
+    ];
+
+    const { checkRunningSessions } = await import("../services/dispatcher.js");
+    const result = await checkRunningSessions();
+
+    expect(result).toEqual({ completed: 1, failed: 0 });
+    // done with the stored pr_url, but…
+    expect(mockUpdateSessionStatus).toHaveBeenCalledWith(300, "done", "https://github.com/qiaolei1973/talos-loop/pull/42");
+    // …NO board transition, NO completion comment, NO optimistic board flip.
+    expect(mockPlugin.transition).not.toHaveBeenCalled();
+    expect(mockPlugin.onComment).not.toHaveBeenCalled();
+    expect(mockSetBoardStatus).not.toHaveBeenCalled();
+  });
+
+  it("crashed review exit → failed, board untouched (implicit retry next tick)", async () => {
+    const session = "tl-github-talos-loop-9-review";
+    exitCodeBySession[session] = 1;
+    tmuxOutput[session] = "Error: something blew up";
+    runningSessions = [
+      {
+        id: 300,
+        tmux_session: session,
+        pr_url: "https://github.com/qiaolei1973/talos-loop/pull/42",
+        type: "review",
+        branch: "feat/9",
+        project_id: "qiaolei1973/1",
+        project_type: "github",
+        source_id: "9",
+        target_repo: "talos-loop",
+      },
+    ];
+
+    const { checkRunningSessions } = await import("../services/dispatcher.js");
+    const result = await checkRunningSessions();
+
+    expect(result).toEqual({ completed: 0, failed: 1 });
+    expect(mockUpdateSessionStatus).toHaveBeenCalledWith(
+      300, "failed", undefined, expect.stringContaining("blew up"),
+    );
+    expect(mockPlugin.transition).not.toHaveBeenCalled();
+    expect(mockSetBoardStatus).not.toHaveBeenCalled();
+  });
+});
+
+describe("dispatch() gates review on a slow counter (issue #19)", () => {
+  beforeEach(() => {
+    statusBySourceId = {};
+    runningSessions = [];
+    tmuxOutput = {};
+    tmuxAlive = new Set();
+    exitCodeBySession = {};
+    codingSessionsWithPr = [];
+    runningReviewIssueIds = new Set();
+    boardStatusBySourceId = {};
+    unresolvedThreadsByPr = {};
+    // Fire review every 2 cycles so we can observe gating in few iterations.
+    reviewDispatchEvery = 2;
+    vi.clearAllMocks();
+  });
+
+  // (d) fires on every Nth dispatch cycle, not every cycle.
+  it("dispatches review only on every Nth cycle", async () => {
+    const PR = "https://github.com/qiaolei1973/talos-loop/pull/9";
+    codingSessionsWithPr = [makeCodingSessionWithPr("9", { pr_url: PR, branch: "feat/9" })];
+    boardStatusBySourceId["qiaolei1973/1/9"] = "In review";
+    unresolvedThreadsByPr[PR] = [{ id: "PRRT_1", body: "x", resolved: false }];
+
+    const mod = await import("../services/dispatcher.js");
+    (mod as any).resetReviewTick();
+
+    // Cycle 1: NOT a review tick → no review session.
+    await mod.dispatch([]);
+    expect(mockCreateSession).not.toHaveBeenCalled();
+
+    // Cycle 2: review tick → exactly one review session.
+    await mod.dispatch([]);
+    expect(mockCreateSession).toHaveBeenCalledTimes(1);
+
+    // Cycle 3: not a tick again.
+    await mod.dispatch([]);
+    expect(mockCreateSession).toHaveBeenCalledTimes(1);
+
+    // Cycle 4: tick again → a second review session (threads still unresolved).
+    await mod.dispatch([]);
+    expect(mockCreateSession).toHaveBeenCalledTimes(2);
+  });
+});
+

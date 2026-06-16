@@ -55,7 +55,15 @@ function migrate(db: Database.Database) {
       pr_url TEXT,
       error TEXT,
       started_at TEXT NOT NULL DEFAULT (datetime('now')),
-      finished_at TEXT
+      finished_at TEXT,
+      -- issue #19: distinguish coding sessions (create a PR) from review
+      -- sessions (fix review threads on an existing PR). Defaults to 'coding'
+      -- so pre-existing rows — and all callers that don't pass a type — keep
+      -- the original behavior.
+      type TEXT NOT NULL DEFAULT 'coding',
+      -- The PR head branch: written by submit-pr for coding sessions and set at
+      -- dispatch for review sessions (the branch they push fixes to).
+      branch TEXT
     );
 
     CREATE INDEX IF NOT EXISTS idx_issues_project ON issues(project_id);
@@ -63,6 +71,20 @@ function migrate(db: Database.Database) {
     CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);
     CREATE INDEX IF NOT EXISTS idx_sessions_issue ON sessions(issue_id);
   `);
+
+  // issue #19: additive migration — add the `type`/`branch` columns to an
+  // existing sessions table without dropping it (non-destructive, unlike the
+  // legacy clean-break above). CREATE TABLE IF NOT EXISTS is a no-op when the
+  // table predates these columns, so we ALTER them in explicitly. ADD COLUMN
+  // with a default back-fills existing rows ('coding' / NULL) in one statement.
+  const sessionCols = db.prepare("PRAGMA table_info(sessions)").all() as Array<{ name: string }>;
+  const hasSessionCol = (name: string) => sessionCols.some((c) => c.name === name);
+  if (!hasSessionCol("type")) {
+    db.exec("ALTER TABLE sessions ADD COLUMN type TEXT NOT NULL DEFAULT 'coding'");
+  }
+  if (!hasSessionCol("branch")) {
+    db.exec("ALTER TABLE sessions ADD COLUMN branch TEXT");
+  }
 }
 
 // --- Issue Types ---
@@ -140,14 +162,43 @@ export interface Session {
   error: string | null;
   started_at: string;
   finished_at: string | null;
+  /** issue #19: 'coding' (default, creates a PR) or 'review' (fixes review threads). */
+  type: "coding" | "review";
+  /** PR head branch — set by submit-pr (coding) or at dispatch (review). */
+  branch: string | null;
 }
 
 // --- Session CRUD ---
 
-export function createSession(issueId: number, tmuxSession: string): Session {
+/**
+ * Record the PR head branch on an issue's currently-running coding session
+ * (issue #19). Called by the submit-pr action so a later `dispatchReview()` can
+ * push review fixes to the same branch. Mirrors {@link setSessionPrUrl} by
+ * targeting the running row, so a review session (which never calls submit-pr)
+ * is untouched.
+ */
+export function setSessionBranch(issueId: number, branch: string): void {
+  getDb().prepare("UPDATE sessions SET branch = ? WHERE issue_id = ? AND status = 'running'")
+    .run(branch, issueId);
+}
+
+/**
+ * Create a session row. Coding sessions (the default) leave type/branch empty —
+ * branch is filled in later by submit-pr. Review sessions pass their PR url and
+ * target branch up front (issue #19): the PR already exists, so the url is
+ * known at dispatch time, not via an agent callback.
+ */
+export function createSession(
+  issueId: number,
+  tmuxSession: string,
+  init?: { type?: "coding" | "review"; branch?: string; prUrl?: string },
+): Session {
   const d = getDb();
-  d.prepare("INSERT INTO sessions (issue_id, tmux_session) VALUES (?, ?)")
-    .run(issueId, tmuxSession);
+  const type = init?.type ?? "coding";
+  d.prepare(
+    `INSERT INTO sessions (issue_id, tmux_session, type, branch, pr_url)
+     VALUES (?, ?, ?, ?, ?)`,
+  ).run(issueId, tmuxSession, type, init?.branch ?? null, init?.prUrl ?? null);
   return d.prepare("SELECT * FROM sessions WHERE id = last_insert_rowid()").get() as Session;
 }
 
@@ -203,4 +254,43 @@ export function getRunningSessionsWithIssues(): (Session & { project_id: string;
     JOIN issues i ON s.issue_id = i.id
     WHERE s.status = 'running'
   `).all() as (Session & { project_id: string; project_type: string; source_id: string; target_repo: string })[];
+}
+
+/**
+ * Coding sessions that have created a PR (issue #19) — the candidates
+ * `dispatchReview()` inspects for unresolved review threads. Each carries the
+ * PR url and head branch (so review fixes push to the right branch) plus the
+ * issue context needed for the board "In review" cross-check and session
+ * dispatch. A later review session for the same issue is tracked separately.
+ */
+export function getCodingSessionsWithPr(): (Session & {
+  project_id: string;
+  project_type: string;
+  source_id: string;
+  target_repo: string;
+})[] {
+  return getDb().prepare(`
+    SELECT s.*, i.project_id, i.project_type, i.source_id, i.target_repo
+    FROM sessions s
+    JOIN issues i ON s.issue_id = i.id
+    WHERE s.type = 'coding' AND s.pr_url IS NOT NULL
+  `).all() as (Session & {
+    project_id: string;
+    project_type: string;
+    source_id: string;
+    target_repo: string;
+  })[];
+}
+
+/**
+ * Issue ids that currently have a running review session (issue #19).
+ * `dispatchReview()` skips these: only one review session per issue at a time,
+ * reusing the existing serial-dispatch guarantee to prevent concurrent agents on
+ * the same PR branch.
+ */
+export function getRunningReviewIssueIds(): Set<number> {
+  const rows = getDb().prepare(
+    "SELECT DISTINCT issue_id FROM sessions WHERE type = 'review' AND status = 'running'",
+  ).all() as Array<{ issue_id: number }>;
+  return new Set(rows.map((r) => r.issue_id));
 }

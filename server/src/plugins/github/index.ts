@@ -13,6 +13,7 @@ import type {
   StatusTransition,
   PluginCapability,
   QuotaStatus,
+  ReviewThread,
 } from "../../types/plugin.js";
 
 /**
@@ -67,6 +68,22 @@ function parseProjectId(projectId: string): { owner: string; number: number } {
   const m = projectId.match(/^([^/]+)\/(\d+)$/);
   if (!m) throw new Error(`Invalid projectId "${projectId}" — expected "owner/number" (e.g. "qiaolei1973/1")`);
   return { owner: m[1], number: parseInt(m[2], 10) };
+}
+
+/**
+ * Parse a GitHub PR URL → { owner, repo, number } (issue #19). Accepts the plain
+ * PR url (and tolerates a trailing path/query). owner/repo are validated to a
+ * shell/GraphQL-safe shape since they are inlined into GraphQL literals.
+ */
+function parsePrUrl(prUrl: string): { owner: string; repo: string; number: number } {
+  const m = prUrl.match(/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/);
+  if (!m) throw new Error(`Invalid PR url "${prUrl}" — expected "https://github.com/owner/repo/pull/<number>"`);
+  const owner = m[1];
+  const repo = m[2];
+  if (!/^[\w.-]+$/.test(owner) || !/^[\w.-]+$/.test(repo)) {
+    throw new Error(`Invalid owner/repo in PR url "${prUrl}"`);
+  }
+  return { owner, repo, number: parseInt(m[3], 10) };
 }
 
 /** Map a core state to the GitHub Projects status option name. */
@@ -329,6 +346,12 @@ export class GitHubIssueSourcePlugin implements IssueSourcePlugin {
       { action: "submit-pr", description: "完成编码后提交 PR", params: [{ name: "branch", description: "PR 源分支名" }] },
       { action: "comment", description: "在工作项留言", params: [{ name: "message", description: "留言内容" }] },
       { action: "skip", description: "放弃任务", params: [{ name: "reason", description: "跳过原因" }] },
+      // resolve-thread (issue #19): the review-fix agent calls this after
+      // addressing each thread so GitHub's native thread state is the single
+      // source of truth. `threadId` is the review-thread node id from
+      // listUnresolvedThreads(); `prUrl` identifies the PR (the agent knows both
+      // from its prompt).
+      { action: "resolve-thread", description: "解决 PR 评审线程（修复后调用）", params: [{ name: "threadId", description: "评审线程节点 id" }, { name: "prUrl", description: "PR 地址" }] },
     ];
   }
 
@@ -349,6 +372,57 @@ export class GitHubIssueSourcePlugin implements IssueSourcePlugin {
     if (!url) throw new Error(`submitPr: could not parse PR URL from gh output for ${repo.remote}#${sourceId}`);
     ctx.logger.info(`Created PR for ${repo.remote}#${sourceId} from branch ${branch}: ${url}`);
     return url;
+  }
+
+  /**
+   * Unresolved review threads on a PR (issue #19). GitHub's GraphQL is the only
+   * source — `gh pr view` does not expose the thread node id that
+   * `resolveReviewThread` needs. A transient read failure returns [] (treated by
+   * `dispatchReview()` as "no work, skip this cycle"); unresolved threads still
+   * exist, so the next poll cycle retries.
+   */
+  async listUnresolvedThreads(ctx: ProjectContext, prUrl: string): Promise<ReviewThread[]> {
+    const { owner, repo, number } = parsePrUrl(prUrl);
+    // Inline the (validated) owner/repo/number as GraphQL literals. owner/repo
+    // match ^[\w.-]+$ and number is an integer, so this is injection-safe and
+    // avoids the GraphQL-Int-vs-String coercion pitfall of a `-F number=` arg.
+    const query = `query{repository(owner:"${owner}",name:"${repo}"){pullRequest(number:${number}){reviewThreads(first:100){nodes{id isResolved path comments(first:1){nodes{body}}}}}}}`;
+    let raw: string;
+    try {
+      raw = execSync(`gh api graphql -f query='${query}'`, { encoding: "utf-8", timeout: 30_000, stdio: "pipe" });
+    } catch (err: any) {
+      ctx.logger.warn(`listUnresolvedThreads: GraphQL read failed for ${owner}/${repo}#${number}: ${err.message}`);
+      return [];
+    }
+    const threads =
+      (JSON.parse(raw) as { data?: { repository?: { pullRequest?: { reviewThreads?: { nodes?: Array<{ id: string; isResolved: boolean; path?: string; comments?: { nodes?: Array<{ body?: string }> } }> } } } } })?.data?.repository?.pullRequest?.reviewThreads?.nodes ?? [];
+    return threads
+      .filter((t) => !t.isResolved)
+      .map((t) => ({
+        id: String(t.id),
+        body: t.comments?.nodes?.[0]?.body ?? "",
+        path: t.path,
+        resolved: false,
+      }));
+  }
+
+  /**
+   * Resolve one review thread via the GraphQL `resolveReviewThread` mutation
+   * (issue #19). `threadId` is the review-thread node id. The id is validated to
+   * a node-id shape (GitHub ids are base64-ish `[A-Za-z0-9_]+`) before inlining
+   * into the mutation — it carries no shell or GraphQL quoting hazard once
+   * validated. Errors propagate so the agent sees the failure.
+   */
+  async resolveThread(ctx: ProjectContext, _sourceId: string, prUrl: string, threadId: string): Promise<void> {
+    if (!/^[\w]+$/.test(threadId)) throw new Error(`resolveThread: invalid thread id "${threadId}"`);
+    parsePrUrl(prUrl); // validate the PR url shape (owner/repo/#)
+    const mutation = `mutation{resolveReviewThread(input:{threadId:"${threadId}"}){thread{isResolved}}}`;
+    try {
+      execSync(`gh api graphql -f query='${mutation}'`, { encoding: "utf-8", timeout: 15_000, stdio: "pipe" });
+    } catch (err: any) {
+      ctx.logger.error(`resolveThread: failed to resolve thread ${threadId} on ${prUrl}: ${err.message}`);
+      throw err;
+    }
   }
 
   // --- internals ---

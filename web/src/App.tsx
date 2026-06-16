@@ -37,6 +37,10 @@ interface Session {
   error: string | null;
   started_at: string;
   finished_at: string | null;
+  /** issue #19: 'coding' (creates a PR) or 'review' (fixes review threads). */
+  type?: "coding" | "review";
+  /** issue #19: tmux process still alive — drives the per-session live + attach UI. */
+  isLive?: boolean;
 }
 
 interface Status {
@@ -89,19 +93,41 @@ function StatusBadge({ status }: { status: string }) {
 }
 
 /**
- * Surfaces per-session outcomes alongside the board status: infrastructure
- * failures (recorded in dashboard only) and skips (durable, awaiting label
- * removal on GitHub).
+ * One session in an issue's session group (issue #19). Renders exactly one
+ * state — the same logic the old latest-only SessionIndicator applied, now
+ * applied to EVERY session (coding + each review cycle):
+ *
+ *   isLive               → pulsing dot + attach (any live session, coding or review)
+ *   status failed/error  → AlertTriangle "infra error" + tooltip
+ *   status skipped       → SkipForward "skipped" + tooltip
+ *   status done          → neutral completed indicator
+ *
+ * The issue-level stage badge (StatusBadge) is decoupled and stays purely
+ * board-driven — a live review session does NOT flip it to "In progress".
  */
-function SessionIndicator({ session }: { session?: Session }) {
-  if (!session) return null;
+function SessionChip({ session }: { session: Session }) {
+  const typeLabel = session.type === "review" ? "review" : "coding";
+
+  // Live: pulsing dot + an attach button on the row itself (user stories 8 & 10).
+  if (session.isLive) {
+    return (
+      <span className="inline-flex items-center gap-1.5 rounded bg-green-50 px-1.5 py-0.5" title={`Live ${typeLabel} session`}>
+        <span className="relative flex h-2 w-2">
+          <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-green-400 opacity-75" />
+          <span className="relative inline-flex h-2 w-2 rounded-full bg-green-500" />
+        </span>
+        <span className="text-[10px] font-medium text-green-700">{typeLabel}</span>
+        <AttachButton session={session.tmux_session} />
+      </span>
+    );
+  }
   if (session.status === "skipped") {
     return (
       <span
         className="inline-flex items-center gap-1 rounded bg-purple-100 px-1.5 py-0.5 text-[10px] font-medium text-purple-700"
         title={session.error ?? "Agent skipped this issue — remove the skipped label on GitHub to re-enable"}
       >
-        <SkipForward className="h-3 w-3" /> skipped
+        <SkipForward className="h-3 w-3" /> {typeLabel} · skipped
       </span>
     );
   }
@@ -109,13 +135,36 @@ function SessionIndicator({ session }: { session?: Session }) {
     return (
       <span
         className="inline-flex items-center gap-1 rounded bg-red-100 px-1.5 py-0.5 text-[10px] font-medium text-red-700"
-        title={session.error ?? "Infrastructure failure — will auto-retry from Ready"}
+        title={session.error ?? "Infrastructure failure — will auto-retry"}
       >
-        <AlertTriangle className="h-3 w-3" /> infra error
+        <AlertTriangle className="h-3 w-3" /> {typeLabel} · infra error
       </span>
     );
   }
-  return null;
+  // Neutral completed indicator (done) — or a running-but-not-live (zombie) row.
+  return (
+    <span className="inline-flex items-center gap-1 rounded bg-gray-100 px-1.5 py-0.5 text-[10px] font-medium text-gray-600" title={`${typeLabel} session · ${timeAgo(session.started_at)}`}>
+      <CheckCircle className="h-3 w-3 text-gray-400" /> {typeLabel} · {timeAgo(session.started_at)}
+    </span>
+  );
+}
+
+/**
+ * An issue's full session history (issue #19, user story 7): the coding session
+ * plus zero or more review cycles, oldest → newest so it reads as a timeline.
+ * Empty when no sessions have run yet.
+ */
+function SessionGroup({ sessions }: { sessions: Session[] }) {
+  if (!sessions || sessions.length === 0) return <span className="text-gray-400">-</span>;
+  // API returns started_at DESC; reverse for a chronological (oldest-first) view.
+  const chronological = [...sessions].reverse();
+  return (
+    <div className="flex flex-col items-start gap-1">
+      {chronological.map((s) => (
+        <SessionChip key={s.id} session={s} />
+      ))}
+    </div>
+  );
 }
 
 function AttachButton({ session }: { session: string }) {
@@ -265,14 +314,17 @@ export default function App() {
                       <th className="px-4 py-2 text-left font-medium text-gray-600">Issue</th>
                       <th className="px-4 py-2 text-left font-medium text-gray-600">Project</th>
                       <th className="px-4 py-2 text-left font-medium text-gray-600">Status</th>
+                      <th className="px-4 py-2 text-left font-medium text-gray-600">Sessions</th>
                       <th className="px-4 py-2 text-left font-medium text-gray-600">PR</th>
                       <th className="px-4 py-2 text-left font-medium text-gray-600">Updated</th>
-                      <th className="px-4 py-2 text-right font-medium text-gray-600">Actions</th>
                     </tr>
                   </thead>
                   <tbody>
                     {repoIssues.map((issue) => {
-                      const latestSession = issue.sessions?.[0];
+                      const sessions = issue.sessions ?? [];
+                      // PR link: latest session that recorded a PR url (coding or
+                      // review carry the same PR url; review-only rows reuse it).
+                      const prSession = sessions.find((s) => s.pr_url) ?? null;
                       return (
                         <tr key={issue.id} className="border-b last:border-0 hover:bg-gray-50">
                           <td className="px-4 py-3">
@@ -293,15 +345,17 @@ export default function App() {
                             </span>
                           </td>
                           <td className="px-4 py-3">
-                            <div className="flex items-center gap-1.5">
-                              <StatusBadge status={issue.status} />
-                              <SessionIndicator session={latestSession} />
-                            </div>
+                            {/* Board-driven stage badge only (issue #19, user story 9):
+                                a live review session does NOT change it. */}
+                            <StatusBadge status={issue.status} />
                           </td>
                           <td className="px-4 py-3">
-                            {latestSession?.pr_url ? (
+                            <SessionGroup sessions={sessions} />
+                          </td>
+                          <td className="px-4 py-3">
+                            {prSession?.pr_url ? (
                               <a
-                                href={latestSession.pr_url}
+                                href={prSession.pr_url}
                                 target="_blank"
                                 rel="noopener noreferrer"
                                 className="inline-flex items-center gap-1 text-blue-600 hover:underline"
@@ -313,11 +367,6 @@ export default function App() {
                             )}
                           </td>
                           <td className="px-4 py-3 text-gray-500">{timeAgo(issue.updated_at)}</td>
-                          <td className="px-4 py-3 text-right">
-                            {issue.status === "processing" && issue.tmux_session && (
-                              <AttachButton session={issue.tmux_session} />
-                            )}
-                          </td>
                         </tr>
                       );
                     })}

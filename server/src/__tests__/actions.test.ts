@@ -7,11 +7,13 @@ const mockPlugin = {
   submitPr: vi.fn(),
   onComment: vi.fn(),
   skip: vi.fn(),
+  resolveThread: vi.fn(), // issue #19
 };
 
 // DB coordination helpers are vi.fns so tests assert they were called.
 const mockGetIssue = vi.fn();
 const mockSetSessionPrUrl = vi.fn();
+const mockSetSessionBranch = vi.fn(); // issue #19: submit-pr records the PR head branch
 const mockMarkSessionSkipped = vi.fn();
 // The skip action optimistically flips the in-memory board snapshot to "Ready"
 // (issue #13) — no persisted status/tmux column is written anymore.
@@ -33,6 +35,7 @@ vi.mock("../config.js", () => ({
 vi.mock("../db/index.js", () => ({
   getIssue: mockGetIssue,
   setSessionPrUrl: mockSetSessionPrUrl,
+  setSessionBranch: mockSetSessionBranch, // issue #19: submit-pr records the PR head branch
   markSessionSkipped: mockMarkSessionSkipped,
   // Exported by db/index but unused by the action route — present so the mock
   // satisfies api.ts's named imports.
@@ -84,6 +87,7 @@ describe("POST /api/projects/:projectId/issues/:sourceId/actions/:action", () =>
     mockPlugin.submitPr.mockReset();
     mockPlugin.onComment.mockReset();
     mockPlugin.skip.mockReset();
+    mockPlugin.resolveThread.mockReset();
     app = await buildApp();
   });
 
@@ -104,6 +108,9 @@ describe("POST /api/projects/:projectId/issues/:sourceId/actions/:action", () =>
     expect(res.json()).toEqual({ success: true, prUrl: "https://github.com/qiaolei1973/talos-loop/pull/7" });
     expect(mockPlugin.submitPr).toHaveBeenCalledWith(expect.anything(), "9", "feat/x", "talos-loop");
     expect(mockSetSessionPrUrl).toHaveBeenCalledWith(42, "https://github.com/qiaolei1973/talos-loop/pull/7");
+    // issue #19: submit-pr also records the PR head branch so a later review
+    // dispatch can push fixes to it.
+    expect(mockSetSessionBranch).toHaveBeenCalledWith(42, "feat/x");
     // submit-pr performs no skip-style coordination.
     expect(mockMarkSessionSkipped).not.toHaveBeenCalled();
     expect(mockSetBoardStatus).not.toHaveBeenCalled();
@@ -171,6 +178,43 @@ describe("POST /api/projects/:projectId/issues/:sourceId/actions/:action", () =>
     expect(mockMarkSessionSkipped).not.toHaveBeenCalled();
     expect(mockSetSessionPrUrl).not.toHaveBeenCalled();
     expect(mockSetBoardStatus).not.toHaveBeenCalled();
+  });
+
+  it("resolve-thread → plugin.resolveThread(sourceId, prUrl, threadId), no DB coordination", async () => {
+    mockPlugin.resolveThread.mockResolvedValue(undefined);
+    const res = await app.inject({
+      method: "POST",
+      url: "/api/projects/qiaolei1973%2F1/issues/9/actions/resolve-thread",
+      payload: {
+        targetRepo: "talos-loop",
+        prUrl: "https://github.com/qiaolei1973/talos-loop/pull/42",
+        threadId: "PRRT_kwDOS2N8m85L2XHk",
+      },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ success: true });
+    expect(mockPlugin.resolveThread).toHaveBeenCalledWith(
+      expect.anything(),
+      "9",
+      "https://github.com/qiaolei1973/talos-loop/pull/42",
+      "PRRT_kwDOS2N8m85L2XHk",
+    );
+    // resolve-thread performs no session/board coordination.
+    expect(mockSetSessionPrUrl).not.toHaveBeenCalled();
+    expect(mockSetSessionBranch).not.toHaveBeenCalled();
+    expect(mockMarkSessionSkipped).not.toHaveBeenCalled();
+    expect(mockSetBoardStatus).not.toHaveBeenCalled();
+  });
+
+  it("resolve-thread without prUrl/threadId → 200 error body, plugin not called", async () => {
+    const res = await app.inject({
+      method: "POST",
+      url: "/api/projects/qiaolei1973%2F1/issues/9/actions/resolve-thread",
+      payload: { targetRepo: "talos-loop", threadId: "PRRT_x" },
+    });
+    expect(res.json().error).toMatch(/prUrl and threadId required/);
+    expect(mockPlugin.resolveThread).not.toHaveBeenCalled();
   });
 
   it("unknown action → 400 error", async () => {
