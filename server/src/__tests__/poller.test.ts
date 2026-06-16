@@ -5,6 +5,7 @@ import type { Issue } from "../db/index.js";
 let discoveredIssues: any[] = [];
 let boardItems: any[] = [];
 let listBoardError: Error | null = null;
+let quotaStatus: any = { available: true, remaining: 99999, limit: 5000 };
 
 const mockPlugin = {
   name: "github",
@@ -14,6 +15,9 @@ const mockPlugin = {
   async listBoard() {
     if (listBoardError) throw listBoardError;
     return boardItems;
+  },
+  async checkQuota() {
+    return quotaStatus;
   },
 };
 
@@ -36,6 +40,7 @@ vi.mock("../config.js", () => ({
     repos: [{ name: "talos-loop", path: "/tmp/talos-loop", remote: "qiaolei1973/talos-loop" }],
     projectId: "qiaolei1973/1",
   }),
+  loadConfig: () => ({ quotaThreshold: 200 }),
 }));
 
 vi.mock("../db/index.js", () => ({
@@ -78,6 +83,7 @@ describe("poller builds the board snapshot (issue #13)", () => {
     discoveredIssues = [];
     boardItems = [];
     listBoardError = null;
+    quotaStatus = { available: true, remaining: 99999, limit: 5000 };
     mockUpsertIssue.mockReset();
     mockSetProjectBoard.mockReset();
     mockLogger.warn.mockReset();
@@ -141,5 +147,60 @@ describe("poller builds the board snapshot (issue #13)", () => {
     expect(mockUpsertIssue).toHaveBeenCalledTimes(1);
     // Snapshot is the only other write — and it is in-memory (setProjectBoard).
     expect(mockSetProjectBoard).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("poller gates polling on GraphQL quota", () => {
+  beforeEach(() => {
+    discoveredIssues = [];
+    boardItems = [];
+    listBoardError = null;
+    quotaStatus = { available: true, remaining: 99999, limit: 5000 };
+    mockUpsertIssue.mockReset();
+    mockSetProjectBoard.mockReset();
+    mockLogger.warn.mockReset();
+    mockUpsertIssue.mockImplementation(
+      (_pid: string, _pt: string, sid: string) => issueFromSource(sid),
+    );
+  });
+
+  it("skips discover/listBoard when GraphQL quota is below threshold", async () => {
+    quotaStatus = { available: true, remaining: 30, limit: 5000, resetAt: new Date("2026-06-16T14:23:34Z") };
+    discoveredIssues = [{ sourceId: "9", url: "u9", title: "T9", targetRepo: "talos-loop", state: "queued" }];
+    boardItems = [{ sourceId: "9", repository: "qiaolei1973/talos-loop", boardStatus: "Ready", url: "u9", title: "T9" }];
+
+    const { pollAll } = await import("../services/poller.js");
+    const results = await pollAll();
+
+    expect(results[0].discovered).toEqual([]);
+    expect(results[0].error).toBeUndefined();
+    expect(mockUpsertIssue).not.toHaveBeenCalled();
+    expect(mockSetProjectBoard).not.toHaveBeenCalled();
+    expect(mockLogger.warn).toHaveBeenCalledWith(expect.stringMatching(/配额不足/));
+  });
+
+  it("falls through (still polls) when the quota probe itself fails", async () => {
+    quotaStatus = { available: false, error: "network down" };
+    discoveredIssues = [{ sourceId: "9", url: "u9", title: "T9", targetRepo: "talos-loop", state: "queued" }];
+    boardItems = [{ sourceId: "9", repository: "qiaolei1973/talos-loop", boardStatus: "Ready", url: "u9", title: "T9" }];
+
+    const { pollAll } = await import("../services/poller.js");
+    const results = await pollAll();
+
+    expect(results[0].discovered).toHaveLength(1);
+    expect(mockUpsertIssue).toHaveBeenCalled();
+    expect(mockLogger.warn).toHaveBeenCalledWith(expect.stringMatching(/探测失败/));
+  });
+
+  it("polls normally when quota is above threshold", async () => {
+    quotaStatus = { available: true, remaining: 4000, limit: 5000 };
+    discoveredIssues = [{ sourceId: "9", url: "u9", title: "T9", targetRepo: "talos-loop", state: "queued" }];
+    boardItems = [{ sourceId: "9", repository: "qiaolei1973/talos-loop", boardStatus: "Ready", url: "u9", title: "T9" }];
+
+    const { pollAll } = await import("../services/poller.js");
+    const results = await pollAll();
+
+    expect(results[0].discovered).toHaveLength(1);
+    expect(mockUpsertIssue).toHaveBeenCalled();
   });
 });

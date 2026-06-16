@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import fs from "fs";
 import os from "os";
 import path from "path";
-import { loadProjects, getEnabledProjects, getProjectById, resetConfigCache } from "../config.js";
+import { loadProjects, getEnabledProjects, getProjectById, loadConfig, resetConfigCache } from "../config.js";
 
 let tmpProjects: string;
 let tmpConfig: string;
@@ -92,5 +92,18 @@ describe("getProjectById()", () => {
     );
     expect(getProjectById("owner/1")?.projectType).toBe("github");
     expect(getProjectById("nope/9")).toBeUndefined();
+  });
+});
+
+describe("loadConfig()", () => {
+  it("defaults quotaThreshold to 200 when omitted", () => {
+    // beforeEach writes { port: 3100 } to tmpConfig — no quotaThreshold.
+    expect(loadConfig().quotaThreshold).toBe(200);
+  });
+
+  it("parses quotaThreshold from config.json when provided", () => {
+    fs.writeFileSync(tmpConfig, JSON.stringify({ port: 3100, quotaThreshold: 50 }));
+    resetConfigCache();
+    expect(loadConfig().quotaThreshold).toBe(50);
   });
 });

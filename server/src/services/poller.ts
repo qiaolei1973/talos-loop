@@ -1,4 +1,4 @@
-import { getEnabledProjects, buildProjectContext, type ProjectConfig } from "../config.js";
+import { getEnabledProjects, buildProjectContext, loadConfig, type ProjectConfig } from "../config.js";
 import { upsertIssue, type Issue } from "../db/index.js";
 import { resolvePlugin } from "../plugins/loader.js";
 import type { BoardItem, ProjectContext, RawIssue } from "../types/plugin.js";
@@ -59,6 +59,22 @@ async function pollProject(project: ProjectConfig): Promise<PollResult> {
     const plugin = await resolvePlugin(project.projectType);
     const ctx = buildProjectContext(project, log);
     displayName = plugin.name;
+
+    // Quota gate: probe the shared GraphQL budget BEFORE spending it. talos-loop
+    // and the dispatched agent share one token; when the agent has run the budget
+    // low, skip this cycle's board read instead of slamming into a hard
+    // rate-limit error. A failed probe falls through (never blocks polling).
+    if (typeof plugin.checkQuota === "function") {
+      const quota = await plugin.checkQuota(ctx);
+      if (!quota.available) {
+        log.warn(`[${project.projectId}] 配额探测失败（${quota.error}），保守放行本轮 board 轮询`);
+      } else if ((quota.remaining ?? 0) < loadConfig().quotaThreshold) {
+        log.warn(
+          `[${project.projectId}] GraphQL 配额不足：剩余 ${quota.remaining}/${quota.limit}（reset ${quota.resetAt?.toISOString()}）< 阈值 ${loadConfig().quotaThreshold}，跳过本轮 board 轮询`,
+        );
+        return { projectId: project.projectId, projectType: project.projectType, discovered };
+      }
+    }
 
     const rawIssues: RawIssue[] = await plugin.discover(ctx);
 

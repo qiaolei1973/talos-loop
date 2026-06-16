@@ -87,6 +87,15 @@ export interface IssueSourcePlugin {
   transition(ctx: ProjectContext, sourceId: string, transition: StatusTransition, targetRepo: string): Promise<void>;
   test(ctx: ProjectContext): Promise<boolean>;
   /**
+   * Probe whether there is enough capacity to perform a rate-limited operation
+   * (e.g. reading the GraphQL board). Returns available:false if the probe
+   * itself fails — the poller then falls through conservatively. Deciding to
+   * skip is the caller's job (it applies the core `quotaThreshold`); this only
+   * reports the raw numbers. Optional: plugins whose source isn't behind a
+   * shared rate-limited token may omit it, and the poller polls as before.
+   */
+  checkQuota?(ctx: ProjectContext): Promise<QuotaStatus>;
+  /**
    * Post a comment on the issue. `targetRepo` selects which repository the
    * issue lives in (a project may span multiple repos).
    */
@@ -173,6 +182,28 @@ export interface BoardItem {
 export interface IssueStatus {
   /** `null` when the issue is not in any pipeline state. */
   state: IssueState | null;
+}
+
+/**
+ * Result of a quota probe taken before a rate-limited operation (e.g. a GraphQL
+ * board read). talos-loop shares its GitHub token — and thus its 5000/h GraphQL
+ * budget — with the dispatched claude agent, so the poller probes capacity
+ * before spending it: when remaining is low it skips the call instead of
+ * slamming into a hard `rate limit exceeded`. `available:false` means the probe
+ * itself failed; callers should fall through conservatively rather than block
+ * polling on a broken meter.
+ */
+export interface QuotaStatus {
+  /** false = the probe itself failed; callers should fall through, not block. */
+  available: boolean;
+  /** Remaining capacity for the rate-limited resource (GitHub GraphQL points). */
+  remaining?: number;
+  /** Total capacity (GitHub GraphQL is 5000/h). */
+  limit?: number;
+  /** When capacity resets. */
+  resetAt?: Date;
+  /** Why the probe failed (available:false only). */
+  error?: string;
 }
 
 export interface StatusTransition {

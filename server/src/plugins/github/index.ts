@@ -12,6 +12,7 @@ import type {
   IssueState,
   StatusTransition,
   PluginCapability,
+  QuotaStatus,
 } from "../../types/plugin.js";
 
 /**
@@ -86,6 +87,14 @@ export class GitHubIssueSourcePlugin implements IssueSourcePlugin {
   /** Per-project cache keyed by projectId. The plugin is a singleton (one per type). */
   private cache = new Map<string, ProjectMeta>();
 
+  /** Active-board cache per project so discover() + listBoard() share one item-list per poll cycle. */
+  private boardCache = new Map<string, { items: GhItem[]; at: number }>();
+  private static readonly BOARD_CACHE_TTL_MS = 10_000;
+
+  /** Quota probe cache (token-wide): collapses concurrent per-project probes within one poll. */
+  private quotaCache: { remaining: number; limit: number; reset: number; at: number } | null = null;
+  private static readonly QUOTA_TTL_MS = 5_000;
+
   async init(ctx: ProjectContext): Promise<void> {
     this.ensureCache(ctx);
 
@@ -109,18 +118,16 @@ export class GitHubIssueSourcePlugin implements IssueSourcePlugin {
   }
 
   async discover(ctx: ProjectContext): Promise<RawIssue[]> {
-    const { owner, number } = parseProjectId(ctx.projectId);
     try {
       this.ensureCache(ctx);
     } catch (err: any) {
       ctx.logger.error(`discover: failed to resolve project meta: ${err.message}`);
       return [];
     }
-    const { trigger, skip } = resolveLabels(ctx);
 
-    // Server-side filter: only items carrying the trigger label and NOT the skip
-    // label (item-list content carries no labels, so we lean on --query).
-    const items = this.ghItemList(owner, number, `label:${trigger} -label:${skip}`);
+    // readBoard shares one item-list with listBoard() (cached this poll cycle) and
+    // already narrows server-side to eligible, non-skipped, active items.
+    const items = this.readBoard(ctx);
     const results: RawIssue[] = [];
 
     for (const item of items) {
@@ -154,16 +161,16 @@ export class GitHubIssueSourcePlugin implements IssueSourcePlugin {
   }
 
   async listBoard(ctx: ProjectContext): Promise<BoardItem[]> {
-    const { owner, number } = parseProjectId(ctx.projectId);
     try {
       this.ensureCache(ctx);
     } catch (err: any) {
       ctx.logger.error(`listBoard: failed to resolve project meta: ${err.message}`);
       return [];
     }
-    // ghItemList throws on read failure (issue #13: no silent empty) — the poller
-    // surfaces it as a prominent "board read failed" warning.
-    const items = this.ghItemList(owner, number);
+    // readBoard shares one item-list with discover() (cached this poll cycle) and
+    // returns only the active, eligible set. It throws on read failure (issue #13:
+    // no silent empty) — the poller surfaces it as a "board read failed" warning.
+    const items = this.readBoard(ctx);
     const results: BoardItem[] = [];
     for (const item of items) {
       if (!item.content) continue;
@@ -176,6 +183,28 @@ export class GitHubIssueSourcePlugin implements IssueSourcePlugin {
       });
     }
     return results;
+  }
+
+  async checkQuota(_ctx: ProjectContext): Promise<QuotaStatus> {
+    const now = Date.now();
+    const cached = this.quotaCache;
+    if (cached && now - cached.at < GitHubIssueSourcePlugin.QUOTA_TTL_MS) {
+      return { available: true, remaining: cached.remaining, limit: cached.limit, resetAt: new Date(cached.reset * 1000) };
+    }
+    try {
+      // `gh api rate_limit` is a free probe (costs neither REST nor GraphQL quota)
+      // and reports both budgets. talos-loop only burns GraphQL, so that is what
+      // we surface for the poller's skip decision.
+      const raw = execSync("gh api rate_limit", { encoding: "utf-8", timeout: 10_000, stdio: "pipe" });
+      const graphql = (JSON.parse(raw) as { resources?: { graphql?: { remaining?: number; limit?: number; reset?: number } } }).resources?.graphql;
+      if (!graphql) return { available: false, error: "rate_limit response missing graphql resource" };
+      this.quotaCache = { remaining: graphql.remaining ?? 0, limit: graphql.limit ?? 0, reset: graphql.reset ?? 0, at: now };
+      return { available: true, remaining: this.quotaCache.remaining, limit: this.quotaCache.limit, resetAt: new Date(this.quotaCache.reset * 1000) };
+    } catch (err: any) {
+      // A probe failure must never block polling — surface it and let the caller
+      // fall through to a normal (possibly rate-limited) board read.
+      return { available: false, error: err.message };
+    }
   }
 
   async getStatus(ctx: ProjectContext, sourceId: string, targetRepo: string): Promise<IssueStatus> {
@@ -356,6 +385,29 @@ export class GitHubIssueSourcePlugin implements IssueSourcePlugin {
     const meta: ProjectMeta = { projectNodeId, statusFieldId: statusField.id, options };
     this.cache.set(ctx.projectId, meta);
     return meta;
+  }
+
+  /**
+   * Read the active board — eligible (trigger label), not skipped, in an active
+   * column — once per poll cycle, cached so discover() and listBoard() share a
+   * single `gh project item-list`. Halving the GraphQL spend matters because this
+   * token's 5000/h budget is shared with the dispatched agent.
+   *
+   * Status uses exclusion form: repeating a single-select `status:` qualifier is
+   * AND (not OR), so "Ready OR In progress OR In review" is expressed by negating
+   * the two terminal columns Backlog/Done. Assumes standard five column names.
+   * Throws on read failure (issue #13) so callers distinguish empty from broken.
+   */
+  private readBoard(ctx: ProjectContext): GhItem[] {
+    const cached = this.boardCache.get(ctx.projectId);
+    if (cached && Date.now() - cached.at < GitHubIssueSourcePlugin.BOARD_CACHE_TTL_MS) {
+      return cached.items;
+    }
+    const { owner, number } = parseProjectId(ctx.projectId);
+    const { trigger, skip } = resolveLabels(ctx);
+    const items = this.ghItemList(owner, number, `label:${trigger} -label:${skip} -status:Backlog -status:Done`);
+    this.boardCache.set(ctx.projectId, { items, at: Date.now() });
+    return items;
   }
 
   /**

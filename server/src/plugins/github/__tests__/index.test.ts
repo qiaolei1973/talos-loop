@@ -40,8 +40,9 @@ const FIELD_LIST = {
   ],
 };
 
-function ghMock(opts: { items?: any[]; labels?: any[]; comments?: any[] } = {}) {
+function ghMock(opts: { items?: any[]; labels?: any[]; comments?: any[]; graphql?: { remaining?: number; limit?: number; reset?: number } } = {}) {
   return (cmd: string) => {
+    if (cmd.includes("gh api rate_limit")) return JSON.stringify({ resources: { graphql: opts.graphql ?? { remaining: 5000, limit: 5000, reset: 1800000000 } } });
     if (cmd.includes("gh project view")) return JSON.stringify({ id: "PVT_test", number: 1 });
     if (cmd.includes("gh project field-list")) return JSON.stringify(FIELD_LIST);
     if (cmd.includes("gh project item-list")) return JSON.stringify({ items: opts.items ?? [] });
@@ -169,14 +170,15 @@ describe("GitHubIssueSourcePlugin", () => {
   });
 
   describe("listBoard()", () => {
-    it("returns every board item with its status, url, title (all columns)", async () => {
+    it("returns the active board items (eligible, non-terminal) with status/url/title", async () => {
+      // readBoard queries with -status:Backlog -status:Done, so the API already
+      // returns only the active set; the mock hands listBoard that filtered view.
       mockExecSync.mockImplementation(
         ghMock({
           items: [
             item(9, "Ready"),
             item(11, "In progress"),
             item(12, "In review"),
-            item(13, "Done"),
           ],
         }),
       );
@@ -187,11 +189,22 @@ describe("GitHubIssueSourcePlugin", () => {
         { id: "9", status: "Ready" },
         { id: "11", status: "In progress" },
         { id: "12", status: "In review" },
-        { id: "13", status: "Done" },
       ]);
       expect(board[0].repository).toBe("qiaolei1973/talos-loop");
       expect(board[0].url).toBe("u9");
       expect(board[0].title).toBe("Issue 9");
+    });
+
+    it("shares one item-list between discover() and listBoard() (cached per cycle)", async () => {
+      mockExecSync.mockImplementation(ghMock({ items: [item(9, "Ready"), item(11, "In progress")] }));
+      await plugin.init(makeCtx());
+      await plugin.discover(makeCtx());
+      await plugin.listBoard(makeCtx());
+
+      const itemListCalls = mockExecSync.mock.calls
+        .map((c: any[]) => c[0] as string)
+        .filter((cmd) => cmd.includes("gh project item-list"));
+      expect(itemListCalls).toHaveLength(1);
     });
 
     it("throws on board-read failure instead of returning an empty array (issue #13)", async () => {
@@ -204,6 +217,37 @@ describe("GitHubIssueSourcePlugin", () => {
       });
       await plugin.init(makeCtx());
       await expect(plugin.listBoard(makeCtx())).rejects.toThrow(/rate limited/);
+    });
+  });
+
+  describe("checkQuota()", () => {
+    it("parses graphql remaining/limit/reset from gh api rate_limit", async () => {
+      mockExecSync.mockImplementation(ghMock({ graphql: { remaining: 44, limit: 5000, reset: 1781591014 } }));
+      const q = await plugin.checkQuota(makeCtx());
+      expect(q.available).toBe(true);
+      expect(q.remaining).toBe(44);
+      expect(q.limit).toBe(5000);
+      expect(q.resetAt).toEqual(new Date(1781591014 * 1000));
+    });
+
+    it("caches the probe within TTL (one rate_limit call for repeated probes)", async () => {
+      mockExecSync.mockImplementation(ghMock({ graphql: { remaining: 100, limit: 5000, reset: 1781591014 } }));
+      await plugin.checkQuota(makeCtx());
+      await plugin.checkQuota(makeCtx());
+      const rateLimitCalls = mockExecSync.mock.calls
+        .map((c: any[]) => c[0] as string)
+        .filter((cmd) => cmd.includes("gh api rate_limit"));
+      expect(rateLimitCalls).toHaveLength(1);
+    });
+
+    it("returns available:false on probe failure (never blocks)", async () => {
+      mockExecSync.mockImplementation((cmd: string) => {
+        if (cmd.includes("gh api rate_limit")) throw new Error("network down");
+        return "";
+      });
+      const q = await plugin.checkQuota(makeCtx());
+      expect(q.available).toBe(false);
+      expect(q.error).toMatch(/network down/);
     });
   });
 
