@@ -19,7 +19,7 @@ export function checkTmux(): void {
 /**
  * Build a session name from the plugin alias (or source type), target repo, and
  * source ID. Each segment is sanitized so scoped package names (e.g.
- * "@talos-loop/source-dima") and display names with spaces don't inject path
+ * "@alipay/talos-plugin-dima") and display names with spaces don't inject path
  * separators — the returned value is embedded in temp-file paths and tmux
  * session names, so it must be a flat, shell-safe identifier.
  */
@@ -30,13 +30,13 @@ export function sessionName(sourceName: string, targetRepo: string, sourceId: st
 
 /** Create a new detached tmux session running a command */
 export function createSession(name: string, command: string): void {
-  execSync(`/usr/bin/tmux new-session -d -s "${name}" -x 200 -y 50 "${command}"`, { timeout: 10_000 });
+  execSync(`tmux new-session -d -s "${name}" -x 200 -y 50 "${command}"`, { timeout: 10_000 });
 }
 
 /** Check if a tmux session is still alive */
 export function isAlive(name: string): boolean {
   try {
-    execSync(`/usr/bin/tmux has-session -t "${name}" 2>/dev/null`, { timeout: 5_000 });
+    execSync(`tmux has-session -t "${name}" 2>/dev/null`, { timeout: 5_000 });
     return true;
   } catch {
     return false;
@@ -46,7 +46,7 @@ export function isAlive(name: string): boolean {
 /** Kill a tmux session */
 export function killSession(name: string): void {
   try {
-    execSync(`/usr/bin/tmux kill-session -t "${name}" 2>/dev/null`, { timeout: 5_000 });
+    execSync(`tmux kill-session -t "${name}" 2>/dev/null`, { timeout: 5_000 });
   } catch {
     // session already dead
   }
@@ -55,7 +55,7 @@ export function killSession(name: string): void {
 /** Capture the last N lines of a tmux session's output */
 export function captureOutput(name: string, lines = 200): string {
   try {
-    return execSync(`/usr/bin/tmux capture-pane -t "${name}" -p -S -${lines}`, {
+    return execSync(`tmux capture-pane -t "${name}" -p -S -${lines}`, {
       encoding: "utf-8",
       timeout: 5_000,
     });
@@ -67,7 +67,7 @@ export function captureOutput(name: string, lines = 200): string {
 /** List all talos-loop managed sessions */
 export function listManagedSessions(): string[] {
   try {
-    const raw = execSync("/usr/bin/tmux list-sessions -F '#{session_name}'", {
+    const raw = execSync("tmux list-sessions -F '#{session_name}'", {
       encoding: "utf-8",
       timeout: 5_000,
     });

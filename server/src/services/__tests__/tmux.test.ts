@@ -25,7 +25,7 @@ describe("sessionName sanitization (issue #7)", () => {
   });
 
   it("produces a flat identifier safe for use as a filename segment", () => {
-    const name = sessionName("@talos-loop/source-dima", "oceanbase/console-site", "1.2");
+    const name = sessionName("@alipay/talos-plugin-dima", "oceanbase/console-site", "1.2");
     expect(name).not.toMatch(/[/@.]/);
   });
 });
