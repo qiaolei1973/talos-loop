@@ -13,8 +13,9 @@ const mockPlugin = {
 const mockGetIssue = vi.fn();
 const mockSetSessionPrUrl = vi.fn();
 const mockMarkSessionSkipped = vi.fn();
-const mockUpdateIssueStatus = vi.fn();
-const mockUpdateIssueTmux = vi.fn();
+// The skip action optimistically flips the in-memory board snapshot to "Ready"
+// (issue #13) — no persisted status/tmux column is written anymore.
+const mockSetBoardStatus = vi.fn();
 
 vi.mock("../config.js", () => ({
   loadConfig: () => ({ port: 3100, pollInterval: 60_000, maxParallel: 1, serverBaseUrl: "http://127.0.0.1:3100" }),
@@ -33,8 +34,6 @@ vi.mock("../db/index.js", () => ({
   getIssue: mockGetIssue,
   setSessionPrUrl: mockSetSessionPrUrl,
   markSessionSkipped: mockMarkSessionSkipped,
-  updateIssueStatus: mockUpdateIssueStatus,
-  updateIssueTmux: mockUpdateIssueTmux,
   // Exported by db/index but unused by the action route — present so the mock
   // satisfies api.ts's named imports.
   getAllIssues: vi.fn(),
@@ -42,6 +41,13 @@ vi.mock("../db/index.js", () => ({
   getSessionsByIssue: vi.fn(),
   getIssueById: vi.fn(),
   getRunningSessions: vi.fn(),
+}));
+
+vi.mock("../services/boardSnapshot.js", () => ({
+  setBoardStatus: mockSetBoardStatus,
+  getBoardStatus: vi.fn(),
+  setProjectBoard: vi.fn(),
+  clearBoardSnapshot: vi.fn(),
 }));
 
 vi.mock("../plugins/loader.js", () => ({
@@ -100,7 +106,7 @@ describe("POST /api/projects/:projectId/issues/:sourceId/actions/:action", () =>
     expect(mockSetSessionPrUrl).toHaveBeenCalledWith(42, "https://github.com/qiaolei1973/talos-loop/pull/7");
     // submit-pr performs no skip-style coordination.
     expect(mockMarkSessionSkipped).not.toHaveBeenCalled();
-    expect(mockUpdateIssueStatus).not.toHaveBeenCalled();
+    expect(mockSetBoardStatus).not.toHaveBeenCalled();
   });
 
   it("submit-pr without a branch → 200 error body, plugin not called", async () => {
@@ -125,7 +131,7 @@ describe("POST /api/projects/:projectId/issues/:sourceId/actions/:action", () =>
     expect(mockSetSessionPrUrl).not.toHaveBeenCalled();
   });
 
-  it("skip → plugin.skip plus coordination DB ops (markSessionSkipped, updateIssueStatus, updateIssueTmux)", async () => {
+  it("skip → plugin.skip plus coordination (markSessionSkipped, optimistic board flip to Ready)", async () => {
     const res = await app.inject({
       method: "POST",
       url: "/api/projects/qiaolei1973%2F1/issues/9/actions/skip",
@@ -136,8 +142,9 @@ describe("POST /api/projects/:projectId/issues/:sourceId/actions/:action", () =>
     expect(res.json()).toEqual({ success: true });
     expect(mockPlugin.skip).toHaveBeenCalledWith(expect.anything(), "9", "talos-loop", "needs more info");
     expect(mockMarkSessionSkipped).toHaveBeenCalledWith(42, "needs more info");
-    expect(mockUpdateIssueStatus).toHaveBeenCalledWith("qiaolei1973/1", "9", "queued");
-    expect(mockUpdateIssueTmux).toHaveBeenCalledWith("qiaolei1973/1", "9", null);
+    // Issue #13: no persisted status column — the board move happened in
+    // plugin.skip(); we only mirror it optimistically to "Ready" in memory.
+    expect(mockSetBoardStatus).toHaveBeenCalledWith("qiaolei1973/1", "9", "Ready");
   });
 
   it("skip defaults the reason when none is provided", async () => {
@@ -163,7 +170,7 @@ describe("POST /api/projects/:projectId/issues/:sourceId/actions/:action", () =>
     expect(mockPlugin.onComment).toHaveBeenCalledWith(expect.anything(), "9", "checking in", "talos-loop");
     expect(mockMarkSessionSkipped).not.toHaveBeenCalled();
     expect(mockSetSessionPrUrl).not.toHaveBeenCalled();
-    expect(mockUpdateIssueStatus).not.toHaveBeenCalled();
+    expect(mockSetBoardStatus).not.toHaveBeenCalled();
   });
 
   it("unknown action → 400 error", async () => {

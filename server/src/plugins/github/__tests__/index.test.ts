@@ -157,11 +157,53 @@ describe("GitHubIssueSourcePlugin", () => {
       expect((await plugin.getStatus(makeCtx(), "9", "talos-loop")).state).toBeNull();
     });
 
-    it("returns null on gh failure", async () => {
+    it("returns null on gh failure (issue #13: warns prominently, no silent null)", async () => {
       mockExecSync.mockImplementation(() => {
         throw new Error("not found");
       });
-      expect((await plugin.getStatus(makeCtx(), "999", "talos-loop")).state).toBeNull();
+      const ctx = makeCtx();
+      expect((await plugin.getStatus(ctx, "999", "talos-loop")).state).toBeNull();
+      // The read failure is surfaced, not masquerading as "not actionable".
+      expect(ctx.logger.warn).toHaveBeenCalledWith(expect.stringMatching(/read failed/i));
+    });
+  });
+
+  describe("listBoard()", () => {
+    it("returns every board item with its status, url, title (all columns)", async () => {
+      mockExecSync.mockImplementation(
+        ghMock({
+          items: [
+            item(9, "Ready"),
+            item(11, "In progress"),
+            item(12, "In review"),
+            item(13, "Done"),
+          ],
+        }),
+      );
+      await plugin.init(makeCtx());
+      const board = await plugin.listBoard(makeCtx());
+
+      expect(board.map((b) => ({ id: b.sourceId, status: b.boardStatus }))).toEqual([
+        { id: "9", status: "Ready" },
+        { id: "11", status: "In progress" },
+        { id: "12", status: "In review" },
+        { id: "13", status: "Done" },
+      ]);
+      expect(board[0].repository).toBe("qiaolei1973/talos-loop");
+      expect(board[0].url).toBe("u9");
+      expect(board[0].title).toBe("Issue 9");
+    });
+
+    it("throws on board-read failure instead of returning an empty array (issue #13)", async () => {
+      // ensureCache (view + field-list) succeeds, but the item-list read fails.
+      mockExecSync.mockImplementation((cmd: string) => {
+        if (cmd.includes("gh project view")) return JSON.stringify({ id: "PVT_test", number: 1 });
+        if (cmd.includes("gh project field-list")) return JSON.stringify(FIELD_LIST);
+        if (cmd.includes("gh project item-list")) throw new Error("rate limited");
+        return "";
+      });
+      await plugin.init(makeCtx());
+      await expect(plugin.listBoard(makeCtx())).rejects.toThrow(/rate limited/);
     });
   });
 
@@ -191,6 +233,27 @@ describe("GitHubIssueSourcePlugin", () => {
         .find((cmd) => cmd.includes("gh project item-edit"));
       // done → "In review" → o_review
       expect(editCmd).toContain("--single-select-option-id o_review");
+    });
+
+    it("warns distinctly on board-read failure (vs item not found) — issue #13", async () => {
+      // ensureCache ok, but item-list (the board read) fails.
+      mockExecSync.mockImplementation((cmd: string) => {
+        if (cmd.includes("gh project view")) return JSON.stringify({ id: "PVT_test", number: 1 });
+        if (cmd.includes("gh project field-list")) return JSON.stringify(FIELD_LIST);
+        if (cmd.includes("gh project item-list")) throw new Error("rate limited");
+        return "";
+      });
+      await plugin.init(makeCtx());
+      const ctx = makeCtx();
+      await plugin.transition(ctx, "9", { from: "queued", to: "processing" }, "talos-loop");
+
+      // The transient read failure is surfaced as a prominent warn…
+      expect(ctx.logger.warn).toHaveBeenCalledWith(expect.stringMatching(/board read failed/i));
+      // …and no item-edit is attempted (we couldn't read the board).
+      const editCmd = mockExecSync.mock.calls
+        .map((c: any[]) => c[0] as string)
+        .find((cmd) => cmd.includes("gh project item-edit"));
+      expect(editCmd).toBeUndefined();
     });
   });
 

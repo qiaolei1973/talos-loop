@@ -1,14 +1,16 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import * as fs from "fs";
 import * as db from "../db/index.js";
+import * as boardSnapshot from "../services/boardSnapshot.js";
 import type { IssueEntry, PollResult } from "../services/poller.js";
 import type { Issue } from "../db/index.js";
 
 // --- spy references into the mocked modules ---
 const mockWriteFileSync = fs.writeFileSync as unknown as ReturnType<typeof vi.fn>;
 const mockUpdateSessionStatus = db.updateSessionStatus as unknown as ReturnType<typeof vi.fn>;
-const mockUpdateIssueStatus = db.updateIssueStatus as unknown as ReturnType<typeof vi.fn>;
-const mockUpdateIssueTmux = db.updateIssueTmux as unknown as ReturnType<typeof vi.fn>;
+// Issue #13: workflow status is no longer persisted — dispatch/completion/skip
+// only optimistically flip the in-memory board snapshot.
+const mockSetBoardStatus = boardSnapshot.setBoardStatus as unknown as ReturnType<typeof vi.fn>;
 
 // --- per-test controllable state ---
 // Freshness check: maps sourceId → getStatus().state.
@@ -24,6 +26,9 @@ const mockPlugin = {
   name: "github",
   async init() {},
   async discover() {
+    return [];
+  },
+  async listBoard() {
     return [];
   },
   async getStatus(_ctx: unknown, sourceId: string, _targetRepo: string) {
@@ -59,8 +64,13 @@ vi.mock("../db/index.js", () => ({
   getRunningSessionsWithIssues: () => runningSessions,
   createSession: vi.fn(),
   updateSessionStatus: vi.fn(),
-  updateIssueTmux: vi.fn(),
-  updateIssueStatus: vi.fn(),
+}));
+
+vi.mock("../services/boardSnapshot.js", () => ({
+  setBoardStatus: vi.fn(),
+  setProjectBoard: vi.fn(),
+  getBoardStatus: vi.fn(),
+  clearBoardSnapshot: vi.fn(),
 }));
 
 vi.mock("../plugins/loader.js", () => ({
@@ -94,8 +104,6 @@ function makeCandidate(sourceId: string): IssueEntry {
     target_repo: "talos-loop",
     url: `https://github.com/qiaolei1973/talos-loop/issues/${sourceId}`,
     title: `Issue ${sourceId}`,
-    tmux_session: null,
-    status: "queued",
     created_at: "",
     updated_at: "",
   };
@@ -208,6 +216,9 @@ describe("buildPrompt percent-encodes projectId and renders capabilities", () =>
     // The old per-action routes and the single-line PR-URL instruction are gone.
     expect(prompt).not.toMatch(/\/issues\/\d+\/(skip|comment)\b/);
     expect(prompt).not.toMatch(/单独一行输出 PR/);
+    // Issue #13: a successful dispatch optimistically flips the snapshot to
+    // "In progress" instead of writing a persisted status column.
+    expect(mockSetBoardStatus).toHaveBeenCalledWith("qiaolei1973/1", "1", "In progress");
   });
 });
 
@@ -233,8 +244,6 @@ describe("checkRunningSessions outcome from stored pr_url (issue #11)", () => {
 
     // session finalized as done with the stored PR url
     expect(mockUpdateSessionStatus).toHaveBeenCalledWith(100, "done", "https://github.com/qiaolei1973/talos-loop/pull/42");
-    // issue → done (semantics: In review)
-    expect(mockUpdateIssueStatus).toHaveBeenCalledWith("qiaolei1973/1", "9", "done");
     // board transition processing → done
     expect(mockPlugin.transition).toHaveBeenCalledWith(
       expect.anything(), "9", { from: "processing", to: "done" }, "talos-loop",
@@ -242,8 +251,9 @@ describe("checkRunningSessions outcome from stored pr_url (issue #11)", () => {
     // PR comment posted
     expect(mockPlugin.onComment).toHaveBeenCalledTimes(1);
     expect(String((mockPlugin.onComment as any).mock.calls[0][2])).toContain("pull/42");
-    // tmux pointer cleared
-    expect(mockUpdateIssueTmux).toHaveBeenCalledWith("qiaolei1973/1", "9", null);
+    // Issue #13: no persisted status — completion optimistically mirrors the board
+    // move (processing → "In review") in the snapshot for a snappy dashboard.
+    expect(mockSetBoardStatus).toHaveBeenCalledWith("qiaolei1973/1", "9", "In review");
   });
 
   it("session.pr_url null → infra failure: transition queued, NO comment, session failed+tail", async () => {
@@ -261,15 +271,14 @@ describe("checkRunningSessions outcome from stored pr_url (issue #11)", () => {
     expect(mockUpdateSessionStatus).toHaveBeenCalledWith(
       100, "failed", undefined, expect.stringContaining("rate limit exceeded"),
     );
-    // issue → queued (back to Ready for auto-retry)
-    expect(mockUpdateIssueStatus).toHaveBeenCalledWith("qiaolei1973/1", "9", "queued");
     // board transition processing → queued (back to Ready)
     expect(mockPlugin.transition).toHaveBeenCalledWith(
       expect.anything(), "9", { from: "processing", to: "queued" }, "talos-loop",
     );
     // NO comment posted (silent infra failure)
     expect(mockPlugin.onComment).not.toHaveBeenCalled();
-    expect(mockUpdateIssueTmux).toHaveBeenCalledWith("qiaolei1973/1", "9", null);
+    // Issue #13: infra failure optimistically mirrors the board rollback (→ "Ready").
+    expect(mockSetBoardStatus).toHaveBeenCalledWith("qiaolei1973/1", "9", "Ready");
   });
 
   it("alive sessions are left alone", async () => {
