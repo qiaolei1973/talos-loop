@@ -1,4 +1,5 @@
-import { useEffect, useState, useCallback } from "react";
+import { useMemo, useState } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   RefreshCw,
   ExternalLink,
@@ -49,6 +50,26 @@ interface Status {
 }
 
 const API = "";
+
+/**
+ * Each endpoint is its own query so they refresh independently: a slow
+ * `/api/issues` response never blocks the `/api/status` header badge, and the
+ * two cadences can be tuned separately. React Query handles the concerns that
+ * `setInterval` + `Promise.all` used to do manually — request deduplication,
+ * in-flight coalescing (a scheduled refetch is skipped while one is already
+ * running), and stale-while-revalidate.
+ */
+async function fetchIssues(): Promise<Issue[]> {
+  const res = await fetch(`${API}/api/issues`);
+  if (!res.ok) throw new Error(`Failed to load issues (${res.status})`);
+  return res.json();
+}
+
+async function fetchStatus(): Promise<Status> {
+  const res = await fetch(`${API}/api/status`);
+  if (!res.ok) throw new Error(`Failed to load status (${res.status})`);
+  return res.json();
+}
 
 function StatusBadge({ status }: { status: string }) {
   const config: Record<string, { icon: any; label: string; cls: string }> = {
@@ -132,43 +153,52 @@ function timeAgo(dateStr: string | null): string {
 }
 
 export default function App() {
-  const [issues, setIssues] = useState<Issue[]>([]);
-  const [status, setStatus] = useState<Status | null>(null);
-  const [loading, setLoading] = useState(false);
+  const queryClient = useQueryClient();
 
-  const fetchData = useCallback(async () => {
-    setLoading(true);
-    try {
-      const [issuesRes, statusRes] = await Promise.all([
-        fetch(`${API}/api/issues`).then((r) => r.json()),
-        fetch(`${API}/api/status`).then((r) => r.json()),
-      ]);
-      setIssues(issuesRes);
-      setStatus(statusRes);
-    } catch (err) {
-      console.error("Failed to fetch data:", err);
-    } finally {
-      setLoading(false);
-    }
-  }, []);
+  const issuesQuery = useQuery({
+    queryKey: ["issues"],
+    queryFn: fetchIssues,
+    refetchInterval: 10_000, // refresh issue list every 10s
+  });
+  const statusQuery = useQuery({
+    queryKey: ["status"],
+    queryFn: fetchStatus,
+    refetchInterval: 30_000, // status is lightweight metadata — poll less often
+  });
 
+  const issues = issuesQuery.data ?? [];
+  const status = statusQuery.data ?? null;
+
+  // "Poll Now" feedback is user-initiated and distinct from background refresh,
+  // so it gets its own flag rather than reusing isFetching (which would spin on
+  // every interval tick). The button is disabled while any issues fetch is
+  // in-flight so manual polls never stack on a pending one.
+  const [polling, setPolling] = useState(false);
   const triggerPoll = async () => {
-    setLoading(true);
-    await fetch(`${API}/api/poll`, { method: "POST" });
-    await fetchData();
+    setPolling(true);
+    try {
+      await fetch(`${API}/api/poll`, { method: "POST" });
+      await queryClient.invalidateQueries({ queryKey: ["issues"] });
+    } finally {
+      setPolling(false);
+    }
   };
+  const buttonBusy = polling || issuesQuery.isFetching;
 
-  useEffect(() => {
-    fetchData();
-    const interval = setInterval(fetchData, 10000); // refresh every 10s
-    return () => clearInterval(interval);
-  }, [fetchData]);
+  // Only the very first fetch (no data yet) shows a loading state; background
+  // refetches update silently via stale-while-revalidate, so the UI doesn't
+  // flicker on every poll cycle.
+  const initialLoading = issuesQuery.isLoading;
 
   // Group issues by target_repo
-  const byRepo = issues.reduce<Record<string, Issue[]>>((acc, issue) => {
-    (acc[issue.target_repo] ??= []).push(issue);
-    return acc;
-  }, {});
+  const byRepo = useMemo(
+    () =>
+      issues.reduce<Record<string, Issue[]>>((acc, issue) => {
+        (acc[issue.target_repo] ??= []).push(issue);
+        return acc;
+      }, {}),
+    [issues],
+  );
 
   return (
     <div className="min-h-screen bg-gray-50">
@@ -194,10 +224,10 @@ export default function App() {
             )}
             <button
               onClick={triggerPoll}
-              disabled={loading}
+              disabled={buttonBusy}
               className="inline-flex items-center gap-1.5 rounded-md bg-blue-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50"
             >
-              <RefreshCw className={`h-4 w-4 ${loading ? "animate-spin" : ""}`} />
+              <RefreshCw className={`h-4 w-4 ${polling ? "animate-spin" : ""}`} />
               Poll Now
             </button>
           </div>
@@ -206,7 +236,12 @@ export default function App() {
 
       {/* Content */}
       <main className="mx-auto max-w-5xl px-6 py-6">
-        {Object.entries(byRepo).length === 0 ? (
+        {initialLoading ? (
+          <div className="rounded-lg border border-dashed border-gray-300 p-12 text-center">
+            <Loader2 className="mx-auto mb-3 h-10 w-10 animate-spin text-gray-400" />
+            <p className="text-gray-500">Loading issues…</p>
+          </div>
+        ) : Object.entries(byRepo).length === 0 ? (
           <div className="rounded-lg border border-dashed border-gray-300 p-12 text-center">
             <GitBranch className="mx-auto mb-3 h-10 w-10 text-gray-400" />
             <p className="text-gray-500">No issues found yet.</p>
