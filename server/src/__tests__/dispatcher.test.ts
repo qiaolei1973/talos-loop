@@ -3,6 +3,7 @@ import * as fs from "fs";
 import * as db from "../db/index.js";
 import * as boardSnapshot from "../services/boardSnapshot.js";
 import * as worktree from "../services/worktree.js";
+import * as tmux from "../services/tmux.js";
 import type { IssueEntry, PollResult } from "../services/poller.js";
 import type { Issue } from "../db/index.js";
 
@@ -17,6 +18,8 @@ const mockSetBoardStatus = boardSnapshot.setBoardStatus as unknown as ReturnType
 const mockCreateWorktree = worktree.createWorktree as unknown as ReturnType<typeof vi.fn>;
 const mockEnsureWorktree = worktree.ensureWorktree as unknown as ReturnType<typeof vi.fn>;
 const mockRemoveWorktree = worktree.removeWorktree as unknown as ReturnType<typeof vi.fn>;
+// Issue #26: killSession is called on the done path (auto-kill completed sessions).
+const mockKillSession = tmux.killSession as unknown as ReturnType<typeof vi.fn>;
 
 // --- per-test controllable state ---
 // Freshness check: maps sourceId → getStatus().state.
@@ -41,6 +44,8 @@ let boardStatusBySourceId: Record<string, string | undefined> = {};
 let unresolvedThreadsByPr: Record<string, any[]> = {};
 // dispatchReview cadence (cycles between review ticks).
 let reviewDispatchEvery = 15;
+// Issue #26: keepSessionOnSuccess opts out of auto-killing completed sessions.
+let keepSessionOnSuccess = false;
 
 const mockPlugin = {
   name: "github",
@@ -72,7 +77,7 @@ const mockPlugin = {
 };
 
 vi.mock("../config.js", () => ({
-  loadConfig: () => ({ maxParallel: 1, serverBaseUrl: "http://127.0.0.1:3100", reviewDispatchEvery }),
+  loadConfig: () => ({ maxParallel: 1, serverBaseUrl: "http://127.0.0.1:3100", reviewDispatchEvery, keepSessionOnSuccess }),
   buildProjectContextForIssue: () => ({
     config: {},
     logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -112,6 +117,7 @@ vi.mock("../services/tmux.js", () => ({
   isAlive: (session: string) => tmuxAlive.has(session),
   exitCodePath: (session: string) => `/tmp/tl-exit-${session}.txt`,
   readExitCode: (session: string) => exitCodeBySession[session],
+  killSession: vi.fn(),
 }));
 
 // Issue #21: stub the worktree service so dispatch never runs real git. The
@@ -185,6 +191,7 @@ describe("dispatchNew slot accounting (issue #6)", () => {
     boardStatusBySourceId = {};
     unresolvedThreadsByPr = {};
     reviewDispatchEvery = 15;
+    keepSessionOnSuccess = false;
     vi.clearAllMocks();
   });
 
@@ -238,6 +245,7 @@ describe("buildPrompt percent-encodes projectId and renders capabilities", () =>
     boardStatusBySourceId = {};
     unresolvedThreadsByPr = {};
     reviewDispatchEvery = 15;
+    keepSessionOnSuccess = false;
     vi.clearAllMocks();
   });
 
@@ -290,6 +298,7 @@ describe("launcher script writes the exit-code sentinel (issue #20)", () => {
     boardStatusBySourceId = {};
     unresolvedThreadsByPr = {};
     reviewDispatchEvery = 15;
+    keepSessionOnSuccess = false;
     vi.clearAllMocks();
   });
 
@@ -339,6 +348,7 @@ describe("checkRunningSessions classifies by exit code, not task outcome (issue 
     boardStatusBySourceId = {};
     unresolvedThreadsByPr = {};
     reviewDispatchEvery = 15;
+    keepSessionOnSuccess = false;
     vi.clearAllMocks();
   });
 
@@ -364,6 +374,8 @@ describe("checkRunningSessions classifies by exit code, not task outcome (issue 
     expect(String((mockPlugin.onComment as any).mock.calls[0][2])).toContain("pull/42");
     // completion optimistically mirrors the board move (processing → "In review").
     expect(mockSetBoardStatus).toHaveBeenCalledWith("qiaolei1973/1", "9", "In review");
+    // Issue #26: a completed session's tmux window is torn down.
+    expect(mockKillSession).toHaveBeenCalledWith("tl-github-talos-loop-9");
   });
 
   // (b) exit 0 + no pr_url → done, board UNCHANGED (e.g. a review session).
@@ -383,6 +395,8 @@ describe("checkRunningSessions classifies by exit code, not task outcome (issue 
     expect(mockPlugin.transition).not.toHaveBeenCalled();
     expect(mockPlugin.onComment).not.toHaveBeenCalled();
     expect(mockSetBoardStatus).not.toHaveBeenCalled();
+    // Issue #26: clean exit still counts as completed → window torn down.
+    expect(mockKillSession).toHaveBeenCalledWith("tl-github-talos-loop-9");
   });
 
   // (c) non-zero exit → failed, board UNCHANGED.
@@ -407,6 +421,8 @@ describe("checkRunningSessions classifies by exit code, not task outcome (issue 
     expect(mockPlugin.transition).not.toHaveBeenCalled();
     expect(mockPlugin.onComment).not.toHaveBeenCalled();
     expect(mockSetBoardStatus).not.toHaveBeenCalled();
+    // Issue #26: a failed session is LEFT alive for inspection/retry.
+    expect(mockKillSession).not.toHaveBeenCalled();
   });
 
   // (d) sentinel absent → failed (unclean termination), board UNCHANGED.
@@ -430,6 +446,8 @@ describe("checkRunningSessions classifies by exit code, not task outcome (issue 
     expect(mockPlugin.transition).not.toHaveBeenCalled();
     expect(mockPlugin.onComment).not.toHaveBeenCalled();
     expect(mockSetBoardStatus).not.toHaveBeenCalled();
+    // Issue #26: an unclean-termination failure is kept alive, not killed.
+    expect(mockKillSession).not.toHaveBeenCalled();
   });
 
   it("alive sessions are left alone", async () => {
@@ -443,6 +461,42 @@ describe("checkRunningSessions classifies by exit code, not task outcome (issue 
     expect(result).toEqual({ completed: 0, failed: 0 });
     expect(mockUpdateSessionStatus).not.toHaveBeenCalled();
     expect(mockPlugin.transition).not.toHaveBeenCalled();
+    expect(mockKillSession).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #26: auto-kill completed sessions after sentinel detection
+// ---------------------------------------------------------------------------
+
+describe("checkRunningSessions() auto-kills completed sessions (issue #26)", () => {
+  beforeEach(() => {
+    statusBySourceId = {};
+    runningSessions = [];
+    tmuxOutput = {};
+    tmuxAlive = new Set();
+    exitCodeBySession = {};
+    codingSessionsWithPr = [];
+    runningReviewIssueIds = new Set();
+    boardStatusBySourceId = {};
+    unresolvedThreadsByPr = {};
+    reviewDispatchEvery = 15;
+    keepSessionOnSuccess = false;
+    vi.clearAllMocks();
+  });
+
+  it("keepSessionOnSuccess=true leaves the completed window alive (opt-out)", async () => {
+    keepSessionOnSuccess = true;
+    const session = "tl-github-talos-loop-9";
+    exitCodeBySession[session] = 0;
+    runningSessions = [makeRunningSession(session, "9", "https://github.com/qiaolei1973/talos-loop/pull/42")];
+
+    const { checkRunningSessions } = await import("../services/dispatcher.js");
+    await checkRunningSessions();
+
+    // Still finalized as done, but the tmux window is intentionally kept.
+    expect(mockUpdateSessionStatus).toHaveBeenCalledWith(100, "done", "https://github.com/qiaolei1973/talos-loop/pull/42");
+    expect(mockKillSession).not.toHaveBeenCalled();
   });
 });
 
@@ -483,6 +537,7 @@ describe("dispatchReview() (issue #19)", () => {
     boardStatusBySourceId = {};
     unresolvedThreadsByPr = {};
     reviewDispatchEvery = 15;
+    keepSessionOnSuccess = false;
     vi.clearAllMocks();
   });
 
@@ -603,6 +658,7 @@ describe("checkRunningSessions() review branch (issue #19)", () => {
     boardStatusBySourceId = {};
     unresolvedThreadsByPr = {};
     reviewDispatchEvery = 15;
+    keepSessionOnSuccess = false;
     vi.clearAllMocks();
   });
 
@@ -635,6 +691,8 @@ describe("checkRunningSessions() review branch (issue #19)", () => {
     expect(mockPlugin.transition).not.toHaveBeenCalled();
     expect(mockPlugin.onComment).not.toHaveBeenCalled();
     expect(mockSetBoardStatus).not.toHaveBeenCalled();
+    // Issue #26: a completed review session is torn down too.
+    expect(mockKillSession).toHaveBeenCalledWith("tl-github-talos-loop-9-review");
   });
 
   it("crashed review exit → failed, board untouched (implicit retry next tick)", async () => {
@@ -664,6 +722,8 @@ describe("checkRunningSessions() review branch (issue #19)", () => {
     );
     expect(mockPlugin.transition).not.toHaveBeenCalled();
     expect(mockSetBoardStatus).not.toHaveBeenCalled();
+    // Issue #26: a crashed review session is kept alive for inspection.
+    expect(mockKillSession).not.toHaveBeenCalled();
   });
 });
 
@@ -680,6 +740,7 @@ describe("dispatch() gates review on a slow counter (issue #19)", () => {
     unresolvedThreadsByPr = {};
     // Fire review every 2 cycles so we can observe gating in few iterations.
     reviewDispatchEvery = 2;
+    keepSessionOnSuccess = false;
     vi.clearAllMocks();
   });
 
@@ -749,6 +810,7 @@ describe("dispatchRetry() reuses the failed session's worktree + branch (issue #
     boardStatusBySourceId = {};
     unresolvedThreadsByPr = {};
     reviewDispatchEvery = 15;
+    keepSessionOnSuccess = false;
     vi.clearAllMocks();
   });
 
@@ -819,6 +881,7 @@ describe("checkRunningSessions() worktree lifecycle (issue #21)", () => {
     boardStatusBySourceId = {};
     unresolvedThreadsByPr = {};
     reviewDispatchEvery = 15;
+    keepSessionOnSuccess = false;
     vi.clearAllMocks();
   });
 
