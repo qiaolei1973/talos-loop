@@ -67,7 +67,12 @@ function migrate(db: Database.Database) {
       -- issue #21: the server-determined worktree path. Written at dispatch so
       -- the path is known to the server without the agent reporting back; a
       -- retry session inherits it from the failed session to reuse the worktree.
-      worktree_path TEXT
+      worktree_path TEXT,
+      -- issue #30: the Claude Code -p session id, captured by the stream
+      -- formatter at the stream's init event and persisted by the dispatcher so
+      -- an operator can 'claude -r <id>' to resume/inspect any session (running,
+      -- failed, or done). Written mid-run, so it survives a crash.
+      claude_session_id TEXT
     );
 
     CREATE INDEX IF NOT EXISTS idx_issues_project ON issues(project_id);
@@ -92,6 +97,10 @@ function migrate(db: Database.Database) {
   // issue #21: additive migration for the server-determined worktree path.
   if (!hasSessionCol("worktree_path")) {
     db.exec("ALTER TABLE sessions ADD COLUMN worktree_path TEXT");
+  }
+  // issue #30: additive migration for the captured Claude Code session id.
+  if (!hasSessionCol("claude_session_id")) {
+    db.exec("ALTER TABLE sessions ADD COLUMN claude_session_id TEXT");
   }
 }
 
@@ -182,6 +191,8 @@ export interface Session {
   branch: string | null;
   /** issue #21: server-determined worktree path; inherited by a retry session. */
   worktree_path: string | null;
+  /** issue #30: captured Claude Code `-p` session id (for `claude -r` resume). */
+  claude_session_id: string | null;
 }
 
 // --- Session CRUD ---
@@ -196,6 +207,19 @@ export interface Session {
 export function setSessionBranch(issueId: number, branch: string): void {
   getDb().prepare("UPDATE sessions SET branch = ? WHERE issue_id = ? AND status = 'running'")
     .run(branch, issueId);
+}
+
+/**
+ * Record the captured Claude Code `-p` session id on a session row (issue #30).
+ * Called by checkRunningSessions each cycle once the stream formatter has written
+ * the id to its sidecar (at the stream's init event) — so the id lands in the DB
+ * mid-run, not just at completion, and survives a crash/kill. Targets the row by
+ * id (the dispatcher is already iterating concrete running rows), not the running
+ * issue like submit-pr/branch, since this is a per-session attribute.
+ */
+export function setSessionClaudeId(sessionId: number, claudeSessionId: string): void {
+  getDb().prepare("UPDATE sessions SET claude_session_id = ? WHERE id = ?")
+    .run(claudeSessionId, sessionId);
 }
 
 /**

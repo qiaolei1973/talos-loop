@@ -45,6 +45,8 @@ interface Session {
   isLive?: boolean;
   /** issue #21: server-determined worktree path; present when a retry is possible. */
   worktree_path?: string | null;
+  /** issue #30: captured claude -p session id; present when a `claude -r` resume is possible. */
+  claude_session_id?: string | null;
 }
 
 interface Status {
@@ -146,6 +148,7 @@ function SessionChip({ session }: { session: Session }) {
         title={session.error ?? "Killed manually via the dashboard"}
       >
         <Power className="h-3 w-3" /> {typeLabel} · killed
+        {session.claude_session_id && session.worktree_path && <ResumeButton sessionId={session.id} />}
       </span>
     );
   }
@@ -156,6 +159,7 @@ function SessionChip({ session }: { session: Session }) {
         title={session.error ?? "Infrastructure failure — will auto-retry"}
       >
         <AlertTriangle className="h-3 w-3" /> {typeLabel} · infra error
+        {session.claude_session_id && session.worktree_path && <ResumeButton sessionId={session.id} />}
       </span>
     );
   }
@@ -176,6 +180,7 @@ function SessionChip({ session }: { session: Session }) {
   return (
     <span className="inline-flex items-center gap-1 rounded bg-gray-100 px-1.5 py-0.5 text-[10px] font-medium text-gray-600" title={`${typeLabel} session · ${timeAgo(session.started_at)}`}>
       <CheckCircle className="h-3 w-3 text-gray-400" /> {typeLabel} · {timeAgo(session.started_at)}
+      {session.claude_session_id && session.worktree_path && <ResumeButton sessionId={session.id} />}
     </span>
   );
 }
@@ -302,6 +307,48 @@ function RetryButton({ projectId, sourceId }: { projectId: string; sourceId: str
     >
       {busy ? <Loader2 className="h-3 w-3 animate-spin" /> : <RotateCcw className="h-3 w-3" />}
       {busy ? "retrying" : "retry"}
+    </button>
+  );
+}
+
+/**
+ * Copy a `claude -r <id>` resume command for an operator to run in their own
+ * terminal (issue #30). `claude -r` is interactive/TTY-bound, so the server only
+ * assembles the filled-in command (repo path, worktree, branch, session id) —
+ * the operator pastes and runs it. Shown on any session that captured a claude
+ * session id, so a running, failed, or done session can all be resumed/inspected.
+ */
+function ResumeButton({ sessionId }: { sessionId: number }) {
+  const [copied, setCopied] = useState(false);
+  const [busy, setBusy] = useState(false);
+
+  const handleCopy = async () => {
+    setBusy(true);
+    try {
+      const res = await fetch(`${API}/api/sessions/${sessionId}/resume-command`);
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok || !body.command) {
+        alert(`无法生成 resume 命令：${body.error ?? res.status}`);
+        return;
+      }
+      await navigator.clipboard.writeText(body.command);
+      setCopied(true);
+      alert(`已复制到剪贴板（在你的终端执行）：\n\n${body.command}`);
+      setTimeout(() => setCopied(false), 1500);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <button
+      onClick={handleCopy}
+      disabled={busy}
+      className="mr-2 inline-flex items-center gap-1 rounded bg-gray-100 px-2 py-0.5 text-xs text-gray-600 hover:bg-gray-200 disabled:opacity-50 cursor-pointer"
+      title="复制 claude -r 恢复命令（在你的终端执行）"
+    >
+      {busy ? <Loader2 className="h-3 w-3 animate-spin" /> : copied ? <Check className="h-3 w-3 text-green-600" /> : <RotateCcw className="h-3 w-3" />}
+      {busy ? "…" : copied ? "copied!" : "resume"}
     </button>
   );
 }

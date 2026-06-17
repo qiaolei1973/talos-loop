@@ -7,6 +7,7 @@ import {
   getRunningSessionsWithIssues,
   createSession,
   updateSessionStatus,
+  setSessionClaudeId,
   getCodingSessionsWithPr,
   getRunningReviewIssueIds,
 } from "../db/index.js";
@@ -82,17 +83,36 @@ function buildPrompt(
  * signal that {@link checkRunningSessions} reads. `workDir` is the directory the
  * agent starts in: a coding session's pre-created worktree (issue #21), or the
  * repo path for a review session (which spins up its own worktree).
+ *
+ * Issue #30: claude runs in `-p` print mode with stream-json, piped through the
+ * stream formatter (live readability + claude session-id capture). `-p` makes the
+ * process exit deterministically on task completion, so the exit-code sentinel is
+ * reliably written and the existing completion classification works unchanged.
  */
 function launchScript(workDir: string, prompt: string, session: string): string {
   const promptFile = path.join(os.tmpdir(), `tl-prompt-${session}.txt`);
   fs.writeFileSync(promptFile, prompt, "utf-8");
   const exitCodeFile = tmux.exitCodePath(session);
+  const sessionFile = tmux.sessionIdPath(session);
+  const rawJsonl = path.join(os.tmpdir(), `tl-stream-${session}.jsonl`);
+  // The formatter ships alongside this module (src in dev, dist in prod — the
+  // build copies the .cjs verbatim), so resolve it relative to __dirname.
+  const formatter = path.join(__dirname, "stream-formatter.cjs");
   const scriptFile = path.join(os.tmpdir(), `tl-run-${session}.sh`);
   fs.writeFileSync(scriptFile, [
     `#!/bin/bash`,
     `cd ${workDir}`,
-    `claude "$(cat ${promptFile})" --dangerously-skip-permissions`,
-    `echo $? > "${exitCodeFile}"`,
+    // The sidecar path the formatter writes claude's session id to (read each
+    // cycle by checkRunningSessions). Exported so the `node` stage inherits it.
+    `export TL_SESSION_FILE="${sessionFile}"`,
+    // `-p` + stream-json: deterministic exit + a streamable trace. stdout+stderr
+    // are merged (2>&1) so stderr warnings reach the formatter too; tee keeps a
+    // raw .jsonl for forensics while the formatter renders to the pane.
+    `claude -p "$(cat ${promptFile})" --dangerously-skip-permissions --output-format=stream-json --verbose 2>&1 | tee "${rawJsonl}" | node "${formatter}"`,
+    // In a pipeline `$?` is the LAST stage's exit (node's); capture claude's via
+    // PIPESTATUS[0] instead. Deliberately NOT `set -o pipefail` — it would let a
+    // downstream tee/node non-zero code pollute the completion sentinel.
+    `echo \${PIPESTATUS[0]} > "${exitCodeFile}"`,
     `rm -f "${scriptFile}" "${promptFile}"`,
   ].join("\n"), "utf-8");
   fs.chmodSync(scriptFile, 0o755);
@@ -194,6 +214,19 @@ function buildRetryPrompt(
 }
 
 /**
+ * Has a session exceeded the wall-clock limit (issue #30)? `started_at` is
+ * SQLite `datetime('now')` (UTC without a trailing 'Z'); append 'Z' to parse as
+ * UTC. Returns false for an unparseable/missing timestamp so a malformed row
+ * never trips the watchdog kill.
+ */
+function isOverdue(startedAt: string | null | undefined, claudeTimeoutSeconds: number): boolean {
+  if (!startedAt) return false;
+  const start = Date.parse(startedAt.endsWith("Z") ? startedAt : startedAt + "Z");
+  if (Number.isNaN(start)) return false;
+  return Date.now() - start > claudeTimeoutSeconds * 1000;
+}
+
+/**
  * Check running sessions; for each that has exited, classify it by the process's
  * OWN exit state — not by whether the agent produced a PR (issue #20):
  *
@@ -209,16 +242,33 @@ export async function checkRunningSessions(): Promise<{ completed: number; faile
   const running = getRunningSessionsWithIssues();
   // issue #26: a successfully-completed (exit-0) session's tmux window is torn
   // down unless the operator opts into keep-alive. Loaded once per cycle (cached).
-  const { keepSessionOnSuccess } = loadConfig();
+  const config = loadConfig();
+  const keepSessionOnSuccess = config.keepSessionOnSuccess;
   let completed = 0;
   let failed = 0;
 
   for (const { project_id, project_type, source_id, target_repo, ...session } of running) {
-    if (tmux.isAlive(session.tmux_session)) continue;
-
     const plugin = await resolvePlugin(project_type);
     const ctx = buildProjectContextForIssue(project_id, log);
     const sourceName = plugin.name;
+
+    // issue #30: persist the captured claude session id as soon as the stream
+    // formatter writes it to its sidecar (at the stream's init event — early in
+    // the run). Read every cycle, delete on first sight; the id then lives in the
+    // DB, available mid-run and surviving a crash, for `claude -r` resume.
+    const claudeId = tmux.readSessionId(session.tmux_session);
+    if (claudeId) setSessionClaudeId(session.id, claudeId);
+
+    // issue #30: wall-clock watchdog. A hung agent (deadlock, infinite tool loop,
+    // blocked tool) would otherwise hold a concurrency slot forever. Kill it past
+    // the limit; the kill leaves no exit sentinel, so the session falls through to
+    // the missing-sentinel → failed branch below (its id was already captured).
+    if (tmux.isAlive(session.tmux_session) && isOverdue(session.started_at, config.claudeTimeout)) {
+      log.warn(`⏰ ${sourceName}:${source_id} exceeded claudeTimeout (${config.claudeTimeout}s) — killing`);
+      tmux.killSession(session.tmux_session);
+    }
+
+    if (tmux.isAlive(session.tmux_session)) continue;
 
     // issue #19: review sessions are fire-and-retire workers on a PR that is
     // already "In review". They never advance the board and never post a

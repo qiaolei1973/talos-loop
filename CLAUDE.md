@@ -76,6 +76,8 @@ queued(Ready) ──派发──► processing(In progress) ──exit 0 + pr_ur
 ### 3. exit code + sentinel 判定
 agent 在 tmux 会话里跑一个启动脚本，把退出码写到一个 sentinel 文件；会话结束后 dispatcher 读 sentinel（而非靠 tmux 退出码），据此 + 是否拿到 `pr_url` 分类结果。这样 agent 的「业务成功（建了 PR）」与「进程正常退出」可被独立判别。
 
+> claude 以 `-p` 打印模式 + stream-json 触发（issue #30）：进程在任务完成后**确定性退出**，sentinel 才会被可靠写入——交互模式不自动退出会让完成判定彻底失效。stdout/stderr 经启动脚本管道 `tee <raw>.jsonl | node stream-formatter`，formatter 向 pane 渲染【思考】/【工具】/文本（attach 可观测 + 失败取证），并在流的 `init` 事件把 claude 的 session_id 写到 sidecar——dispatcher 每周期读取入库，故运行中即可 `claude -r <id>` 恢复。因引入管道，退出码用 `${PIPESTATUS[0]}`（取 claude 段），不用 `set -o pipefail`（会污染 sentinel）。同一周期还有一道墙上时钟看门狗：运行中会话超 `claudeTimeout` 即 `killSession` → 无 sentinel → 归类 failed（session_id 已捕获，仍可 resume）。
+
 ### 4. capabilities 驱动的 Prompt 渲染
 agent 可用的 actions 由插件 `capabilities()` 自描述，`buildPrompt` 据此动态生成 API 块。新增 action 不需要改 dispatcher 或加路由——**插件自描述能力，核心被动渲染**。所有 agent 信号走同一个 `/actions/:action` 入口，body 统一带 `targetRepo`。
 

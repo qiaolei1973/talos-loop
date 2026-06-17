@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import * as fs from "fs";
-import { exitCodePath, readExitCode, sessionName } from "../tmux.js";
+import { exitCodePath, readExitCode, sessionIdPath, readSessionId, sessionName } from "../tmux.js";
 
 describe("sessionName sanitization (issue #7)", () => {
   it("passes through already-safe identifiers unchanged", () => {
@@ -68,5 +68,41 @@ describe("readExitCode sentinel (issue #20)", () => {
     expect(readExitCode(session)).toBeUndefined();
     // the corrupt sentinel is still cleaned up
     expect(fs.existsSync(exitCodePath(session))).toBe(false);
+  });
+});
+
+describe("readSessionId sidecar (issue #30)", () => {
+  // A clearly test-only session name so the sidecar can't collide with a real one.
+  const session = "tl-readSessionId-test-only";
+
+  function writeSidecar(content: string): void {
+    fs.writeFileSync(sessionIdPath(session), content, "utf-8");
+  }
+
+  it("returns the id and deletes the sidecar after reading", () => {
+    writeSidecar("claude-uuid-123\n");
+    expect(readSessionId(session)).toBe("claude-uuid-123");
+    // single-use: the file is gone after the read
+    expect(fs.existsSync(sessionIdPath(session))).toBe(false);
+  });
+
+  it("returns undefined when the sidecar is absent (init not seen yet)", () => {
+    try {
+      fs.unlinkSync(sessionIdPath(session));
+    } catch {
+      // already absent
+    }
+    expect(readSessionId(session)).toBeUndefined();
+  });
+
+  it("returns undefined for a blank sidecar (and still cleans it up)", () => {
+    writeSidecar("   \n");
+    expect(readSessionId(session)).toBeUndefined();
+    expect(fs.existsSync(sessionIdPath(session))).toBe(false);
+  });
+
+  it("sessionIdPath lives in the tmp dir with the session-id prefix", () => {
+    // Stable contract shared with the launcher's TL_SESSION_FILE env.
+    expect(sessionIdPath(session)).toMatch(/\/tl-session-tl-readSessionId-test-only\.txt$/);
   });
 });

@@ -9,6 +9,9 @@ let issuesState: Issue[] = [];
 let sessionsByIssue: Record<number, Session[]> = {};
 /** issue #26: session rows looked up by id for the kill endpoint. */
 let sessionById: Record<number, Session> = {};
+/** issue #30: issues + projects looked up by id for the resume-command endpoint. */
+let issueById: Record<number, Issue> = {};
+let projectById: Record<string, { repos: Array<{ name: string; path: string }> }> = {};
 /** board snapshot: `${projectId}/${sourceId}` → raw board column name. */
 let boardByIssue: Record<string, string | undefined> = {};
 let aliveSessionNames: Set<string> = new Set();
@@ -17,7 +20,7 @@ vi.mock("../config.js", () => ({
   loadConfig: () => ({ port: 3100, pollInterval: 60_000, maxParallel: 1, serverBaseUrl: "http://127.0.0.1:3100" }),
   getEnabledProjects: () => [],
   loadProjects: () => [],
-  getProjectById: () => undefined,
+  getProjectById: (pid: string) => projectById[pid],
   buildProjectContext: () => ({
     config: {},
     logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -31,7 +34,7 @@ vi.mock("../db/index.js", () => ({
   getSessionsByIssue: (id: number) => sessionsByIssue[id] ?? [],
   getSessionById: (id: number) => sessionById[id],
   getIssuesByTargetRepo: () => [],
-  getIssueById: () => undefined,
+  getIssueById: (id: number) => issueById[id],
   getIssue: () => undefined,
   getRunningSessions: () => [],
   markSessionSkipped: vi.fn(),
@@ -298,6 +301,77 @@ describe("POST /api/sessions/:id/kill — dashboard kill (issue #26)", () => {
     expect(res.statusCode).toBe(404);
     expect(tmux.killSession).not.toHaveBeenCalled();
     expect(db.updateSessionStatus).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * Issue #30: GET /api/sessions/:id/resume-command assembles a `claude -r <id>`
+ * command the operator runs in their own terminal, filling in authoritative
+ * values from the session row + the project's repo path.
+ */
+describe("GET /api/sessions/:id/resume-command — claude -r resume (issue #30)", () => {
+  let app: Awaited<ReturnType<typeof buildApp>>;
+
+  beforeEach(async () => {
+    issuesState = [];
+    sessionsByIssue = {};
+    sessionById = {};
+    issueById = {};
+    projectById = {};
+    boardByIssue = {};
+    aliveSessionNames = new Set();
+    vi.clearAllMocks();
+    app = await buildApp();
+  });
+
+  afterEach(async () => {
+    await app.close();
+  });
+
+  it("assembles a filled-in resume command from the session + repo", async () => {
+    sessionById[1] = makeSession({
+      id: 1,
+      issue_id: 9,
+      status: "failed",
+      claude_session_id: "claude-abc",
+      worktree_path: "/wt/tl-session",
+      branch: "feat/issue-9",
+    });
+    issueById[9] = makeIssue({ id: 9, project_id: "qiaolei1973/1", target_repo: "talos-loop" });
+    projectById["qiaolei1973/1"] = { repos: [{ name: "talos-loop", path: "/home/agent/talos-loop" }] };
+
+    const res = await app.inject({ method: "GET", url: "/api/sessions/1/resume-command" });
+
+    expect(res.statusCode).toBe(200);
+    expect(await res.json()).toEqual({
+      command:
+        "git -C /home/agent/talos-loop worktree add /wt/tl-session feat/issue-9 2>/dev/null; cd /wt/tl-session && claude -r claude-abc",
+    });
+  });
+
+  it("returns 404 for an unknown session", async () => {
+    const res = await app.inject({ method: "GET", url: "/api/sessions/999/resume-command" });
+    expect(res.statusCode).toBe(404);
+  });
+
+  it("returns 409 when no claude session id was captured", async () => {
+    sessionById[1] = makeSession({ id: 1, claude_session_id: null, worktree_path: "/w", branch: "b" });
+    const res = await app.inject({ method: "GET", url: "/api/sessions/1/resume-command" });
+    expect(res.statusCode).toBe(409);
+  });
+
+  it("returns 409 when worktree or branch is missing", async () => {
+    sessionById[1] = makeSession({ id: 1, claude_session_id: "id", worktree_path: null, branch: null });
+    const res = await app.inject({ method: "GET", url: "/api/sessions/1/resume-command" });
+    expect(res.statusCode).toBe(409);
+  });
+
+  it("returns 404 when the repo isn't declared on the project", async () => {
+    sessionById[1] = makeSession({ id: 1, issue_id: 9, claude_session_id: "id", worktree_path: "/w", branch: "b" });
+    issueById[9] = makeIssue({ id: 9, project_id: "qiaolei1973/1", target_repo: "talos-loop" });
+    projectById["qiaolei1973/1"] = { repos: [{ name: "other", path: "/x" }] };
+    const res = await app.inject({ method: "GET", url: "/api/sessions/1/resume-command" });
+    expect(res.statusCode).toBe(404);
   });
 });
 
