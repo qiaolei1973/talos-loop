@@ -149,11 +149,22 @@ export interface IssueSourcePlugin {
  * doubles as the DB `target_repo` key (and dashboard grouping); `remote` is the
  * upstream "owner/repo" (inferred from `git remote`, overridable) and may be
  * undefined when inference fails and no override is given.
+ *
+ * `branch` is the repo's baseline (integration) branch — the line the feat
+ * branch is cut from as `origin/<branch>` and the PR target. Defaults to
+ * "main" at the consumer when unset, since different repos use master/develop/etc.
+ * (issue #28).
  */
 export interface RepoRef {
   name: string;
   path: string;
   remote?: string;
+  /**
+   * Baseline integration branch (e.g. "main", "master", "develop"). The feat
+   * branch is created from `origin/<branch>` (issue #28); consumers default to
+   * "main" when this is unset.
+   */
+  branch?: string;
 }
 
 export interface ProjectContext {

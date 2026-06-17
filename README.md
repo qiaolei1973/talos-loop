@@ -44,7 +44,8 @@ cp projects.example.json  projects.json   # Projects + 仓库
     "enabled": true,
     "repos": [                         // 该 project 涉及的代码仓库（Claude 运行的地方）
       { "path": "/abs/path/to/local/clone" },
-      { "path": "/path/to/other-repo", "remote": "owner/other-repo" }  // remote 可选，缺省从 git remote 推断
+      { "path": "/path/to/other-repo", "remote": "owner/other-repo" }, // remote 可选，缺省从 git remote 推断
+      { "path": "/path/to/repo-on-master", "branch": "master" }        // branch 可选，基线分支，缺省 main
     ],
     "config": {}                       // 可选：插件特定配置，由插件自行解释
   }
@@ -52,6 +53,7 @@ cp projects.example.json  projects.json   # Projects + 仓库
 ```
 
 - `repos[].name` 取 `path` 的 basename，既作为看板 issue 与本地仓库的映射键（`targetRepo`），也用于 dashboard 分组；**同一 project 内须唯一**。
+- `repos[].branch` 为该仓库的**基线分支**（feat 分支从 `origin/<branch>` 切出，也是 PR 的目标分支），缺省 `main`；不同仓库使用 `master`/`develop` 等时需显式声明，否则 PR 可能创建失败。
 - 看板上的 issue 若其仓库未在 `repos[]` 声明（配置漂移），会被告警并跳过。
 
 **`config.json`**（运行参数，完整字段见模板）：常用项为 `port`、`pollInterval`、`maxParallel`、`claudeTimeout`，以及 `serverBaseUrl`（agent 回调本地 actions 接口的基址，默认 `http://127.0.0.1:${port}`）。
@@ -133,7 +135,7 @@ talos-loop 通过 **Issue Source 插件** 与具体 issue 源解耦。核心只�
 
 完整类型定义见 [`server/src/types/plugin.ts`](./server/src/types/plugin.ts)。
 
-**上下文 `ProjectContext`**：核心注入给每个方法的上下文，含 `config`（该 project 的插件配置）、`logger`、`repos: RepoRef[]`（`{ name, path, remote? }`，`name` 即 `targetRepo` 键）、`projectId`（"owner/number"）。
+**上下文 `ProjectContext`**：核心注入给每个方法的上下文，含 `config`（该 project 的插件配置）、`logger`、`repos: RepoRef[]`（`{ name, path, remote?, branch? }`，`name` 即 `targetRepo` 键，`branch` 为基线分支）、`projectId`（"owner/number"）。
 
 **Actions 入口**：agent 的一切信号统一走 `POST /api/projects/:projectId/issues/:sourceId/actions/:action`（body 带 `targetRepo`）。`:action` 与参数由插件 `capabilities()` 自描述，`buildPrompt` 据此动态渲染 agent 可用的 API 块——**新增 action 无需改 dispatcher 或加路由**，只需插件声明 `capabilities()` + 实现对应方法。
 

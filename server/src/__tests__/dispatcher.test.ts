@@ -47,6 +47,14 @@ let reviewDispatchEvery = 15;
 // Issue #26: keepSessionOnSuccess opts out of auto-killing completed sessions.
 let keepSessionOnSuccess = false;
 
+// Issue #28: the repos injected into ProjectContext — mutable so a test can
+// declare a baseline branch and assert it reaches createWorktree. Resets to the
+// standard repo (no branch → dispatcher applies the "main" default).
+function defaultCtxRepos() {
+  return [{ name: "talos-loop", path: "/tmp/talos-loop", remote: "qiaolei1973/talos-loop" }];
+}
+let ctxRepos = defaultCtxRepos();
+
 const mockPlugin = {
   name: "github",
   async init() {},
@@ -81,7 +89,7 @@ vi.mock("../config.js", () => ({
   buildProjectContextForIssue: () => ({
     config: {},
     logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
-    repos: [{ name: "talos-loop", path: "/tmp/talos-loop", remote: "qiaolei1973/talos-loop" }],
+    repos: ctxRepos,
     projectId: "qiaolei1973/1",
   }),
 }));
@@ -246,6 +254,7 @@ describe("buildPrompt percent-encodes projectId and renders capabilities", () =>
     unresolvedThreadsByPr = {};
     reviewDispatchEvery = 15;
     keepSessionOnSuccess = false;
+    ctxRepos = defaultCtxRepos();
     vi.clearAllMocks();
   });
 
@@ -283,6 +292,39 @@ describe("buildPrompt percent-encodes projectId and renders capabilities", () =>
     // Issue #13: a successful dispatch optimistically flips the snapshot to
     // "In progress" instead of writing a persisted status column.
     expect(mockSetBoardStatus).toHaveBeenCalledWith("qiaolei1973/1", "1", "In progress");
+  });
+
+  // Issue #28: the feat branch is cut from the repo's baseline branch, defaulting
+  // to "main" when the repo declares no `branch`.
+  it("creates the worktree from the default baseline 'main' when repo.branch is unset", async () => {
+    statusBySourceId = { "1": "queued" };
+    const candidates: PollResult[] = [
+      { projectId: "qiaolei1973/1", projectType: "github", discovered: [makeCandidate("1")] },
+    ];
+    const { dispatchNew } = await import("../services/dispatcher.js");
+    await dispatchNew(candidates);
+    expect(mockCreateWorktree).toHaveBeenCalledWith(
+      "/tmp/talos-loop",
+      "/tmp/talos-worktrees/tl-github-talos-loop-1",
+      "feat/issue-1",
+      "main",
+    );
+  });
+
+  it("creates the worktree from the repo's configured baseline branch", async () => {
+    ctxRepos = [{ name: "talos-loop", path: "/tmp/talos-loop", remote: "qiaolei1973/talos-loop", branch: "develop" }];
+    statusBySourceId = { "7": "queued" };
+    const candidates: PollResult[] = [
+      { projectId: "qiaolei1973/1", projectType: "github", discovered: [makeCandidate("7")] },
+    ];
+    const { dispatchNew } = await import("../services/dispatcher.js");
+    await dispatchNew(candidates);
+    expect(mockCreateWorktree).toHaveBeenCalledWith(
+      "/tmp/talos-loop",
+      "/tmp/talos-worktrees/tl-github-talos-loop-7",
+      "feat/issue-7",
+      "develop",
+    );
   });
 });
 
@@ -741,6 +783,7 @@ describe("dispatch() gates review on a slow counter (issue #19)", () => {
     // Fire review every 2 cycles so we can observe gating in few iterations.
     reviewDispatchEvery = 2;
     keepSessionOnSuccess = false;
+    ctxRepos = defaultCtxRepos();
     vi.clearAllMocks();
   });
 

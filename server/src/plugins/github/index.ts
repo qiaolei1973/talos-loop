@@ -363,9 +363,12 @@ export class GitHubIssueSourcePlugin implements IssueSourcePlugin {
     // Single responsibility: create the PR and return its URL. The dispatcher
     // performs session finalization (transition, comment, status) once it reads
     // this URL back from the stored session.
+    // Issue #28: target the repo's declared baseline branch (default "main") so a
+    // repo on master/develop doesn't fail PR creation against a non-existent base.
+    const base = repo.branch ?? "main";
     const title = `Closes #${sourceId}`;
     const raw = execSync(
-      `gh pr create --head ${branch} --base main --title "${title}" --repo ${repo.remote} --json url`,
+      `gh pr create --head ${branch} --base ${base} --title "${title}" --repo ${repo.remote} --json url`,
       { encoding: "utf-8", timeout: 30_000, stdio: "pipe" },
     );
     const url = (JSON.parse(raw) as { url?: string }).url;

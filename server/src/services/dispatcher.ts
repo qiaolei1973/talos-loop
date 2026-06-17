@@ -365,7 +365,9 @@ export async function dispatchNew(pollResults: PollResult[]): Promise<number> {
     const branch = `feat/issue-${sourceId}`;
     const worktreePath = worktree.worktreePath(repo.path, session);
     try {
-      worktree.createWorktree(repo.path, worktreePath, branch);
+      // Issue #28: cut the feat branch from the repo's declared baseline branch
+      // (default "main"), not local HEAD — fetched fresh inside createWorktree.
+      worktree.createWorktree(repo.path, worktreePath, branch, repo.branch ?? "main");
     } catch (err: any) {
       log.error(`Failed to create worktree for ${sourceName}:${sourceId}: ${err.message}`);
       continue;
