@@ -460,11 +460,32 @@ describe("GitHubIssueSourcePlugin", () => {
         .find((cmd) => cmd.includes("gh pr create"));
       expect(createCmd).toBeDefined();
       expect(createCmd).toContain("--head feat/x");
+      // Default baseline is "main" when the repo declares no branch (issue #28).
       expect(createCmd).toContain("--base main");
       expect(createCmd).toContain("--repo qiaolei1973/talos-loop");
       expect(createCmd).toContain("--json url");
       // Title references the source issue so GitHub links the PR.
       expect(createCmd).toContain('Closes #9');
+    });
+
+    // Issue #28: target the repo's declared baseline branch so a non-main repo
+    // doesn't fail PR creation against a non-existent "main" base.
+    it("targets the repo's configured baseline branch (--base)", async () => {
+      mockExecSync.mockImplementation((cmd: string) => {
+        if (cmd.includes("gh pr create")) return JSON.stringify({ url: "https://github.com/qiaolei1973/talos-loop/pull/8" });
+        return "";
+      });
+      const ctx = makeCtx({
+        repos: [{ name: "talos-loop", path: "/tmp/talos-loop", remote: "qiaolei1973/talos-loop", branch: "develop" }],
+      });
+
+      await plugin.submitPr(ctx, "9", "feat/x", "talos-loop");
+
+      const createCmd = mockExecSync.mock.calls
+        .map((c: any[]) => c[0] as string)
+        .find((cmd) => cmd.includes("gh pr create"))!;
+      expect(createCmd).toContain("--base develop");
+      expect(createCmd).not.toContain("--base main");
     });
 
     it("throws when the repo has no remote", async () => {

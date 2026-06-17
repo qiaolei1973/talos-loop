@@ -29,12 +29,16 @@ function run(cmd: string): void {
 }
 
 /**
- * Create a fresh worktree + branch from HEAD for a new coding session (issue
- * #21). A stale path/branch from a prior issue lifecycle (e.g. an issue reopened
- * after its PR merged) is removed first so a fresh dispatch always starts clean.
- * Throws on a real git failure — the caller logs it and skips the dispatch.
+ * Create a fresh worktree + branch for a new coding session (issue #21), cut from
+ * the remote baseline `origin/<baseBranch>` rather than local HEAD (issue #28) —
+ * so the feat branch's starting point is the actual integration line (and its
+ * current tip), not whatever happens to be checked out locally. The remote base is
+ * fetched first so that tip is current. A stale path/branch from a prior issue
+ * lifecycle (e.g. an issue reopened after its PR merged) is removed first so a
+ * fresh dispatch always starts clean. Throws on a real git failure (including a
+ * fetch failure) — the caller logs it and skips the dispatch.
  */
-export function createWorktree(repoPath: string, worktree: string, branch: string): void {
+export function createWorktree(repoPath: string, worktree: string, branch: string, baseBranch: string): void {
   // Best-effort cleanup of a stale worktree and branch from a prior lifecycle.
   try {
     run(`git -C "${repoPath}" worktree remove --force "${worktree}"`);
@@ -46,8 +50,12 @@ export function createWorktree(repoPath: string, worktree: string, branch: strin
   } catch {
     // branch absent — expected
   }
-  run(`git -C "${repoPath}" worktree add -b "${branch}" "${worktree}"`);
-  log.info(`Created worktree ${worktree} on branch ${branch}`);
+  // Fetch the remote baseline first so the feat branch starts from the current
+  // tip of the integration line, not a stale local ref (issue #28). A fetch
+  // failure throws and the caller skips the dispatch.
+  run(`git -C "${repoPath}" fetch origin "${baseBranch}"`);
+  run(`git -C "${repoPath}" worktree add -b "${branch}" "${worktree}" "origin/${baseBranch}"`);
+  log.info(`Created worktree ${worktree} on branch ${branch} from origin/${baseBranch}`);
 }
 
 /**

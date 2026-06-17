@@ -5,7 +5,8 @@
     "enabled": true,
     "repos": [
       { "path": "/abs/path/to/local/clone" },
-      { "path": "/abs/path/to/other-repo", "remote": "owner/other-repo" }
+      { "path": "/abs/path/to/other-repo", "remote": "owner/other-repo" },
+      { "path": "/abs/path/to/repo-on-master", "branch": "master" }
     ],
     "config": {}
   }

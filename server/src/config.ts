@@ -135,10 +135,12 @@ function inferRemote(repoPath: string): string | undefined {
 
 /**
  * Load projects from projects.json. Each entry is
- * `{ projectId, projectType, enabled?, repos: [{path, remote?}], config? }`.
+ * `{ projectId, projectType, enabled?, repos: [{path, remote?, branch?}], config? }`.
  * `repos[].name` is the path basename; `remote` is the override or git-inferred
- * "owner/repo". Missing file → empty array. Duplicate repo basenames within a
- * project emit a console warning (they collide on the target_repo key).
+ * "owner/repo"; `branch` is the optional baseline branch (issue #28) — passed
+ * through verbatim, with consumers defaulting unset to "main". Missing file →
+ * empty array. Duplicate repo basenames within a project emit a console warning
+ * (they collide on the target_repo key).
  */
 export function loadProjects(): ProjectConfig[] {
   if (cachedProjects) return cachedProjects;
@@ -153,7 +155,7 @@ export function loadProjects(): ProjectConfig[] {
     projectId: string;
     projectType: string;
     enabled?: boolean;
-    repos?: Array<{ path: string; remote?: string }>;
+    repos?: Array<{ path: string; remote?: string; branch?: string }>;
     config?: Record<string, unknown>;
   }>;
 
@@ -162,6 +164,9 @@ export function loadProjects(): ProjectConfig[] {
       name: basename(r.path),
       path: r.path,
       remote: r.remote ?? inferRemote(r.path),
+      // Issue #28: baseline branch passed through; the dispatcher applies the
+      // "main" default where it's consumed (createWorktree).
+      branch: r.branch,
     }));
 
     // Duplicate basenames within a project collide on the target_repo key.

@@ -45,6 +45,27 @@ describe("loadProjects()", () => {
     expect(projects[0].repos[0].remote).toBe("owner/my-repo");
   });
 
+  // Issue #28: repos[].branch (baseline branch) is passed through verbatim; the
+  // consumer applies the "main" default, so unset stays undefined here.
+  it("passes repos[].branch through (undefined when omitted)", () => {
+    fs.writeFileSync(
+      tmpProjects,
+      JSON.stringify([
+        {
+          projectId: "owner/1",
+          projectType: "github",
+          repos: [
+            { path: "/x/repo-default" },
+            { path: "/x/repo-master", branch: "master" },
+          ],
+        },
+      ]),
+    );
+    const repos = loadProjects()[0].repos;
+    expect(repos[0].branch).toBeUndefined();
+    expect(repos[1].branch).toBe("master");
+  });
+
   it("defaults enabled to true when omitted", () => {
     fs.writeFileSync(
       tmpProjects,
