@@ -108,10 +108,28 @@ talos-loop 通过 **Issue Source 插件** 与具体 issue 源解耦。核心只�
 
 **标准状态**：核心与插件之间只有三个抽象状态，插件在它们与自身机制（看板列、Jira 转换……）之间双向翻译。`queued(Ready)` → `processing(In progress)` → `done(In review)`；`done` 对应 GitHub 的 "In review" 列，不是终态 "Done"。
 
-**`IssueSourcePlugin` 接口**（per-issue 方法都带 `targetRepo`，因为一个 project 可跨多仓库）：
+**`IssueSourcePlugin` 接口**（per-issue 方法都带 `targetRepo`，因为一个 project 可跨多仓库）。**必填**方法：
 
-- **必填**：`name`、`init`、`discover`（返回可派发 issue）、`listBoard`（列出整张看板，失败需抛错）、`getStatus`（派发前新鲜度复查）、`transition`（按状态机迁移）、`test`（连通性自检）、`skip`（打标记 + 评论 + 回 `queued`）。
-- **可选**：`capabilities`（自描述 actions）、`submitPr`（建 PR 返回 URL）、`onComment`、`listUnresolvedThreads` / `resolveThread`（PR 评审线程）、`checkQuota`（限流配额探测）。
+| 方法 | 职责 |
+|------|------|
+| `name` | 插件显示名 / 别名（日志、UI 使用） |
+| `init(ctx)` | 初始化（如创建 `skipped` 标签、缓存 per-project 元数据） |
+| `discover(ctx)` | 返回可派发的 issue（每个携带标准 `state`，恒为 `queued`） |
+| `listBoard(ctx)` | 列出看板上全部 item（含列名），用于 dashboard 展示；读取失败需抛错 |
+| `getStatus(ctx, sourceId, targetRepo)` | 单个 issue 当前状态（派发前新鲜度复查）；不可派发时返回 `null` |
+| `transition(ctx, sourceId, {from,to}, targetRepo)` | 按状态机迁移 issue（核心只发起合法迁移） |
+| `test(ctx)` | 连通性自检 |
+| `skip(ctx, sourceId, targetRepo, reason)` | agent 主动放弃：打 skip 标记 + 评论 + 回 `queued`（阻止再次触发） |
+
+**可选**方法（声明即支持）：
+
+| 方法 | 职责 |
+|------|------|
+| `capabilities?()` | 自描述暴露给 agent 的 actions，驱动 Prompt 渲染（见下） |
+| `submitPr?(ctx, sourceId, branch, targetRepo)` | 创建 PR 并返回其 URL（单一职责，不做看板 / DB 副作用） |
+| `onComment?(ctx, sourceId, comment, targetRepo)` | 在 issue 留言 |
+| `listUnresolvedThreads?` / `resolveThread?` | 枚举 / 解决 PR 评审线程（驱动 review-fix 流程） |
+| `checkQuota?(ctx)` | 探测限流配额（如 GraphQL 预算），供轮询方保守跳过 |
 
 完整类型定义见 [`server/src/types/plugin.ts`](./server/src/types/plugin.ts)。
 
