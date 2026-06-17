@@ -56,7 +56,7 @@ cp projects.example.json  projects.json   # Projects + 仓库
 - `repos[].branch` 为该仓库的**基线分支**（feat 分支从 `origin/<branch>` 切出，也是 PR 的目标分支），缺省 `main`；不同仓库使用 `master`/`develop` 等时需显式声明，否则 PR 可能创建失败。
 - 看板上的 issue 若其仓库未在 `repos[]` 声明（配置漂移），会被告警并跳过。
 
-**`config.json`**（运行参数，完整字段见模板）：常用项为 `port`、`pollInterval`、`maxParallel`、`claudeTimeout`，以及 `serverBaseUrl`（agent 回调本地 actions 接口的基址，默认 `http://127.0.0.1:${port}`）。
+**`config.json`**（运行参数，完整字段见模板）：常用项为 `port`、`pollInterval`、`maxParallel`、`claudeTimeout`，以及 `serverBaseUrl`（agent 回调本地 actions 接口的基址，默认 `http://127.0.0.1:${port}`）、`reviewDispatchEvery`（评审修复扫描每 N 个派发周期跑一次，默认 15）。
 
 ### 2. 为 Issue 设置 `ready-for-agent` 标签
 
@@ -70,10 +70,11 @@ cp projects.example.json  projects.json   # Projects + 仓库
 
 ```
 Ready + ready-for-agent ──派发──► In progress ──提交 PR──► In review ──PR 合并──► Done
-                                    │
-                       exit 0 无 PR / 异常退出
-                                    │
-                       session 标记 done/failed，看板保持 In progress（人工介入 / 重试）
+                                    │                          │
+                       exit 0 无 PR / 异常退出             │  有未解决评审线程时
+                                    │                         └─► 触发 review-fix 自循环 ↺
+                       session 标记 done/failed，              （详见「评审修复循环」）
+                       看板保持 In progress（人工介入 / 重试）
 
                  skip action ──► 加 skipped 标签 + 回 Ready（移除标签前不再触发）
 ```
@@ -84,11 +85,22 @@ Ready + ready-for-agent ──派发──► In progress ──提交 PR──�
 |------|------|
 | 进入 `Ready` + 带标签 | 进入派发队列，agent 开始时在 issue 评论 `🤖 Agent has started...` |
 | agent 提交 PR（exit 0 + pr_url） | 推进到 `In review`，在 issue 评论 `✅ Agent completed. PR: <url>` |
-| `In review` 后 | PR 合并由 GitHub 自带项目自动化推进到终态 `Done`，talos-loop 不参与 |
+| `In review` + 有未解决评审线程 | 慢节奏派发 **review-fix 会话**：agent 修复代码、推回原 PR 分支、`resolve-thread`，循环至全部解决；看板不迁移（详见「评审修复循环」） |
+| `In review` 的 PR 被合并 | 由 GitHub 自带项目自动化推进到终态 `Done`，talos-loop 不参与 |
 | agent 主动 `skip` | 打 `skipped` 标签 + 评论原因 + 回 `Ready` |
 | 进程崩溃 / 非零退出 | session 标记 `failed`，issue **留在 In progress** 等待人工介入（不自动回退、不自动重试） |
 
 > ⚠️ 命名陷阱：`In review` 对应核心内部的 `done` 状态（PR 已创建），不是终态 `Done`。
+
+#### 评审修复循环（review-fix）
+
+PR 进入 `In review` 后并非被动等待合并。talos-loop 会**按慢节奏**（每 `reviewDispatchEvery` 个派发周期，默认 15 ≈ 15 分钟）扫描那些看板仍为 `In review`、且插件能检视评审的 PR；一旦发现**未解决的评审线程**，就派发一个 review-fix 会话：
+
+- agent 拉取 PR 上所有未解决线程 → 逐个修复 → 推送到**原 PR 分支**（不新建分支，保持 PR 历史连续）→ 调用 `resolve-thread` 标记解决 → 复查（含评审者在修复期间新提出的线程）→ 循环至全部解决。
+- review 会话**绝不迁移看板、不发完成评论**：issue 始终停在 `In review`，直到 PR 合并进 `Done`。同一 issue 同一时刻最多一个 review 会话。
+- 失败（崩溃 / 非零退出）不回退看板，下一个 review 周期自动重试。
+
+> ⚠️ **如何触发评审修复**：触发源是 GitHub 的 **review thread**——即对 PR 代码行的 **inline 评审评论**（在 PR 的 "Files changed" 里点行号 `+` 发起的评论，或带 "Request changes" 的评审）。**PR 底部的普通评论不会创建 review thread，也不会触发 review-fix。** 评审者按正常方式留 inline 评论即可，agent 会在下个节奏点自动接手。
 
 ### 运行与 Dashboard
 

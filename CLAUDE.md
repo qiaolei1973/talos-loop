@@ -47,10 +47,11 @@ Issue (Ready + ready-for-agent + 无 skipped)
 
 ```
 queued(Ready) ──派发──► processing(In progress) ──exit 0 + pr_url──► done(In review) ──PR 合并──► Done
-                                                    │
-                                       exit 0 无 pr_url / 异常退出
-                                                    │
-                                       session 标记 done/failed，看板保持 In progress（人工介入 / 重试）
+                                                    │                        │  ↺ review-fix
+                                       exit 0 无 pr_url / 异常退出      自循环（未解决评审线程）
+                                                    │                  → 修复 → resolve-thread
+                                       session 标记 done/failed，
+                                       看板保持 In progress（人工介入 / 重试）
 
                        skip action ──► 加 skipped 标签 + 回 queued（block，直到人工移除标签）
 ```
@@ -86,6 +87,15 @@ loader 按 `projectType` 缓存单例插件。一个插件实例可能服务于�
 
 ### 7. 配额探测
 核心与派发的 agent 共享同一个 GitHub token（及其 GraphQL 预算）。轮询前插件可选地 `checkQuota()` 探测剩余额度，额度低时保守跳过本次调用，避免硬撞 rate limit。探测失败时回退为「照常轮询」而非阻塞。
+
+### 8. review-fix 是 done 状态上的常驻 worker
+`done`（In review）不是被动等待合并的死状态：dispatcher 在慢节奏计数器（`reviewDispatchEvery`，每 N 个派发周期）上扫描所有「有 PR 且看板仍 In review」的 issue，经插件 `listUnresolvedThreads(prUrl)` 探测 GitHub 评审线程，发现未解决线程即派发 review-fix 会话。agent 自驱动「拉线程 → 修复 → 推回原分支 → `resolve-thread` → 复查」循环，直到全解决或 PR 合并。
+
+三个关键约束：
+
+- **不碰看板**：review 会话不发 `transition`、不发完成评论，issue 恒 In review。它与 coding 会话通过 session `type` 区分，在 `checkRunningSessions` 里**先于**按 `pr_url` 分类的成功路径分流（review 也带 `pr_url`，否则会被误判为 coding 成功而推进看板）。
+- **失败隐式重试**：review 会话崩溃 / 非零退出不回退看板，下一个节奏点重新探测，未解决线程自然再次触发——所以 review 阶段天然重试，无需像 coding 那样的显式 retry 入口。
+- **线程真相源是 GitHub review thread**：触发与终止都以 GitHub 原生 `reviewThreads` 的 `isResolved` 为准（`resolve-thread` action 直接调用 `resolveReviewThread` mutation）。普通 PR 评论不产生 review thread、不触发——文档需据此澄清，避免用户误以为任意评论即可。
 
 ## 模块职责（`server/src/`）
 
