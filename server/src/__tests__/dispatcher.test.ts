@@ -11,6 +11,8 @@ import type { Issue } from "../db/index.js";
 const mockWriteFileSync = fs.writeFileSync as unknown as ReturnType<typeof vi.fn>;
 const mockUpdateSessionStatus = db.updateSessionStatus as unknown as ReturnType<typeof vi.fn>;
 const mockCreateSession = db.createSession as unknown as ReturnType<typeof vi.fn>;
+// Issue #30: the dispatcher persists the captured claude session id each cycle.
+const mockSetSessionClaudeId = db.setSessionClaudeId as unknown as ReturnType<typeof vi.fn>;
 // Issue #13: workflow status is no longer persisted — dispatch/completion/skip
 // only optimistically flip the in-memory board snapshot.
 const mockSetBoardStatus = boardSnapshot.setBoardStatus as unknown as ReturnType<typeof vi.fn>;
@@ -33,6 +35,13 @@ let tmuxAlive: Set<string> = new Set();
 // Issue #20: exit code read from the launcher's sentinel file per session name.
 // `undefined` (unset) models a missing sentinel (unclean termination).
 let exitCodeBySession: Record<string, number | undefined> = {};
+// Issue #30: captured claude session id read from the formatter's sidecar per
+// session name. `undefined` models "not written yet / already consumed".
+let readSessionIdBySession: Record<string, string | undefined> = {};
+// Issue #30: wall-clock watchdog limit (seconds). Defaults huge so existing
+// tests — whose running sessions have no started_at (→ not overdue) — are
+// unaffected; the watchdog test sets it small.
+let claudeTimeout = 99_999;
 // Issue #19: review-dispatch state.
 // Coding sessions with a PR that dispatchReview() inspects.
 let codingSessionsWithPr: any[] = [];
@@ -85,7 +94,7 @@ const mockPlugin = {
 };
 
 vi.mock("../config.js", () => ({
-  loadConfig: () => ({ maxParallel: 1, serverBaseUrl: "http://127.0.0.1:3100", reviewDispatchEvery, keepSessionOnSuccess }),
+  loadConfig: () => ({ maxParallel: 1, serverBaseUrl: "http://127.0.0.1:3100", reviewDispatchEvery, keepSessionOnSuccess, claudeTimeout }),
   buildProjectContextForIssue: () => ({
     config: {},
     logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -102,6 +111,7 @@ vi.mock("../db/index.js", () => ({
   getRunningReviewIssueIds: () => new Set(runningReviewIssueIds),
   createSession: vi.fn(),
   updateSessionStatus: vi.fn(),
+  setSessionClaudeId: vi.fn(),
 }));
 
 vi.mock("../services/boardSnapshot.js", () => ({
@@ -125,7 +135,13 @@ vi.mock("../services/tmux.js", () => ({
   isAlive: (session: string) => tmuxAlive.has(session),
   exitCodePath: (session: string) => `/tmp/tl-exit-${session}.txt`,
   readExitCode: (session: string) => exitCodeBySession[session],
-  killSession: vi.fn(),
+  // issue #30: the session-id sidecar the formatter writes.
+  sessionIdPath: (session: string) => `/tmp/tl-session-${session}.txt`,
+  readSessionId: (session: string) => readSessionIdBySession[session],
+  // issue #30: a real kill detaches the session; mirror that so a watchdog-killed
+  // session reads as dead and falls through to classification. Recorded like any
+  // vi.fn so existing kill assertions still hold.
+  killSession: vi.fn((session: string) => { tmuxAlive.delete(session); }),
 }));
 
 // Issue #21: stub the worktree service so dispatch never runs real git. The
@@ -344,7 +360,7 @@ describe("launcher script writes the exit-code sentinel (issue #20)", () => {
     vi.clearAllMocks();
   });
 
-  it("echoes $? to the sentinel path right after the agent exits", async () => {
+  it("launches claude in -p print mode, streams through the formatter, and writes claude's exit via PIPESTATUS (issue #30)", async () => {
     statusBySourceId = { "1": "queued" };
     const candidates: PollResult[] = [
       {
@@ -364,13 +380,32 @@ describe("launcher script writes the exit-code sentinel (issue #20)", () => {
     expect(scriptCall, "launcher script should have been written").toBeDefined();
     const script = String((scriptCall as any[])[1]);
 
-    // The session name for github:talos-loop:1 → the sentinel path the reader expects.
     const session = "tl-github-talos-loop-1";
-    // `$?` is captured immediately after `claude` so it reflects the agent's exit.
-    expect(script).toContain(`echo $? > "/tmp/tl-exit-${session}.txt"`);
-    // The sentinel write must come AFTER the claude invocation and BEFORE cleanup.
+
+    // -p print mode (deterministic exit) — NOT a bare -p "" empty string.
+    expect(script).toContain(`claude -p "$(cat `);
+    expect(script).not.toMatch(/claude -p ""/);
+    // The three stream-mode flags.
+    expect(script).toContain("--dangerously-skip-permissions");
+    expect(script).toContain("--output-format=stream-json");
+    expect(script).toContain("--verbose");
+    // stderr merged in, teed to a raw .jsonl, piped through the formatter node script.
+    expect(script).toContain("2>&1");
+    expect(script).toContain(`| tee "/tmp/tl-stream-${session}.jsonl"`);
+    expect(script).toContain("| node ");
+    expect(script).toContain("stream-formatter.cjs");
+    // The formatter gets the session-id sidecar path via env.
+    expect(script).toContain(`export TL_SESSION_FILE="/tmp/tl-session-${session}.txt"`);
+
+    // Exit sentinel uses PIPESTATUS[0] (claude's exit), NOT $? (which would be node's).
+    expect(script).toContain(`echo \${PIPESTATUS[0]} > "/tmp/tl-exit-${session}.txt"`);
+    expect(script).not.toMatch(/echo \$\? >/);
+    // No pipefail — it would pollute the sentinel with downstream exit codes.
+    expect(script).not.toContain("pipefail");
+
+    // Ordering: claude → sentinel → cleanup.
     const claudeLine = script.indexOf("claude ");
-    const echoLine = script.indexOf("echo $?");
+    const echoLine = script.indexOf("echo ${PIPESTATUS[0]}");
     const rmLine = script.indexOf("rm -f");
     expect(claudeLine).toBeGreaterThanOrEqual(0);
     expect(echoLine).toBeGreaterThan(claudeLine);
@@ -974,6 +1009,102 @@ describe("checkRunningSessions() worktree lifecycle (issue #21)", () => {
 
     // Success path safety-net removes the worktree (issue #21).
     expect(mockRemoveWorktree).toHaveBeenCalledWith("/tmp/talos-loop", WT);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #30: capture claude's session id each cycle + wall-clock watchdog
+// ---------------------------------------------------------------------------
+
+describe("checkRunningSessions() persists the captured claude session id (issue #30)", () => {
+  beforeEach(() => {
+    statusBySourceId = {};
+    runningSessions = [];
+    tmuxOutput = {};
+    tmuxAlive = new Set();
+    exitCodeBySession = {};
+    readSessionIdBySession = {};
+    claudeTimeout = 99_999;
+    codingSessionsWithPr = [];
+    runningReviewIssueIds = new Set();
+    boardStatusBySourceId = {};
+    unresolvedThreadsByPr = {};
+    reviewDispatchEvery = 15;
+    keepSessionOnSuccess = false;
+    vi.clearAllMocks();
+  });
+
+  it("writes the sidecar id to the DB row mid-run (available before completion)", async () => {
+    const session = "tl-github-talos-loop-9";
+    // Session still alive: it must NOT be classified — but the id is captured.
+    tmuxAlive = new Set([session]);
+    readSessionIdBySession[session] = "claude-session-abc";
+    runningSessions = [makeRunningSession(session, "9", null)];
+
+    const { checkRunningSessions } = await import("../services/dispatcher.js");
+    const result = await checkRunningSessions();
+
+    // Alive → no completion classification…
+    expect(result).toEqual({ completed: 0, failed: 0 });
+    expect(mockUpdateSessionStatus).not.toHaveBeenCalled();
+    // …but the id was persisted this cycle (row id 100 from makeRunningSession).
+    expect(mockSetSessionClaudeId).toHaveBeenCalledWith(100, "claude-session-abc");
+  });
+
+  it("does not crash and skips the write when the sidecar is absent", async () => {
+    const session = "tl-github-talos-loop-9";
+    tmuxAlive = new Set([session]);
+    // readSessionIdBySession[session] deliberately unset.
+    runningSessions = [makeRunningSession(session, "9", null)];
+
+    const { checkRunningSessions } = await import("../services/dispatcher.js");
+    const result = await checkRunningSessions();
+
+    expect(result).toEqual({ completed: 0, failed: 0 });
+    expect(mockSetSessionClaudeId).not.toHaveBeenCalled();
+  });
+});
+
+describe("checkRunningSessions() wall-clock watchdog (issue #30)", () => {
+  beforeEach(() => {
+    statusBySourceId = {};
+    runningSessions = [];
+    tmuxOutput = {};
+    tmuxAlive = new Set();
+    exitCodeBySession = {};
+    readSessionIdBySession = {};
+    // A tiny limit so a session with an old started_at trips the kill.
+    claudeTimeout = 1;
+    codingSessionsWithPr = [];
+    runningReviewIssueIds = new Set();
+    boardStatusBySourceId = {};
+    unresolvedThreadsByPr = {};
+    reviewDispatchEvery = 15;
+    keepSessionOnSuccess = false;
+    vi.clearAllMocks();
+  });
+
+  it("kills an alive session past the limit → missing sentinel → failed", async () => {
+    const session = "tl-github-talos-loop-9";
+    tmuxAlive = new Set([session]); // alive (hung)…
+    // …and started long ago, past the 1s limit. ISO-ish UTC that Date.parse handles.
+    runningSessions = [{
+      ...makeRunningSession(session, "9", null),
+      started_at: "2020-01-01 00:00:00",
+    }];
+
+    const { checkRunningSessions } = await import("../services/dispatcher.js");
+    const result = await checkRunningSessions();
+
+    // The watchdog force-killed the hung session…
+    expect(mockKillSession).toHaveBeenCalledWith(session);
+    // …which (post-kill) is no longer alive → no exit sentinel → classified failed.
+    expect(result).toEqual({ completed: 0, failed: 1 });
+    expect(mockUpdateSessionStatus).toHaveBeenCalledWith(
+      100, "failed", undefined, expect.stringContaining("no exit-code sentinel"),
+    );
+    // The board is left untouched (same as any infra failure).
+    expect(mockPlugin.transition).not.toHaveBeenCalled();
   });
 });
 

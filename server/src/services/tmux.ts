@@ -13,6 +13,12 @@ const SESSION_PREFIX = "tl";
  * (issue #20: session status reflects exit state, not task outcome).
  */
 const EXIT_CODE_PREFIX = "tl-exit";
+/**
+ * Prefix for the Claude session-id sidecar the stream formatter writes (issue
+ * #30). Gives `/tmp/tl-session-<tmux-session>.txt`. The formatter writes claude's
+ * `-p` session id here at the stream's init event; the dispatcher reads it.
+ */
+const SESSION_ID_PREFIX = "tl-session";
 
 /** Check that tmux is available */
 export function checkTmux(): void {
@@ -118,6 +124,39 @@ export function readExitCode(session: string): number | undefined {
     // sentinel already absent — nothing to clean up
   }
   return code;
+}
+
+/**
+ * Path to the Claude session-id sidecar the stream formatter writes (issue #30).
+ * Shared by the formatter (which writes it via the `TL_SESSION_FILE` env the
+ * launcher sets) and {@link readSessionId} (which consumes it) so the two agree.
+ */
+export function sessionIdPath(session: string): string {
+  return path.join(os.tmpdir(), `${SESSION_ID_PREFIX}-${session}.txt`);
+}
+
+/**
+ * Read the captured Claude session id from a session's sidecar, then delete it
+ * (single-use, like {@link readExitCode}). Returns the id, or `undefined` when
+ * the sidecar is absent — e.g. the formatter hasn't seen the init event yet, or
+ * the run never produced one. The dispatcher persists the id the first cycle it
+ * appears, so an absent sidecar on a later cycle simply means "already captured".
+ */
+export function readSessionId(session: string): string | undefined {
+  const file = sessionIdPath(session);
+  let id: string | undefined;
+  try {
+    const raw = fs.readFileSync(file, "utf-8").trim();
+    id = raw.length > 0 ? raw : undefined;
+  } catch {
+    id = undefined;
+  }
+  try {
+    fs.unlinkSync(file);
+  } catch {
+    // sidecar already absent — nothing to clean up
+  }
+  return id;
 }
 
 /** List all talos-loop managed sessions */

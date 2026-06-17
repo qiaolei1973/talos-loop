@@ -73,6 +73,30 @@ export async function runPollCycle(): Promise<{ pollResults: Awaited<ReturnType<
   return { pollResults, dispatchResult };
 }
 
+/**
+ * Assemble the operator-run resume command for a session (issue #30). `claude -r`
+ * is interactive and owns a TTY, so the server cannot run it — it returns a
+ * filled-in command for the operator to paste into their own terminal.
+ *
+ *   git -C <repo_path> worktree add <worktree_path> <branch> 2>/dev/null; cd <worktree_path> && claude -r <claude_session_id>
+ *
+ * The `worktree add` is idempotent: a failed session's worktree still exists → the
+ * add errors (silenced by 2>/dev/null) and we just cd+resume; a done session's
+ * worktree was cleaned up → the add recreates it at the same path on the same
+ * branch, then we resume. Requires the feat branch to still exist (it does while
+ * the PR is open). The command deliberately omits --dangerously-skip-permissions
+ * — a human resuming keeps the permission prompts.
+ */
+export function buildResumeCommand(parts: {
+  repoPath: string;
+  worktreePath: string;
+  branch: string;
+  claudeSessionId: string;
+}): string {
+  const { repoPath, worktreePath, branch, claudeSessionId } = parts;
+  return `git -C ${repoPath} worktree add ${worktreePath} ${branch} 2>/dev/null; cd ${worktreePath} && claude -r ${claudeSessionId}`;
+}
+
 export async function registerApiRoutes(app: FastifyInstance): Promise<void> {
   // Global status
   app.get("/api/status", async () => {
@@ -168,6 +192,48 @@ export async function registerApiRoutes(app: FastifyInstance): Promise<void> {
       updateSessionStatus(sessionId, "killed", undefined, "Killed via dashboard");
     }
     return { success: true, status: wasRunning ? "killed" : session.status };
+  });
+
+  // issue #30: assemble a `claude -r <id>` resume command for an operator to run
+  // in their own terminal. The server can't run it (interactive / TTY), so it
+  // fills in the authoritative values — repo path (from the project's repo), the
+  // session's worktree+branch, and the captured claude session id — and the
+  // dashboard's "copy resume command" button hands the string to the operator.
+  // Pre-issue-#30 sessions (no captured id) and rows missing worktree/branch are
+  // reported as not resumable rather than emitting a malformed command.
+  app.get("/api/sessions/:id/resume-command", async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const session = getSessionById(parseInt(id, 10));
+    if (!session) {
+      reply.code(404);
+      return { error: "Session not found" };
+    }
+    if (!session.claude_session_id) {
+      reply.code(409);
+      return { error: "Session has no captured claude session id" };
+    }
+    if (!session.worktree_path || !session.branch) {
+      reply.code(409);
+      return { error: "Session is missing worktree/branch — cannot rebuild a worktree to resume into" };
+    }
+    const issue = getIssueById(session.issue_id);
+    if (!issue) {
+      reply.code(404);
+      return { error: "Issue not found" };
+    }
+    const repo = getProjectById(issue.project_id)?.repos.find((r) => r.name === issue.target_repo);
+    if (!repo) {
+      reply.code(404);
+      return { error: `Repo "${issue.target_repo}" not found` };
+    }
+    return {
+      command: buildResumeCommand({
+        repoPath: repo.path,
+        worktreePath: session.worktree_path,
+        branch: session.branch,
+        claudeSessionId: session.claude_session_id,
+      }),
+    };
   });
 
   // Unified agent-signal route. `:action` dispatches to the matching plugin
