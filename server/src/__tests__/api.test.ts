@@ -1,10 +1,14 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import Fastify from "fastify";
+import * as db from "../db/index.js";
+import * as tmux from "../services/tmux.js";
 import type { Issue, Session } from "../db/index.js";
 
 // --- per-test controllable state (read lazily inside the mocked modules) ---
 let issuesState: Issue[] = [];
 let sessionsByIssue: Record<number, Session[]> = {};
+/** issue #26: session rows looked up by id for the kill endpoint. */
+let sessionById: Record<number, Session> = {};
 /** board snapshot: `${projectId}/${sourceId}` → raw board column name. */
 let boardByIssue: Record<string, string | undefined> = {};
 let aliveSessionNames: Set<string> = new Set();
@@ -25,6 +29,7 @@ vi.mock("../config.js", () => ({
 vi.mock("../db/index.js", () => ({
   getAllIssues: () => issuesState,
   getSessionsByIssue: (id: number) => sessionsByIssue[id] ?? [],
+  getSessionById: (id: number) => sessionById[id],
   getIssuesByTargetRepo: () => [],
   getIssueById: () => undefined,
   getIssue: () => undefined,
@@ -32,6 +37,7 @@ vi.mock("../db/index.js", () => ({
   markSessionSkipped: vi.fn(),
   setSessionPrUrl: vi.fn(),
   setSessionBranch: vi.fn(),
+  updateSessionStatus: vi.fn(),
 }));
 
 vi.mock("../services/boardSnapshot.js", () => ({
@@ -43,8 +49,10 @@ vi.mock("../services/boardSnapshot.js", () => ({
 
 // displayState.ts imports tmux directly; stubbing isAlive here drives both the
 // "live session → processing" precedence and the attach-target derivation.
+// Issue #26: killSession is exercised by the kill endpoint.
 vi.mock("../services/tmux.js", () => ({
   isAlive: (name: string) => aliveSessionNames.has(name),
+  killSession: vi.fn(),
 }));
 
 vi.mock("../plugins/loader.js", () => ({
@@ -120,6 +128,7 @@ describe("GET /api/issues — derived display status (issue #13)", () => {
   beforeEach(async () => {
     issuesState = [];
     sessionsByIssue = {};
+    sessionById = {};
     boardByIssue = {};
     aliveSessionNames = new Set();
     vi.clearAllMocks();
@@ -232,6 +241,63 @@ describe("GET /api/issues — derived display status (issue #13)", () => {
     expect((byId.get(3) as any).isLive).toBe(true); // live review session
     // …and the live review session does NOT flip the stage badge off "In review".
     expect(body[0].status).toBe("done");
+  });
+});
+
+/**
+ * Issue #26: POST /api/sessions/:id/kill tears down a session's tmux window and
+ * marks the row `killed`. The worktree is left in place (a killed coding session
+ * stays retryable), and a 404 is returned for an unknown id.
+ */
+describe("POST /api/sessions/:id/kill — dashboard kill (issue #26)", () => {
+  let app: Awaited<ReturnType<typeof buildApp>>;
+
+  beforeEach(async () => {
+    issuesState = [];
+    sessionsByIssue = {};
+    sessionById = {};
+    boardByIssue = {};
+    aliveSessionNames = new Set();
+    vi.clearAllMocks();
+    app = await buildApp();
+  });
+
+  afterEach(async () => {
+    await app.close();
+  });
+
+  it("kills the tmux window and marks a running session killed", async () => {
+    sessionById[1] = makeSession({ id: 1, status: "running", tmux_session: "tl-live-1" });
+
+    const res = await app.inject({ method: "POST", url: "/api/sessions/1/kill" });
+
+    expect(res.statusCode).toBe(200);
+    expect(await res.json()).toEqual({ success: true, status: "killed" });
+    // The tmux window is torn down…
+    expect(tmux.killSession).toHaveBeenCalledWith("tl-live-1");
+    // …and the row is marked killed (terminal, but retryable).
+    expect(db.updateSessionStatus).toHaveBeenCalledWith(1, "killed", undefined, "Killed via dashboard");
+  });
+
+  it("kills the tmux window but does NOT re-mark an already-terminal session", async () => {
+    // A done session: killing (e.g. to clear a lingering window) must not rewrite
+    // its status or clobber its stored pr_url.
+    sessionById[2] = makeSession({ id: 2, status: "done", tmux_session: "tl-done-2", pr_url: "https://x/pull/1" });
+
+    const res = await app.inject({ method: "POST", url: "/api/sessions/2/kill" });
+
+    expect(res.statusCode).toBe(200);
+    expect(await res.json()).toEqual({ success: true, status: "done" });
+    expect(tmux.killSession).toHaveBeenCalledWith("tl-done-2");
+    expect(db.updateSessionStatus).not.toHaveBeenCalled();
+  });
+
+  it("returns 404 for an unknown session id", async () => {
+    const res = await app.inject({ method: "POST", url: "/api/sessions/999/kill" });
+
+    expect(res.statusCode).toBe(404);
+    expect(tmux.killSession).not.toHaveBeenCalled();
+    expect(db.updateSessionStatus).not.toHaveBeenCalled();
   });
 });
 

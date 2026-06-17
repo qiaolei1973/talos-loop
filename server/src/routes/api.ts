@@ -4,12 +4,14 @@ import {
   getAllIssues,
   getIssuesByTargetRepo,
   getSessionsByIssue,
+  getSessionById,
   getIssueById,
   getIssue,
   getRunningSessions,
   markSessionSkipped,
   setSessionPrUrl,
   setSessionBranch,
+  updateSessionStatus,
   getRetryableSession,
   type Issue,
 } from "../db/index.js";
@@ -18,6 +20,7 @@ import { dispatch, dispatchRetry } from "../services/dispatcher.js";
 import { resolvePlugin, getPluginName } from "../plugins/loader.js";
 import { getBoardStatus, setBoardStatus } from "../services/boardSnapshot.js";
 import { deriveDisplayState, liveSessionName, isSessionLive } from "../services/displayState.js";
+import * as tmux from "../services/tmux.js";
 import { createLogger } from "../services/logger.js";
 
 const log = createLogger("api");
@@ -143,6 +146,28 @@ export async function registerApiRoutes(app: FastifyInstance): Promise<void> {
   app.get("/api/issues/:id/sessions", async (request) => {
     const { id } = request.params as { id: string };
     return getSessionsByIssue(parseInt(id, 10));
+  });
+
+  // issue #26: manually tear down a session's tmux window from the dashboard.
+  // Targets a session by its DB id (an issue may have several). Kills the tmux
+  // process (a no-op if already dead — e.g. a zombie running row) and marks the
+  // row `killed` so it reads as terminal and checkRunningSessions does not later
+  // re-classify the now-dead process. The worktree is deliberately LEFT in place
+  // (mirrors the failed-session policy): a killed coding session stays retryable.
+  app.post("/api/sessions/:id/kill", async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const sessionId = parseInt(id, 10);
+    const session = getSessionById(sessionId);
+    if (!session) {
+      reply.code(404);
+      return { error: "Session not found" };
+    }
+    tmux.killSession(session.tmux_session);
+    const wasRunning = session.status === "running";
+    if (wasRunning) {
+      updateSessionStatus(sessionId, "killed", undefined, "Killed via dashboard");
+    }
+    return { success: true, status: wasRunning ? "killed" : session.status };
   });
 
   // Unified agent-signal route. `:action` dispatches to the matching plugin

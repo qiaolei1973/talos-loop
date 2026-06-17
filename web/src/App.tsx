@@ -12,6 +12,7 @@ import {
   AlertTriangle,
   SkipForward,
   RotateCcw,
+  Power,
 } from "lucide-react";
 
 interface Issue {
@@ -121,6 +122,7 @@ function SessionChip({ session }: { session: Session }) {
         </span>
         <span className="text-[10px] font-medium text-green-700">{typeLabel}</span>
         <AttachButton session={session.tmux_session} />
+        <KillButton sessionId={session.id} />
       </span>
     );
   }
@@ -134,6 +136,19 @@ function SessionChip({ session }: { session: Session }) {
       </span>
     );
   }
+  // issue #26: torn down from the dashboard — terminal, but distinct from an
+  // infra failure. The worktree is preserved, so a killed coding session can be
+  // retried from its partial work (the Retry button appears in the Actions cell).
+  if (session.status === "killed") {
+    return (
+      <span
+        className="inline-flex items-center gap-1 rounded bg-gray-200 px-1.5 py-0.5 text-[10px] font-medium text-gray-600"
+        title={session.error ?? "Killed manually via the dashboard"}
+      >
+        <Power className="h-3 w-3" /> {typeLabel} · killed
+      </span>
+    );
+  }
   if (session.status === "failed" || session.error) {
     return (
       <span
@@ -144,7 +159,20 @@ function SessionChip({ session }: { session: Session }) {
       </span>
     );
   }
-  // Neutral completed indicator (done) — or a running-but-not-live (zombie) row.
+  // Running-but-not-live: the DB row still reads "running" but tmux isn't
+  // responding — a stuck/zombie process. Offer a kill to clear it.
+  if (session.status === "running") {
+    return (
+      <span
+        className="inline-flex items-center gap-1 rounded bg-yellow-50 px-1.5 py-0.5 text-[10px] font-medium text-yellow-700"
+        title="Session appears stuck (tmux not responding) — kill to clear it"
+      >
+        <Clock className="h-3 w-3" /> {typeLabel} · stuck
+        <KillButton sessionId={session.id} />
+      </span>
+    );
+  }
+  // Neutral completed indicator (done).
   return (
     <span className="inline-flex items-center gap-1 rounded bg-gray-100 px-1.5 py-0.5 text-[10px] font-medium text-gray-600" title={`${typeLabel} session · ${timeAgo(session.started_at)}`}>
       <CheckCircle className="h-3 w-3 text-gray-400" /> {typeLabel} · {timeAgo(session.started_at)}
@@ -189,6 +217,47 @@ function AttachButton({ session }: { session: string }) {
     >
       {copied ? <Check className="h-3 w-3 text-green-600" /> : <Terminal className="h-3 w-3" />}
       {copied ? "copied!" : "attach"}
+    </button>
+  );
+}
+
+/**
+ * Kill a session's tmux window from the dashboard (issue #26). Tears down the
+ * tmux process and marks the row `killed`; the backend leaves the worktree in
+ * place so a killed coding session stays retryable. The endpoint is keyed by
+ * the session DB id, so it targets exactly the row the button sits on.
+ */
+function KillButton({ sessionId }: { sessionId: number }) {
+  const queryClient = useQueryClient();
+  const [busy, setBusy] = useState(false);
+
+  const handleKill = async () => {
+    if (!window.confirm("Kill this session? Its tmux window will be destroyed (the worktree is kept).")) return;
+    setBusy(true);
+    try {
+      const res = await fetch(`${API}/api/sessions/${sessionId}/kill`, { method: "POST" });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        alert(`终止失败：${body.error ?? res.status}`);
+      } else {
+        // Refresh so the row re-renders as a `killed` chip (and, for a failed
+        // coding session, surfaces the Retry button).
+        await queryClient.invalidateQueries({ queryKey: ["issues"] });
+      }
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <button
+      onClick={handleKill}
+      disabled={busy}
+      className="mr-2 inline-flex items-center gap-1 rounded bg-red-100 px-2 py-0.5 text-xs font-medium text-red-700 hover:bg-red-200 disabled:opacity-50 cursor-pointer"
+      title="Kill the tmux session"
+    >
+      {busy ? <Loader2 className="h-3 w-3 animate-spin" /> : <Power className="h-3 w-3" />}
+      {busy ? "killing" : "kill"}
     </button>
   );
 }
@@ -376,10 +445,12 @@ export default function App() {
                       // issue #21: retry is offered when the LATEST session is a
                       // failed coding session whose worktree is preserved on disk.
                       // sessions[] is newest-first (API returns started_at DESC).
+                      // issue #26: a `killed` session is retryable too — its
+                      // worktree was left in place, so retry continues that work.
                       const latest = sessions[0];
                       const retryable =
                         !!latest &&
-                        latest.status === "failed" &&
+                        (latest.status === "failed" || latest.status === "killed") &&
                         latest.type !== "review" &&
                         !!latest.worktree_path;
                       return (

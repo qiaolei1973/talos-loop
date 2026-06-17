@@ -37,6 +37,14 @@ export interface AppConfig {
    * the review-fix agent runs. Default 15 ≈ 15 min at the 60s poll interval.
    */
   reviewDispatchEvery: number;
+  /**
+   * issue #26: when false (default), checkRunningSessions tears down a
+   * successfully-completed (exit-0) session's tmux window via killSession() so
+   * completed sessions don't accumulate in `tmux ls`. Set true to opt back into
+   * the keep-alive behavior (leave the window open for inspection). Failed
+   * sessions are ALWAYS kept alive regardless, so their output stays available.
+   */
+  keepSessionOnSuccess: boolean;
 }
 
 const PROJECT_ROOT = path.resolve(__dirname, "../..");
@@ -65,6 +73,7 @@ function defaults(): Partial<AppConfig> {
     // is ~1 item-list; 200 survives a full poll plus concurrent agent traffic.
     quotaThreshold: 200,
     reviewDispatchEvery: 15,
+    keepSessionOnSuccess: false,
   };
 }
 
@@ -85,6 +94,7 @@ export function loadConfig(): AppConfig {
     serverBaseUrl: parsed.serverBaseUrl ?? `http://127.0.0.1:${port}`,
     quotaThreshold: parsed.quotaThreshold ?? def.quotaThreshold!,
     reviewDispatchEvery: parsed.reviewDispatchEvery ?? def.reviewDispatchEvery!,
+    keepSessionOnSuccess: parsed.keepSessionOnSuccess ?? def.keepSessionOnSuccess!,
   };
 
   // Ensure database directory exists

@@ -84,6 +84,8 @@ cp projects.example.json  projects.json   # Projects + 仓库（取代旧版 rep
 }
 ```
 
+> 注：完整字段见 `config.example.json`，下面只列常用项。
+
 | 字段 | 默认值 | 说明 |
 |------|--------|------|
 | `port` | `3100` | 服务监听端口 |
@@ -92,6 +94,7 @@ cp projects.example.json  projects.json   # Projects + 仓库（取代旧版 rep
 | `claudeTimeout` | `600` | Claude 会话超时（秒） |
 | `serverBaseUrl` | `http://127.0.0.1:${port}` | agent 调用 actions 接口的基址 |
 | `dbPath` | `<root>/server/data/talos-loop.db` | SQLite 数据库路径 |
+| `keepSessionOnSuccess` | `false` | 成功完成的会话是否保留 tmux 窗口；默认 `false`（issue #26 自动清理），设 `true` 可保留以便人工查看；失败会话始终保留 |
 
 ### `projects.json` — Projects 与仓库
 

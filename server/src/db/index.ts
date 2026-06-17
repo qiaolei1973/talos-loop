@@ -165,7 +165,13 @@ export interface Session {
   id: number;
   issue_id: number;
   tmux_session: string;
-  status: "running" | "done" | "failed" | "skipped";
+  /**
+   * running → done | failed | skipped | killed. `killed` (issue #26) marks a
+   * session torn down by the dashboard's kill action — terminal like failed,
+   * but distinct so the UI can show "killed" rather than "infra error", and so
+   * a killed coding session is still retryable from its preserved worktree.
+   */
+  status: "running" | "done" | "failed" | "skipped" | "killed";
   pr_url: string | null;
   error: string | null;
   started_at: string;
@@ -223,9 +229,14 @@ export function getSessionsByIssue(issueId: number): Session[] {
     .all(issueId) as Session[];
 }
 
+/** Look up a single session by its DB id (issue #26 kill endpoint). */
+export function getSessionById(id: number): Session | undefined {
+  return getDb().prepare("SELECT * FROM sessions WHERE id = ?").get(id) as Session | undefined;
+}
+
 export function updateSessionStatus(
   sessionId: number,
-  status: "done" | "failed" | "skipped",
+  status: "done" | "failed" | "skipped" | "killed",
   prUrl?: string | null,
   error?: string | null,
 ): void {
@@ -309,10 +320,12 @@ export function getRunningReviewIssueIds(): Set<number> {
 
 /**
  * The session a manual retry (issue #21) targets, if any. Retry is only valid
- * when the issue's LATEST session is a failed CODING session that recorded a
- * worktree path — the worktree it left on disk is what the retry continues in.
+ * when the issue's LATEST session is a failed-or-killed CODING session that
+ * recorded a worktree path — the worktree it left on disk is what the retry
+ * continues in. `killed` (issue #26) is included so a dashboard-killed stuck
+ * session can be retried from its preserved worktree (same path as a crash).
  *
- *   latest session is failed coding + has worktree_path → return it (retry OK)
+ *   latest session is failed|killed coding + has worktree_path → return it (retry OK)
  *   otherwise (done/running/skipped, or a failed review session) → undefined
  *
  * Gating on the LATEST session (not just any failed one) means an issue that has
@@ -343,6 +356,6 @@ export function getRetryableSession(issueId: number): RetryableSession | undefin
     LIMIT 1
   `).get(issueId) as RetryableSession | undefined;
   if (!latest) return undefined;
-  if (latest.status !== "failed" || latest.type !== "coding" || !latest.worktree_path || !latest.branch) return undefined;
+  if ((latest.status !== "failed" && latest.status !== "killed") || latest.type !== "coding" || !latest.worktree_path || !latest.branch) return undefined;
   return latest;
 }

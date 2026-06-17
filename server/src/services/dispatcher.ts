@@ -207,6 +207,9 @@ function buildRetryPrompt(
  */
 export async function checkRunningSessions(): Promise<{ completed: number; failed: number }> {
   const running = getRunningSessionsWithIssues();
+  // issue #26: a successfully-completed (exit-0) session's tmux window is torn
+  // down unless the operator opts into keep-alive. Loaded once per cycle (cached).
+  const { keepSessionOnSuccess } = loadConfig();
   let completed = 0;
   let failed = 0;
 
@@ -228,6 +231,8 @@ export async function checkRunningSessions(): Promise<{ completed: number; faile
       if (exitCode === 0) {
         log.info(`✅ ${sourceName}:${source_id} review session done — ${session.pr_url}`);
         updateSessionStatus(session.id, "done", session.pr_url);
+        // issue #26: completed review session — tear down its tmux window.
+        if (!keepSessionOnSuccess) tmux.killSession(session.tmux_session);
         completed++;
       } else {
         const reason = exitCode === undefined
@@ -257,6 +262,10 @@ export async function checkRunningSessions(): Promise<{ completed: number; faile
       // board — it reflects the deliberate submit-pr action.
       log.info(`✅ ${sourceName}:${source_id} done — ${session.pr_url}`);
       updateSessionStatus(session.id, "done", session.pr_url);
+      // issue #26: completed session — tear down its tmux window (opt out via
+      // keepSessionOnSuccess). Done before the board transition so a slow GitHub
+      // call can't delay the local cleanup.
+      if (!keepSessionOnSuccess) tmux.killSession(session.tmux_session);
       await plugin.transition(ctx, source_id, { from: "processing", to: "done" }, target_repo);
       if (plugin.onComment) {
         await plugin.onComment(ctx, source_id, `✅ Agent completed. PR: ${session.pr_url}`, target_repo);
@@ -279,6 +288,8 @@ export async function checkRunningSessions(): Promise<{ completed: number; faile
       // handled by the type === 'review' branch above and never reach here.)
       log.info(`✅ ${sourceName}:${source_id} done — exited cleanly with no PR (board left In progress)`);
       updateSessionStatus(session.id, "done", undefined);
+      // issue #26: a clean exit is still "completed" — tear down the tmux window.
+      if (!keepSessionOnSuccess) tmux.killSession(session.tmux_session);
       completed++;
     } else {
       // Non-zero exit OR missing sentinel → infrastructure failure. The board is

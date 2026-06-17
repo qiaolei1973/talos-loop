@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll, afterEach, beforeEach } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, afterEach, beforeEach, vi } from "vitest";
 import { render, screen, waitFor, cleanup } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -68,6 +68,7 @@ let issuesGets = 0;
 let statusGets = 0;
 let pollPosts = 0;
 let retryPosts = 0;
+let killPosts = 0;
 
 const server = setupServer(
   http.get("/api/issues", () => {
@@ -87,6 +88,11 @@ const server = setupServer(
     retryPosts += 1;
     return HttpResponse.json({ success: true });
   }),
+  // issue #26: the kill endpoint the dashboard's Kill button hits.
+  http.post("/api/sessions/:id/kill", () => {
+    killPosts += 1;
+    return HttpResponse.json({ success: true, status: "killed" });
+  }),
 );
 
 beforeAll(() => server.listen({ onUnhandledRequest: "error" }));
@@ -104,6 +110,7 @@ function resetCounters() {
   statusGets = 0;
   pollPosts = 0;
   retryPosts = 0;
+  killPosts = 0;
 }
 
 // A fresh, deterministic client per render: no retries, no focus refetch, data
@@ -283,6 +290,34 @@ describe("App dashboard", () => {
     // The retry action was posted to the issue's action URL, and issues refetch.
     await waitFor(() => expect(retryPosts).toBe(1));
     await waitFor(() => expect(issuesGets).toBeGreaterThan(1));
+  });
+
+  // issue #26: a live running session shows a Kill button that POSTs the kill
+  // action to the session endpoint, then refetches issues.
+  it("shows a Kill button on a live session and POSTs the kill action on click", async () => {
+    // The default fixture's issue #16 has one live running coding session (id 10).
+    server.use(
+      http.get("/api/issues", () => {
+        issuesGets += 1;
+        return HttpResponse.json(issuesFixture);
+      }),
+    );
+    // The kill button prompts for confirmation — accept it.
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+
+    const user = userEvent.setup();
+    renderApp();
+
+    const killBtn = await screen.findByRole("button", { name: /kill/i });
+    expect(killBtn).toBeInTheDocument();
+
+    await user.click(killBtn);
+
+    // The kill action was posted to the session URL, and issues refetch.
+    await waitFor(() => expect(killPosts).toBe(1));
+    await waitFor(() => expect(issuesGets).toBeGreaterThan(1));
+    expect(window.confirm).toHaveBeenCalled();
+    vi.mocked(window.confirm).mockRestore();
   });
 });
 

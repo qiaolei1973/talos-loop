@@ -106,4 +106,16 @@ describe("loadConfig()", () => {
     resetConfigCache();
     expect(loadConfig().quotaThreshold).toBe(50);
   });
+
+  // Issue #26: keepSessionOnSuccess opts out of auto-killing completed sessions.
+  it("defaults keepSessionOnSuccess to false when omitted", () => {
+    // beforeEach writes { port: 3100 } — no keepSessionOnSuccess.
+    expect(loadConfig().keepSessionOnSuccess).toBe(false);
+  });
+
+  it("parses keepSessionOnSuccess from config.json when provided", () => {
+    fs.writeFileSync(tmpConfig, JSON.stringify({ port: 3100, keepSessionOnSuccess: true }));
+    resetConfigCache();
+    expect(loadConfig().keepSessionOnSuccess).toBe(true);
+  });
 });
