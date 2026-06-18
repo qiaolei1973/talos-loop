@@ -74,6 +74,21 @@ describe("loadProjects()", () => {
     expect(loadProjects()[0].enabled).toBe(true);
   });
 
+  // Issue #32: stages is the stage→skill map (e.g. "ready" → github-code). It
+  // defaults to {} when a project declares none (no dispatch for that project).
+  it("parses the stage→skill map (stages), defaulting to {} when omitted", () => {
+    fs.writeFileSync(
+      tmpProjects,
+      JSON.stringify([
+        { projectId: "a/1", projectType: "github", repos: [{ path: "/x/r", remote: "a/r" }], stages: { ready: "github-code", "in-review": "github-review" } },
+        { projectId: "b/2", projectType: "github", repos: [{ path: "/x/r2", remote: "b/r2" }] },
+      ]),
+    );
+    const projects = loadProjects();
+    expect(projects[0].stages).toEqual({ ready: "github-code", "in-review": "github-review" });
+    expect(projects[1].stages).toEqual({});
+  });
+
   it("returns [] when projects.json is missing", () => {
     // beforeEach never writes tmpProjects, so it's already absent — the
     // "missing file" path is what we want to exercise.
@@ -117,15 +132,17 @@ describe("getProjectById()", () => {
 });
 
 describe("loadConfig()", () => {
-  it("defaults quotaThreshold to 200 when omitted", () => {
-    // beforeEach writes { port: 3100 } to tmpConfig — no quotaThreshold.
-    expect(loadConfig().quotaThreshold).toBe(200);
+  // Issue #32: maxRetry caps the auto `claude -r` retries for a crashed coding
+  // session. Default 1.
+  it("defaults maxRetry to 1 when omitted", () => {
+    // beforeEach writes { port: 3100 } to tmpConfig — no maxRetry.
+    expect(loadConfig().maxRetry).toBe(1);
   });
 
-  it("parses quotaThreshold from config.json when provided", () => {
-    fs.writeFileSync(tmpConfig, JSON.stringify({ port: 3100, quotaThreshold: 50 }));
+  it("parses maxRetry from config.json when provided", () => {
+    fs.writeFileSync(tmpConfig, JSON.stringify({ port: 3100, maxRetry: 3 }));
     resetConfigCache();
-    expect(loadConfig().quotaThreshold).toBe(50);
+    expect(loadConfig().maxRetry).toBe(3);
   });
 
   // Issue #26: keepSessionOnSuccess opts out of auto-killing completed sessions.

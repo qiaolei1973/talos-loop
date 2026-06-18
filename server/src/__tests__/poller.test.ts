@@ -1,23 +1,15 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import type { Issue } from "../db/index.js";
+import type { RawIssue } from "../types/plugin.js";
 
 // --- per-test controllable state ---
-let discoveredIssues: any[] = [];
-let boardItems: any[] = [];
-let listBoardError: Error | null = null;
-let quotaStatus: any = { available: true, remaining: 99999, limit: 5000 };
+let listIssues: RawIssue[] = [];
+let listError: Error | null = null;
 
 const mockPlugin = {
   name: "github",
-  async discover() {
-    return discoveredIssues;
-  },
-  async listBoard() {
-    if (listBoardError) throw listBoardError;
-    return boardItems;
-  },
-  async checkQuota() {
-    return quotaStatus;
+  async list() {
+    if (listError) throw listError;
+    return listIssues;
   },
 };
 
@@ -40,7 +32,6 @@ vi.mock("../config.js", () => ({
     repos: [{ name: "talos-loop", path: "/tmp/talos-loop", remote: "qiaolei1973/talos-loop" }],
     projectId: "qiaolei1973/1",
   }),
-  loadConfig: () => ({ quotaThreshold: 200 }),
 }));
 
 vi.mock("../db/index.js", () => ({
@@ -59,148 +50,101 @@ vi.mock("../services/logger.js", () => ({
   createLogger: () => mockLogger,
 }));
 
-function issueFromSource(sourceId: string): Issue {
-  return {
-    id: Number(sourceId),
-    project_id: "qiaolei1973/1",
-    project_type: "github",
-    source_id: sourceId,
-    target_repo: "talos-loop",
-    url: `u${sourceId}`,
-    title: `T${sourceId}`,
-    created_at: "",
-    updated_at: "",
-  };
-}
-
 /**
- * Seam 3 (issue #13): the poller rebuilds the in-memory board snapshot each cycle
- * (the display-status input) from the plugin's full board listing, and persists
- * NOTHING for workflow status — only identity/display cache via upsertIssue.
+ * issue #32: the poller makes ONE read (plugin.list()) that replaces the old
+ * discover() + listBoard() pair. It upserts every returned active issue for the
+ * identity/display cache, rebuilds the in-memory board snapshot from the standard
+ * `state`s (the display-status input), and carries `subIssues` into `discovered`
+ * so the dispatcher can route review dispatch.
  */
-describe("poller builds the board snapshot (issue #13)", () => {
+describe("poller reads via list() and rebuilds the snapshot (issue #32)", () => {
   beforeEach(() => {
-    discoveredIssues = [];
-    boardItems = [];
-    listBoardError = null;
-    quotaStatus = { available: true, remaining: 99999, limit: 5000 };
+    listIssues = [];
+    listError = null;
     mockUpsertIssue.mockReset();
     mockSetProjectBoard.mockReset();
-    mockLogger.warn.mockReset();
-    mockUpsertIssue.mockImplementation(
-      (_pid: string, _pt: string, sid: string) => issueFromSource(sid),
-    );
+    mockLogger.error.mockReset();
+    // upsertIssue returns a minimal issue row keyed off the source id.
+    mockUpsertIssue.mockImplementation((_pid: string, _pt: string, sid: string) => ({
+      id: Number(sid),
+      project_id: "qiaolei1973/1",
+      project_type: "github",
+      source_id: sid,
+      target_repo: "talos-loop",
+      url: `u${sid}`,
+      title: `T${sid}`,
+      created_at: "",
+      updated_at: "",
+    }));
   });
 
-  it("refreshes the snapshot from listBoard across all board columns", async () => {
-    discoveredIssues = [{ sourceId: "9", url: "u9", title: "T9", targetRepo: "talos-loop", state: "queued" }];
-    boardItems = [
-      { sourceId: "9", repository: "qiaolei1973/talos-loop", boardStatus: "Ready", url: "u9", title: "T9" },
-      { sourceId: "11", repository: "qiaolei1973/talos-loop", boardStatus: "In progress", url: "u11", title: "T11" },
-      { sourceId: "12", repository: "qiaolei1973/talos-loop", boardStatus: "Done", url: "u12", title: "T12" },
-      // Config drift: repo not declared → excluded from the snapshot slice.
-      { sourceId: "13", repository: "qiaolei1973/other", boardStatus: "Ready", url: "u13", title: "T13" },
+  it("refreshes the snapshot from list().state and upserts every active item", async () => {
+    listIssues = [
+      { sourceId: "9", url: "u9", title: "T9", targetRepo: "talos-loop", state: "queued" },
+      { sourceId: "11", url: "u11", title: "T11", targetRepo: "talos-loop", state: "processing" },
+      { sourceId: "12", url: "u12", title: "T12", targetRepo: "talos-loop", state: "done" },
     ];
 
     const { pollAll } = await import("../services/poller.js");
     const results = await pollAll();
 
-    // Discovered (Ready) issues are upserted for identity/display cache.
+    // Every active item is upserted for identity/display cache.
     expect(mockUpsertIssue).toHaveBeenCalledWith("qiaolei1973/1", "github", "9", "talos-loop", "u9", "T9");
-    expect(results[0].discovered).toHaveLength(1);
+    expect(results[0].discovered).toHaveLength(3);
+    expect(results[0].error).toBeUndefined();
 
-    // The snapshot slice covers every declared-repo item, keyed by sourceId.
+    // The snapshot slice is keyed by sourceId → standard state.
     expect(mockSetProjectBoard).toHaveBeenCalledWith("qiaolei1973/1", expect.any(Map));
     const slice = mockSetProjectBoard.mock.calls[0][1] as Map<string, string>;
-    expect(slice.get("9")).toBe("Ready");
-    expect(slice.get("11")).toBe("In progress");
-    expect(slice.get("12")).toBe("Done");
-    expect(slice.has("13")).toBe(false); // drift repo skipped
+    expect(slice.get("9")).toBe("queued");
+    expect(slice.get("11")).toBe("processing");
+    expect(slice.get("12")).toBe("done");
+
+    // The standard state + subIssues are carried into discovered for routing.
+    expect(results[0].discovered.map((d) => d.state)).toEqual(["queued", "processing", "done"]);
   });
 
-  it("warns (not throws) when listBoard fails, leaving discovery intact", async () => {
-    discoveredIssues = [{ sourceId: "9", url: "u9", title: "T9", targetRepo: "talos-loop", state: "queued" }];
-    listBoardError = new Error("rate limited");
+  it("carries a review subIssue into discovered for an in-review issue", async () => {
+    listIssues = [
+      {
+        sourceId: "12",
+        url: "u12",
+        title: "T12",
+        targetRepo: "talos-loop",
+        state: "done",
+        subIssues: [{ type: "review", resolved: false }],
+      },
+    ];
 
     const { pollAll } = await import("../services/poller.js");
     const results = await pollAll();
 
-    // Discovery still upserts the Ready issue…
-    expect(mockUpsertIssue).toHaveBeenCalled();
-    expect(results[0].discovered).toHaveLength(1);
-    expect(results[0].error).toBeUndefined();
-    // …and the snapshot isn't refreshed, but the board-read failure is surfaced
-    // prominently instead of swallowed as an empty board.
+    expect(results[0].discovered[0].subIssues).toEqual([{ type: "review", resolved: false }]);
+  });
+
+  it("surfaces a list() failure as an error and does NOT refresh the snapshot", async () => {
+    listError = new Error("rate limited");
+
+    const { pollAll } = await import("../services/poller.js");
+    const results = await pollAll();
+
+    // The board-read failure surfaces prominently (no silent empty board)…
+    expect(results[0].error).toMatch(/rate limited/);
+    expect(results[0].discovered).toEqual([]);
+    // …and the snapshot is simply not refreshed this cycle.
     expect(mockSetProjectBoard).not.toHaveBeenCalled();
-    expect(mockLogger.warn).toHaveBeenCalledWith(expect.stringMatching(/board read failed/i));
+    expect(mockLogger.error).toHaveBeenCalled();
   });
 
   it("does not persist workflow status — only identity/display cache via upsertIssue", async () => {
-    // The db mock exposes upsertIssue and nothing else. Poller must not import or
-    // call any status-writing helper (updateIssueStatus no longer exists).
-    discoveredIssues = [{ sourceId: "9", url: "u9", title: "T9", targetRepo: "talos-loop", state: "queued" }];
-    boardItems = [{ sourceId: "9", repository: "qiaolei1973/talos-loop", boardStatus: "Ready", url: "u9", title: "T9" }];
+    // The db mock exposes only upsertIssue. The poller must not call any
+    // status-writing helper — the snapshot is the sole (in-memory) write.
+    listIssues = [{ sourceId: "9", url: "u9", title: "T9", targetRepo: "talos-loop", state: "queued" }];
 
     const { pollAll } = await import("../services/poller.js");
     await pollAll();
 
     expect(mockUpsertIssue).toHaveBeenCalledTimes(1);
-    // Snapshot is the only other write — and it is in-memory (setProjectBoard).
     expect(mockSetProjectBoard).toHaveBeenCalledTimes(1);
-  });
-});
-
-describe("poller gates polling on GraphQL quota", () => {
-  beforeEach(() => {
-    discoveredIssues = [];
-    boardItems = [];
-    listBoardError = null;
-    quotaStatus = { available: true, remaining: 99999, limit: 5000 };
-    mockUpsertIssue.mockReset();
-    mockSetProjectBoard.mockReset();
-    mockLogger.warn.mockReset();
-    mockUpsertIssue.mockImplementation(
-      (_pid: string, _pt: string, sid: string) => issueFromSource(sid),
-    );
-  });
-
-  it("skips discover/listBoard when GraphQL quota is below threshold", async () => {
-    quotaStatus = { available: true, remaining: 30, limit: 5000, resetAt: new Date("2026-06-16T14:23:34Z") };
-    discoveredIssues = [{ sourceId: "9", url: "u9", title: "T9", targetRepo: "talos-loop", state: "queued" }];
-    boardItems = [{ sourceId: "9", repository: "qiaolei1973/talos-loop", boardStatus: "Ready", url: "u9", title: "T9" }];
-
-    const { pollAll } = await import("../services/poller.js");
-    const results = await pollAll();
-
-    expect(results[0].discovered).toEqual([]);
-    expect(results[0].error).toBeUndefined();
-    expect(mockUpsertIssue).not.toHaveBeenCalled();
-    expect(mockSetProjectBoard).not.toHaveBeenCalled();
-    expect(mockLogger.warn).toHaveBeenCalledWith(expect.stringMatching(/配额不足/));
-  });
-
-  it("falls through (still polls) when the quota probe itself fails", async () => {
-    quotaStatus = { available: false, error: "network down" };
-    discoveredIssues = [{ sourceId: "9", url: "u9", title: "T9", targetRepo: "talos-loop", state: "queued" }];
-    boardItems = [{ sourceId: "9", repository: "qiaolei1973/talos-loop", boardStatus: "Ready", url: "u9", title: "T9" }];
-
-    const { pollAll } = await import("../services/poller.js");
-    const results = await pollAll();
-
-    expect(results[0].discovered).toHaveLength(1);
-    expect(mockUpsertIssue).toHaveBeenCalled();
-    expect(mockLogger.warn).toHaveBeenCalledWith(expect.stringMatching(/探测失败/));
-  });
-
-  it("polls normally when quota is above threshold", async () => {
-    quotaStatus = { available: true, remaining: 4000, limit: 5000 };
-    discoveredIssues = [{ sourceId: "9", url: "u9", title: "T9", targetRepo: "talos-loop", state: "queued" }];
-    boardItems = [{ sourceId: "9", repository: "qiaolei1973/talos-loop", boardStatus: "Ready", url: "u9", title: "T9" }];
-
-    const { pollAll } = await import("../services/poller.js");
-    const results = await pollAll();
-
-    expect(results[0].discovered).toHaveLength(1);
-    expect(mockUpsertIssue).toHaveBeenCalled();
   });
 });

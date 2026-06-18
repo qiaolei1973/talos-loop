@@ -3,8 +3,6 @@
   "pollInterval": 60000,
   "maxParallel": 1,
   "claudeTimeout": 600,
-  "serverBaseUrl": "http://127.0.0.1:3100",
-  "quotaThreshold": 200,
-  "reviewDispatchEvery": 15,
+  "maxRetry": 1,
   "keepSessionOnSuccess": false
 }

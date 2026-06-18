@@ -12,21 +12,15 @@ let sessionById: Record<number, Session> = {};
 /** issue #30: issues + projects looked up by id for the resume-command endpoint. */
 let issueById: Record<number, Issue> = {};
 let projectById: Record<string, { repos: Array<{ name: string; path: string }> }> = {};
-/** board snapshot: `${projectId}/${sourceId}` → raw board column name. */
+/** board snapshot: `${projectId}/${sourceId}` → standard state (queued/processing/done). */
 let boardByIssue: Record<string, string | undefined> = {};
 let aliveSessionNames: Set<string> = new Set();
 
 vi.mock("../config.js", () => ({
-  loadConfig: () => ({ port: 3100, pollInterval: 60_000, maxParallel: 1, serverBaseUrl: "http://127.0.0.1:3100" }),
+  loadConfig: () => ({ port: 3100, pollInterval: 60_000, maxParallel: 1 }),
   getEnabledProjects: () => [],
   loadProjects: () => [],
   getProjectById: (pid: string) => projectById[pid],
-  buildProjectContext: () => ({
-    config: {},
-    logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
-    repos: [],
-    projectId: "qiaolei1973/1",
-  }),
 }));
 
 vi.mock("../db/index.js", () => ({
@@ -35,11 +29,7 @@ vi.mock("../db/index.js", () => ({
   getSessionById: (id: number) => sessionById[id],
   getIssuesByTargetRepo: () => [],
   getIssueById: (id: number) => issueById[id],
-  getIssue: () => undefined,
   getRunningSessions: () => [],
-  markSessionSkipped: vi.fn(),
-  setSessionPrUrl: vi.fn(),
-  setSessionBranch: vi.fn(),
   updateSessionStatus: vi.fn(),
 }));
 
@@ -91,12 +81,14 @@ function makeSession(overrides: Partial<Session> = {}): Session {
     issue_id: 9,
     tmux_session: "tl-github-talos-loop-9",
     status: "running",
-    pr_url: null,
     error: null,
     started_at: "",
     finished_at: null,
     type: "coding",
     branch: null,
+    worktree_path: null,
+    claude_session_id: null,
+    retry_count: 0,
     ...overrides,
   };
 }
@@ -120,12 +112,12 @@ async function issuesJson(app: Awaited<ReturnType<typeof buildApp>>) {
 }
 
 /**
- * Seam 1 (issue #13): the highest-level black-box test. `status` is now a DERIVED
+ * Seam 1 (issue #13): the highest-level black-box test. `status` is a DERIVED
  * value surfaced by GET /api/issues — sourced from the in-memory board snapshot
- * + the sessions table + a live-tmux check. These cover every "what does the
- * dashboard show" story, including post-merge visibility.
+ * (a standard state, issue #32) + the sessions table + a live-tmux check. These
+ * cover every "what does the dashboard show" story.
  */
-describe("GET /api/issues — derived display status (issue #13)", () => {
+describe("GET /api/issues — derived display status (issue #13/#32)", () => {
   let app: Awaited<ReturnType<typeof buildApp>>;
 
   beforeEach(async () => {
@@ -142,18 +134,18 @@ describe("GET /api/issues — derived display status (issue #13)", () => {
     await app.close();
   });
 
-  it("board Ready, no session → queued", async () => {
+  it("board queued, no session → queued", async () => {
     issuesState = [makeIssue()];
-    boardByIssue["qiaolei1973/1/9"] = "Ready";
+    boardByIssue["qiaolei1973/1/9"] = "queued";
     const body = await issuesJson(app);
     expect(body[0].status).toBe("queued");
     expect(body[0].tmux_session).toBeNull();
   });
 
-  it("running session alive → processing (board column ignored)", async () => {
+  it("running session alive → processing (board state ignored)", async () => {
     issuesState = [makeIssue()];
-    // Board still says Ready, but a live agent session overrides it.
-    boardByIssue["qiaolei1973/1/9"] = "Ready";
+    // Board still says queued, but a live agent session overrides it.
+    boardByIssue["qiaolei1973/1/9"] = "queued";
     sessionsByIssue[9] = [makeSession({ status: "running", tmux_session: "tl-live" })];
     aliveSessionNames = new Set(["tl-live"]);
 
@@ -162,25 +154,18 @@ describe("GET /api/issues — derived display status (issue #13)", () => {
     expect(body[0].tmux_session).toBe("tl-live");
   });
 
-  it("board In review → done", async () => {
+  it("board done → done", async () => {
     issuesState = [makeIssue()];
-    boardByIssue["qiaolei1973/1/9"] = "In review";
+    boardByIssue["qiaolei1973/1/9"] = "done";
     const body = await issuesJson(app);
     expect(body[0].status).toBe("done");
   });
 
-  it("board Done (post-merge) → done", async () => {
+  it("board processing but no live session → processing (zombie), nothing to attach", async () => {
     issuesState = [makeIssue()];
-    boardByIssue["qiaolei1973/1/9"] = "Done";
-    const body = await issuesJson(app);
-    expect(body[0].status).toBe("done");
-  });
-
-  it("board In progress but no live session → processing (zombie), nothing to attach", async () => {
-    issuesState = [makeIssue()];
-    boardByIssue["qiaolei1973/1/9"] = "In progress";
+    boardByIssue["qiaolei1973/1/9"] = "processing";
     // A dead running session must NOT count as processing-via-session, but the
-    // board column still reads In progress → processing (the incident #11 shape).
+    // board state still reads processing (the incident #11 shape).
     sessionsByIssue[9] = [makeSession({ status: "running", tmux_session: "tl-dead" })];
     aliveSessionNames = new Set(); // session not alive
 
@@ -189,48 +174,31 @@ describe("GET /api/issues — derived display status (issue #13)", () => {
     expect(body[0].tmux_session).toBeNull();
   });
 
-  it("board In progress is matched case/space-tolerantly", async () => {
-    issuesState = [makeIssue()];
-    boardByIssue["qiaolei1973/1/9"] = "in Progress"; // odd casing/spacing
-    const body = await issuesJson(app);
-    expect(body[0].status).toBe("processing");
-  });
-
-  it("unknown board column + no live session → null (indeterminate)", async () => {
+  it("unknown board value + no live session → null (indeterminate)", async () => {
     issuesState = [makeIssue()];
     boardByIssue["qiaolei1973/1/9"] = "Backlog";
     const body = await issuesJson(app);
     expect(body[0].status).toBeNull();
   });
 
-  it("PR link comes from the latest session's pr_url", async () => {
+  it("surfaces a failed session's error tail and isLive per session (issue #19)", async () => {
     issuesState = [makeIssue()];
-    boardByIssue["qiaolei1973/1/9"] = "In review";
+    boardByIssue["qiaolei1973/1/9"] = "done";
     // getSessionsByIssue returns started_at DESC — index 0 is the latest.
     sessionsByIssue[9] = [
-      makeSession({ id: 2, status: "done", pr_url: "https://github.com/qiaolei1973/talos-loop/pull/42" }),
-      makeSession({ id: 1, status: "failed", pr_url: null, error: "boom" }),
+      makeSession({ id: 2, status: "done", tmux_session: "tl-done", type: "coding" }),
+      makeSession({ id: 1, status: "failed", tmux_session: "tl-fail", error: "boom" }),
     ];
 
     const body = await issuesJson(app);
-    expect(body[0].sessions[0].pr_url).toBe("https://github.com/qiaolei1973/talos-loop/pull/42");
-    // The failed session's error tail is still surfaced for triage.
-    expect(body[0].sessions[1].error).toBe("boom");
-  });
-
-  it("still carries source/title/repo identity (display cache) and project_name", async () => {
-    issuesState = [makeIssue({ title: "Derive status", source_id: "13", target_repo: "talos-loop" })];
-    boardByIssue["qiaolei1973/1/13"] = "Ready";
-    const body = await issuesJson(app);
-    expect(body[0].source_id).toBe("13");
-    expect(body[0].title).toBe("Derive status");
-    expect(body[0].target_repo).toBe("talos-loop");
-    expect(body[0].project_name).toBe("github");
+    const byId = new Map(body[0].sessions.map((s: any) => [s.id, s]));
+    expect((byId.get(1) as any).error).toBe("boom"); // error tail surfaced for triage
+    expect((byId.get(2) as any).error).toBeNull();
   });
 
   it("surfaces an isLive flag per session (issue #19)", async () => {
     issuesState = [makeIssue()];
-    boardByIssue["qiaolei1973/1/9"] = "In review";
+    boardByIssue["qiaolei1973/1/9"] = "done";
     // One coding session (done), one review session (running + alive) → live.
     sessionsByIssue[9] = [
       makeSession({ id: 2, status: "done", tmux_session: "tl-done", type: "coding" }),
@@ -242,15 +210,25 @@ describe("GET /api/issues — derived display status (issue #13)", () => {
     const byId = new Map(body[0].sessions.map((s: any) => [s.id, s]));
     expect((byId.get(2) as any).isLive).toBe(false); // done coding session
     expect((byId.get(3) as any).isLive).toBe(true); // live review session
-    // …and the live review session does NOT flip the stage badge off "In review".
+    // …and the live review session does NOT flip the stage badge off "done".
     expect(body[0].status).toBe("done");
+  });
+
+  it("still carries source/title/repo identity (display cache) and project_name", async () => {
+    issuesState = [makeIssue({ title: "Derive status", source_id: "13", target_repo: "talos-loop" })];
+    boardByIssue["qiaolei1973/1/13"] = "queued";
+    const body = await issuesJson(app);
+    expect(body[0].source_id).toBe("13");
+    expect(body[0].title).toBe("Derive status");
+    expect(body[0].target_repo).toBe("talos-loop");
+    expect(body[0].project_name).toBe("github");
   });
 });
 
 /**
  * Issue #26: POST /api/sessions/:id/kill tears down a session's tmux window and
  * marks the row `killed`. The worktree is left in place (a killed coding session
- * stays retryable), and a 404 is returned for an unknown id.
+ * stays resumable), and a 404 is returned for an unknown id.
  */
 describe("POST /api/sessions/:id/kill — dashboard kill (issue #26)", () => {
   let app: Awaited<ReturnType<typeof buildApp>>;
@@ -278,14 +256,14 @@ describe("POST /api/sessions/:id/kill — dashboard kill (issue #26)", () => {
     expect(await res.json()).toEqual({ success: true, status: "killed" });
     // The tmux window is torn down…
     expect(tmux.killSession).toHaveBeenCalledWith("tl-live-1");
-    // …and the row is marked killed (terminal, but retryable).
-    expect(db.updateSessionStatus).toHaveBeenCalledWith(1, "killed", undefined, "Killed via dashboard");
+    // …and the row is marked killed with the reason in the error column.
+    expect(db.updateSessionStatus).toHaveBeenCalledWith(1, "killed", "Killed via dashboard");
   });
 
   it("kills the tmux window but does NOT re-mark an already-terminal session", async () => {
     // A done session: killing (e.g. to clear a lingering window) must not rewrite
-    // its status or clobber its stored pr_url.
-    sessionById[2] = makeSession({ id: 2, status: "done", tmux_session: "tl-done-2", pr_url: "https://x/pull/1" });
+    // its status.
+    sessionById[2] = makeSession({ id: 2, status: "done", tmux_session: "tl-done-2" });
 
     const res = await app.inject({ method: "POST", url: "/api/sessions/2/kill" });
 
@@ -374,4 +352,3 @@ describe("GET /api/sessions/:id/resume-command — claude -r resume (issue #30)"
     expect(res.statusCode).toBe(404);
   });
 });
-

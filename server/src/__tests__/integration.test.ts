@@ -4,7 +4,7 @@ import type {
   ProjectContext,
   RepoRef,
   RawIssue,
-  BoardItem,
+  SubIssue,
   IssueStatus,
   IssueState,
   StatusTransition,
@@ -12,11 +12,12 @@ import type {
 
 /**
  * Contract-layer test (Seam A): verify the standard issue-state contract shape
- * and that a mock plugin satisfies the IssueSourcePlugin interface. Conformance
- * is enforced by the TypeScript compiler.
+ * and that a mock plugin satisfies the (issue #32) IssueSourcePlugin interface —
+ * four methods: `list`/`writeLabel` (required) + `getItem?`/`writeComment?`
+ * (optional). Conformance is enforced by the TypeScript compiler.
  */
-describe("Issue-state contract", () => {
-  it("RawIssue carries a standard state and no metadata", () => {
+describe("Issue-source contract (issue #32)", () => {
+  it("RawIssue carries a standard state and optional downstream subIssues", () => {
     const raw: RawIssue = {
       sourceId: "42",
       url: "https://github.com/test/repo/issues/42",
@@ -27,6 +28,14 @@ describe("Issue-state contract", () => {
     expect(raw.sourceId).toBe("42");
     expect(raw.state).toBe("queued");
     expect((raw as any).metadata).toBeUndefined();
+
+    // An in-review issue may carry a downstream attention signal.
+    const withReview: RawIssue = {
+      ...raw,
+      state: "done",
+      subIssues: [{ type: "review", resolved: false }],
+    };
+    expect(withReview.subIssues?.[0]).toEqual({ type: "review", resolved: false } as SubIssue);
   });
 
   it("IssueStatus.state is IssueState | null", () => {
@@ -47,34 +56,33 @@ describe("Issue-state contract", () => {
     expect(new Set(states).size).toBe(3);
   });
 
-  it("a mock plugin satisfies IssueSourcePlugin (skip + targetRepo)", async () => {
-    const calls: Array<{ transition: StatusTransition; targetRepo: string }> = [];
+  it("a mock plugin satisfies IssueSourcePlugin (list + writeLabel + optional methods)", async () => {
+    const writeLabelCalls: Array<{ transition: StatusTransition; targetRepo: string }> = [];
     const plugin: IssueSourcePlugin = {
       name: "mock",
 
-      async init(): Promise<void> {},
-
-      async discover(): Promise<RawIssue[]> {
-        return [{ sourceId: "1", url: "https://example.com/1", title: "Ready", targetRepo: "r", state: "queued" }];
+      // The single read: returns every active issue with its standard state +
+      // any downstream subIssues. Replaces the old discover() + listBoard().
+      async list(_ctx: ProjectContext): Promise<RawIssue[]> {
+        return [
+          { sourceId: "1", url: "https://example.com/1", title: "Ready", targetRepo: "r", state: "queued" },
+          { sourceId: "2", url: "https://example.com/2", title: "In review", targetRepo: "r", state: "done", subIssues: [{ type: "review", resolved: false }] },
+        ];
       },
 
-      async listBoard(): Promise<BoardItem[]> {
-        return [{ sourceId: "1", repository: "owner/r", boardStatus: "Ready", url: "https://example.com/1", title: "Ready" }];
-      },
-
-      async getStatus(_ctx: ProjectContext, sourceId: string, _targetRepo: string): Promise<IssueStatus> {
+      // Optional freshness check before dispatch.
+      async getItem(_ctx: ProjectContext, sourceId: string, _targetRepo: string): Promise<IssueStatus> {
         return sourceId === "1" ? { state: "queued" } : { state: null };
       },
 
-      async transition(_ctx: ProjectContext, _sourceId: string, t: StatusTransition, targetRepo: string): Promise<void> {
-        calls.push({ transition: t, targetRepo });
+      // The stage move: the server only ever initiates queued→processing and
+      // processing→done.
+      async writeLabel(_ctx: ProjectContext, _sourceId: string, t: StatusTransition, targetRepo: string): Promise<void> {
+        writeLabelCalls.push({ transition: t, targetRepo });
       },
 
-      async test(): Promise<boolean> {
-        return true;
-      },
-
-      async skip(_ctx: ProjectContext, _sourceId: string, _targetRepo: string, _reason: string): Promise<void> {},
+      // Optional comment (e.g. on exhausted retries).
+      async writeComment(_ctx: ProjectContext, _sourceId: string, _comment: string, _targetRepo: string): Promise<void> {},
     };
 
     const ctx: ProjectContext = {
@@ -84,24 +92,16 @@ describe("Issue-state contract", () => {
       projectId: "owner/1",
     };
 
-    await plugin.init(ctx);
-    const issues = await plugin.discover(ctx);
-    expect(issues.map((i) => i.state)).toEqual(["queued"]);
+    const issues = await plugin.list(ctx);
+    expect(issues.map((i) => i.state)).toEqual(["queued", "done"]);
+    expect(issues[1].subIssues).toEqual([{ type: "review", resolved: false }]);
 
-    // listBoard is the display-status input (issue #13): every board item carries
-    // a source-specific boardStatus column name the display layer maps.
-    const board = await plugin.listBoard(ctx);
-    expect(board[0].boardStatus).toBe("Ready");
-    expect(board[0].repository).toBe("owner/r");
+    expect((await plugin.getItem(ctx, "1", "r")).state).toBe("queued");
 
-    expect((await plugin.getStatus(ctx, "1", "r")).state).toBe("queued");
+    await plugin.writeLabel(ctx, "1", { from: "queued", to: "processing" }, "r");
+    expect(writeLabelCalls).toEqual([{ transition: { from: "queued", to: "processing" }, targetRepo: "r" }]);
 
-    await plugin.transition(ctx, "1", { from: "queued", to: "processing" }, "r");
-    expect(calls).toEqual([{ transition: { from: "queued", to: "processing" }, targetRepo: "r" }]);
-
-    await plugin.skip(ctx, "1", "r", "not enough info");
-
-    expect(await plugin.test(ctx)).toBe(true);
+    await plugin.writeComment(ctx, "1", "note", "r");
   });
 
   it("ProjectContext exposes repos[] and projectId", () => {
