@@ -158,6 +158,99 @@ talos-loop 通过 **Source 插件** 与具体 issue 源解耦。核心只与插�
 
 **编写第三方插件**：`export default` 一个 class（推荐）或现成实例均可，loader 自动识别 class 并实例化；loader 按 `projectType` 缓存单例，per-project 元数据需插件自行按 `projectId` 缓存（惰性解析，接口无 `init`）；需 Node ≥ 22.12 且**禁止 top-level await**（loader 用 `require()` 加载）。
 
+## Docker 运行（一键起服务）
+
+镜像只烘焙「稳定运行时」（Node 22 + tmux + git + gh + Claude Code CLI + 构建好的 app）；config、目标仓库、claude 凭证 / skills、gh 认证、SQLite db **全部从宿主机 bind-mount 进来**——你在宿主机上编辑它们即可，`docker run` 只负责启动 server。
+
+### 准备
+
+1. **配置 `.env`**（compose 自动读取）：
+
+   ```bash
+   cp .env.example .env
+   ```
+
+   `UID`/`GID` 必须与「拥有目标仓库、`~/.claude`、`~/.config/gh` 的宿主机用户」一致（多数机器是 `1000:1000`）；`REPOS_ROOT` 指向你的代码仓库共同父目录。
+
+2. **准备 `./talos-data/`**（server 运行时状态，挂载到容器 `/data`）：
+
+   ```bash
+   mkdir -p talos-data
+   ```
+
+   `talos-data/config.json`（注意 `dbPath` 指向挂载点）：
+
+   ```json
+   {
+     "port": 3100,
+     "pollInterval": 60000,
+     "maxParallel": 1,
+     "claudeTimeout": 600,
+     "maxRetry": 1,
+     "keepSessionOnSuccess": false,
+     "dbPath": "/data/talos-loop.db"
+   }
+   ```
+
+   `talos-data/projects.json`（**`repos[].path` 必须写容器内路径 `/workspace/<repo>`**，不是宿主机路径）：
+
+   ```json
+   [
+     {
+       "projectId": "owner/1",
+       "projectType": "github",
+       "enabled": true,
+       "repos": [
+         { "path": "/workspace/my-repo", "remote": "owner/my-repo" }
+       ],
+       "stages": { "ready": "github-code", "in-review": "github-review" },
+       "config": {}
+     }
+   ]
+   ```
+
+3. **宿主机前置**（与裸机部署一致，容器通过挂载复用）：
+   - `gh` 已认证且 token 含 `project` scope（`gh auth refresh -s project`）。
+   - `claude` 已登录（OAuth 或 `ANTHROPIC_API_KEY`，`-p` 打印模式两者皆可）。
+   - `~/.claude/skills/` 下已有 `github-code` / `github-review`（可用 `npx skills add git@code.alipay.com:oceanbase/talos-workflows.git --skill <name>` 安装）。
+   - 若 `~/.claude.json` 不存在，先 `touch ~/.claude.json`（compose 会以文件方式挂载它）。
+   - 目标仓库若用 SSH remote（如 `git@code.alipay.com`），compose 已只读挂载 `~/.ssh`。
+
+### 起服务
+
+```bash
+docker compose up --build -d          # 后台运行，首次会构建镜像
+docker compose logs -f                # 看日志
+docker compose down                   # 停止
+```
+
+浏览器打开 `http://localhost:3100`。
+
+### 不用 compose 的等价命令
+
+```bash
+docker build -t talos-loop --build-arg UID=$(id -u) --build-arg GID=$(id -g) .
+docker run -d --name talos-loop \
+  --user "$(id -u):$(id -g)" \
+  -p 3100:3100 \
+  -e HOME=/home/agent -e CONFIG_PATH=/data/config.json -e PROJECTS_PATH=/data/projects.json \
+  -v "$PWD/talos-data":/data \
+  -v "$REPOS_ROOT":/workspace \
+  -v "$HOME/.claude":/home/agent/.claude \
+  -v "$HOME/.claude.json":/home/agent/.claude.json \
+  -v "$HOME/.config/gh":/home/agent/.config/gh \
+  -v "$HOME/.ssh":/home/agent/.ssh:ro \
+  talos-loop
+```
+
+### 注意事项
+
+- **路径映射**：`projects.json` 里所有 `repos[].path` 都用容器内路径 `/workspace/<repo>`；config 文件本身留在宿主机的 `./talos-data/` 里编辑。
+- **uid 必须匹配**：若宿主机用户 uid 不是 1000，在 `.env` 里改 `UID`/`GID`（compose 会带 `--build-arg` 重建对应用户）。
+- **attach 看会话**：dashboard 上的 `tmux attach` 链接跨不过容器边界，改用 `docker exec -it talos-loop tmux attach -t <session>`。
+- **生成的文件属主**：容器以宿主机 uid 运行，worktree（`/workspace/<repo>/.talos-worktrees/`）、SQLite db、sentinel 都是宿主机用户所有，清理不需 `sudo`。
+- **重建镜像**：依赖或源码更新后 `docker compose up --build` 即可。
+
 ## License
 
 Private

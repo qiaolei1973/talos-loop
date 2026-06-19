@@ -1,0 +1,43 @@
+# talos-loop —— `docker compose up`，浏览器打开 http://localhost:3100
+#
+# 镜像烘焙稳定运行时；下面所有东西都从宿主机 bind-mount 进来，
+# 这样 config / 凭证 / 仓库都留在你编辑它们的地方。详见 README「Docker 运行」。
+#
+# 首次使用：
+#   1. cp .env.example .env  并按需改 UID/GID/PORT/REPOS_ROOT
+#   2. 准备 ./talos-data/{config.json,projects.json}（见 README 示例）
+#   3. docker compose up --build
+
+services:
+  talos-loop:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        UID: ${UID:-1000}
+        GID: ${GID:-1000}
+    image: talos-loop:latest
+    # tini 已作为镜像 ENTRYPOINT，无需 init:true；负责回收 tmux/claude 子进程僵尸
+    user: "${UID:-1000}:${GID:-1000}"
+    ports:
+      - "${PORT:-3100}:3100"
+    working_dir: /app
+    environment:
+      HOME: /home/agent
+      CONFIG_PATH: /data/config.json
+      PROJECTS_PATH: /data/projects.json
+      # claude / gh 的认证来自下方挂载的 ~/.claude 与 ~/.config/gh，无需在此注入密钥
+    volumes:
+      # —— server 运行时状态（你在宿主机编辑这些）——
+      #   config.json + projects.json + SQLite db（config.json 里 dbPath 设为 /data/talos-loop.db）
+      - ./talos-data:/data
+      # —— 目标仓库根；projects.json 里 repos[].path 写成 /workspace/<repo> ——
+      - ${REPOS_ROOT:-./repos}:/workspace
+      # —— claude 凭证 + skills（github-code / github-review 即在此）——
+      - ${HOME}/.claude:/home/agent/.claude
+      - ${HOME}/.claude.json:/home/agent/.claude.json
+      # —— gh 认证（token 需含 `project` scope：gh auth refresh -s project）——
+      - ${HOME}/.config/gh:/home/agent/.config/gh
+      # —— SSH 私钥：仅当目标仓库用 ssh remote（如 git@code.alipay.com）时才需要 ——
+      - ${HOME}/.ssh:/home/agent/.ssh:ro
+    restart: unless-stopped

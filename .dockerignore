@@ -1,0 +1,30 @@
+# 依赖与构建产物（镜像里自己装/自己编，不拷宿主机的）
+**/node_modules
+**/dist
+
+# 版本控制 / 元数据
+.git
+.github
+.gitignore
+.claude
+.agents
+skills-lock.json
+
+# 运行时数据与密钥（全部通过挂载注入，不进镜像）
+**/data
+talos-data
+*.db
+*.db-wal
+*.db-shm
+config.json
+projects.json
+.env
+.env.*
+
+# 文档（镜像不需要）
+*.md
+
+# 本身
+Dockerfile
+.dockerignore
+docker-compose.yml
