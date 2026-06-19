@@ -12,11 +12,20 @@ import type { ProjectContext, RepoRef } from "./types/plugin.js";
 export interface ProjectConfig {
   /** "owner/number", e.g. "qiaolei1973/1". Human-readable; parsed by the plugin. */
   projectId: string;
-  /** Plugin type: "github" (built-in) or an external plugin package name / path. */
+  /** Source plugin: "github" (built-in) or an external plugin package name / path. */
   projectType: string;
   enabled: boolean;
   /** Repos declared for this project. `name` is the path basename (doubles as target_repo key). */
   repos: RepoRef[];
+  /**
+   * issue #32: stage → skill map. Each standard stage maps to the Claude Code
+   * skill the server launches when it dispatches an issue in that stage. The
+   * skill is fully self-contained (it reads TALOS_* env vars and drives itself);
+   * the server only invokes it. Keys are stage names; the two core stages are
+   * `"ready"` (a queued issue) and `"in-review"` (a done issue with unresolved
+   * review subIssues). Missing stages ⇒ that stage is never dispatched.
+   */
+  stages: Record<string, string>;
   /** Optional plugin-specific overrides. */
   config?: Record<string, unknown>;
 }
@@ -27,16 +36,14 @@ export interface AppConfig {
   maxParallel: number;
   claudeTimeout: number; // seconds
   dbPath: string;
-  /** Base URL the running agent uses to reach talos-loop's local API (skip/comment endpoints). */
-  serverBaseUrl: string;
-  /** GraphQL remaining capacity below which the poller skips a board read, so talos-loop doesn't collide with the dispatched agent over the shared 5000/h token budget. */
-  quotaThreshold: number;
   /**
-   * dispatchReview() fires every Nth dispatch cycle (issue #19), giving a
-   * reviewer time to batch several rounds of "Request changes" comments before
-   * the review-fix agent runs. Default 15 ≈ 15 min at the 60s poll interval.
+   * issue #32: max number of `claude -r` retries the server auto-launches for a
+   * crashed coding session before giving up (leaving the issue processing +
+   * posting a comment). Default 1. Review sessions don't use this — they are
+   * implicitly retried by the next poll re-dispatching while review subIssues
+   * remain unresolved.
    */
-  reviewDispatchEvery: number;
+  maxRetry: number;
   /**
    * issue #26: when false (default), checkRunningSessions tears down a
    * successfully-completed (exit-0) session's tmux window via killSession() so
@@ -69,10 +76,7 @@ function defaults(): Partial<AppConfig> {
     maxParallel: 1,
     claudeTimeout: 600,
     dbPath: path.join(PROJECT_ROOT, "server/data/talos-loop.db"),
-    // Leave headroom for the dispatched agent (shares this token). A board read
-    // is ~1 item-list; 200 survives a full poll plus concurrent agent traffic.
-    quotaThreshold: 200,
-    reviewDispatchEvery: 15,
+    maxRetry: 1,
     keepSessionOnSuccess: false,
   };
 }
@@ -91,9 +95,7 @@ export function loadConfig(): AppConfig {
     maxParallel: parsed.maxParallel ?? def.maxParallel!,
     claudeTimeout: parsed.claudeTimeout ?? def.claudeTimeout!,
     dbPath: parsed.dbPath ?? def.dbPath!,
-    serverBaseUrl: parsed.serverBaseUrl ?? `http://127.0.0.1:${port}`,
-    quotaThreshold: parsed.quotaThreshold ?? def.quotaThreshold!,
-    reviewDispatchEvery: parsed.reviewDispatchEvery ?? def.reviewDispatchEvery!,
+    maxRetry: parsed.maxRetry ?? def.maxRetry!,
     keepSessionOnSuccess: parsed.keepSessionOnSuccess ?? def.keepSessionOnSuccess!,
   };
 
@@ -156,6 +158,7 @@ export function loadProjects(): ProjectConfig[] {
     projectType: string;
     enabled?: boolean;
     repos?: Array<{ path: string; remote?: string; branch?: string }>;
+    stages?: Record<string, string>;
     config?: Record<string, unknown>;
   }>;
 
@@ -181,6 +184,9 @@ export function loadProjects(): ProjectConfig[] {
       projectType: p.projectType,
       enabled: p.enabled ?? true,
       repos,
+      // issue #32: stage → skill map. Defaults to empty (no dispatch) when a
+      // project declares no stages; the two core stages are "ready"/"in-review".
+      stages: p.stages ?? {},
       config: p.config,
     };
   });

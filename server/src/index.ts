@@ -2,11 +2,11 @@ import Fastify from "fastify";
 import cors from "@fastify/cors";
 import path from "path";
 import fs from "fs";
-import { loadConfig, getEnabledProjects, loadProjects, buildProjectContext } from "./config.js";
+import { loadConfig, getEnabledProjects, loadProjects } from "./config.js";
 import { getDb } from "./db/index.js";
 import { registerApiRoutes, startPoller } from "./routes/api.js";
 import { checkTmux } from "./services/tmux.js";
-import { resolvePlugin, getPluginName } from "./plugins/loader.js";
+import { getPluginName } from "./plugins/loader.js";
 import { createLogger } from "./services/logger.js";
 
 const log = createLogger("server");
@@ -37,12 +37,9 @@ async function main() {
   getDb();
   log.info(`SQLite initialized at ${config.dbPath}`);
 
-  // --- Start the HTTP server BEFORE plugin init. ---
-  // Plugin init() shells out to `gh` synchronously (execSync blocks the event
-  // loop for several seconds). If we init before listen(), nothing is accepting
-  // connections during that window and the dashboard's early /api requests are
-  // refused with ECONNREFUSED. Listening first means the socket is open, so any
-  // request that lands during init simply queues and is served once init done.
+  // --- Start the HTTP server. ---
+  // (The plugin's project metadata is resolved lazily inside list()/writeLabel(),
+  // so there is no blocking init pass at startup — issue #32.)
   const app = Fastify({ logger: false });
 
   await app.register(cors, { origin: true });
@@ -78,31 +75,6 @@ async function main() {
   log.info(`🚀 Talos Loop running on http://localhost:${config.port}`);
   log.info(`📊 Dashboard: http://localhost:${config.port}`)
   log.info(`📡 API: http://localhost:${config.port}/api/status`)
-
-  // Initialize the plugin for each enabled project. The plugin is a singleton
-  // per type, so init() must be idempotent per projectId (it populates a
-  // per-project cache); calling it once per project is correct.
-  const enabledProjects = getEnabledProjects();
-  for (const project of enabledProjects) {
-    try {
-      const plugin = await resolvePlugin(project.projectType);
-      const ctx = buildProjectContext(project, createLogger(`plugin:${plugin.name}`));
-
-      log.info(`Initializing plugin "${plugin.name}" for project ${project.projectId}...`)
-      await plugin.init(ctx)
-
-      const healthy = await plugin.test(ctx);
-      if (!healthy) {
-        log.warn(`Plugin "${plugin.name}" health check failed for ${project.projectId} — project may not work correctly`);
-      } else {
-        log.info(`Plugin "${plugin.name}" initialized and healthy for ${project.projectId}`);
-      }
-    } catch (err: any) {
-      log.error(`Plugin "${project.projectType}" failed to initialize for ${project.projectId}: ${err.message}`);
-      project.enabled = false;
-      log.warn(`Project "${project.projectId}" has been disabled due to initialization failure`);
-    }
-  }
 
   const activeProjects = getEnabledProjects();
   log.info(`⏱  Polling every ${config.pollInterval / 1000}s for ${activeProjects.length} project(s)`);

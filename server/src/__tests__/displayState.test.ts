@@ -8,7 +8,7 @@ vi.mock("../services/tmux.js", () => ({
   isAlive: (name: string) => aliveNames.has(name),
 }));
 
-import { deriveDisplayState, isSessionLive, liveSessionName } from "../services/displayState.js";
+import { deriveDisplayState, isSessionLive, liveSessionName, mapBoardStatus } from "../services/displayState.js";
 
 function session(overrides: Partial<Session> = {}): Session {
   return {
@@ -16,12 +16,14 @@ function session(overrides: Partial<Session> = {}): Session {
     issue_id: 9,
     tmux_session: "tl-x",
     status: "running",
-    pr_url: null,
     error: null,
     started_at: "",
     finished_at: null,
     type: "coding",
     branch: null,
+    worktree_path: null,
+    claude_session_id: null,
+    retry_count: 0,
     ...overrides,
   };
 }
@@ -38,11 +40,27 @@ describe("isSessionLive() (issue #19)", () => {
     // running but dead (zombie) → not live
     aliveNames = new Set();
     expect(isSessionLive(session({ tmux_session: "tl-a", status: "running" }))).toBe(false);
-    // alive-looking but already done → not live
+    // alive-looking but already terminal → not live
     aliveNames = new Set(["tl-a"]);
     expect(isSessionLive(session({ tmux_session: "tl-a", status: "done" }))).toBe(false);
     expect(isSessionLive(session({ tmux_session: "tl-a", status: "failed" }))).toBe(false);
-    expect(isSessionLive(session({ tmux_session: "tl-a", status: "skipped" }))).toBe(false);
+    expect(isSessionLive(session({ tmux_session: "tl-a", status: "killed" }))).toBe(false);
+  });
+});
+
+describe("mapBoardStatus() — standard-state passthrough (issue #32)", () => {
+  it("passes the standard states straight through", () => {
+    expect(mapBoardStatus("queued")).toBe("queued");
+    expect(mapBoardStatus("processing")).toBe("processing");
+    expect(mapBoardStatus("done")).toBe("done");
+  });
+
+  it("returns null for unknown/empty values (indeterminate)", () => {
+    expect(mapBoardStatus("Backlog")).toBeNull();
+    expect(mapBoardStatus("Ready")).toBeNull(); // raw GitHub column names are no longer stored
+    expect(mapBoardStatus("")).toBeNull();
+    expect(mapBoardStatus(null)).toBeNull();
+    expect(mapBoardStatus(undefined)).toBeNull();
   });
 });
 
@@ -55,29 +73,37 @@ describe("deriveDisplayState() — stage badge is board-driven, review-unaffecte
     aliveNames = new Set(["tl-c"]);
     const state = deriveDisplayState(
       [session({ tmux_session: "tl-c", type: "coding", status: "running" })],
-      "Ready",
+      "queued",
     );
     expect(state).toBe("processing");
   });
 
-  it("a live REVIEW session does NOT override the board — badge stays In review (done)", () => {
+  it("a live REVIEW session does NOT override the board — badge stays done", () => {
     aliveNames = new Set(["tl-r"]);
     const state = deriveDisplayState(
       [session({ tmux_session: "tl-r", type: "review", status: "running" })],
-      "In review",
+      "done",
     );
-    // Board-driven (In review → done), NOT processing — user story 9.
+    // Board-driven (done), NOT processing — user story 9.
     expect(state).toBe("done");
   });
 
-  it("a live review session never reads as processing even against a Ready board", () => {
+  it("a live review session never reads as processing even against a queued board", () => {
     aliveNames = new Set(["tl-r"]);
     const state = deriveDisplayState(
       [session({ tmux_session: "tl-r", type: "review", status: "running" })],
-      "Ready",
+      "queued",
     );
-    // The review session is invisible to the stage badge; the board column wins.
+    // The review session is invisible to the stage badge; the board state wins.
     expect(state).toBe("queued");
+  });
+
+  it("falls back to the board state when no session is live", () => {
+    aliveNames = new Set();
+    expect(deriveDisplayState([], "queued")).toBe("queued");
+    expect(deriveDisplayState([], "processing")).toBe("processing");
+    expect(deriveDisplayState([], "done")).toBe("done");
+    expect(deriveDisplayState([], "Backlog")).toBeNull();
   });
 
   it("liveSessionName still surfaces a live review session as an attach target", () => {

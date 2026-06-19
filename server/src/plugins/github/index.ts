@@ -7,23 +7,18 @@ import type {
   ProjectContext,
   RepoRef,
   RawIssue,
-  BoardItem,
   IssueStatus,
   IssueState,
   StatusTransition,
-  PluginCapability,
-  QuotaStatus,
-  ReviewThread,
 } from "../../types/plugin.js";
 
 /**
- * Default label vocabulary. `ready-for-agent` is a permanent eligibility
- * marker set during PRD authoring (never modified by talos-loop); `skipped`
- * is the durable skip marker the plugin applies. Both may be overridden via
- * project `config`. Core never reads these — they live entirely in the plugin.
+ * The permanent eligibility marker an issue carries to be picked up by
+ * talos-loop (set during PRD authoring; never modified by talos-loop). May be
+ * overridden via project `config`. Core never reads it — it lives entirely in
+ * the plugin. (The `skipped` label and the skip action were removed in issue #32.)
  */
 const DEFAULT_TRIGGER = "ready-for-agent";
-const DEFAULT_SKIP = "skipped";
 
 /** Per-project cached metadata resolved once from the GitHub Projects API. */
 interface ProjectMeta {
@@ -34,21 +29,16 @@ interface ProjectMeta {
 
 interface GitHubConfig {
   triggerLabel?: string;
-  skipLabel?: string;
 }
 
-/** Resolve the trigger/skip labels from config (defaults apply). */
-function resolveLabels(ctx: ProjectContext): { trigger: string; skip: string } {
-  const c = (ctx.config ?? {}) as GitHubConfig;
-  return {
-    trigger: c.triggerLabel ?? DEFAULT_TRIGGER,
-    skip: c.skipLabel ?? DEFAULT_SKIP,
-  };
+/** Resolve the trigger label from config (default applies). */
+function resolveTrigger(ctx: ProjectContext): string {
+  return ((ctx.config ?? {}) as GitHubConfig).triggerLabel ?? DEFAULT_TRIGGER;
 }
 
 interface GhItem {
   id: string;                  // PVTI_xxx item node id
-  status: string;              // option name (e.g. "Ready", "In progress")
+  status: string;              // option name (e.g. "Ready", "In progress", "In review")
   content: {
     number: number;
     title: string;
@@ -70,20 +60,21 @@ function parseProjectId(projectId: string): { owner: string; number: number } {
   return { owner: m[1], number: parseInt(m[2], 10) };
 }
 
-/**
- * Parse a GitHub PR URL → { owner, repo, number } (issue #19). Accepts the plain
- * PR url (and tolerates a trailing path/query). owner/repo are validated to a
- * shell/GraphQL-safe shape since they are inlined into GraphQL literals.
- */
-function parsePrUrl(prUrl: string): { owner: string; repo: string; number: number } {
-  const m = prUrl.match(/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/);
-  if (!m) throw new Error(`Invalid PR url "${prUrl}" — expected "https://github.com/owner/repo/pull/<number>"`);
-  const owner = m[1];
-  const repo = m[2];
-  if (!/^[\w.-]+$/.test(owner) || !/^[\w.-]+$/.test(repo)) {
-    throw new Error(`Invalid owner/repo in PR url "${prUrl}"`);
+/** Split an "owner/repo" remote into its parts (validated to a shell/GraphQL-safe shape). */
+function parseRemote(remote: string): { owner: string; repo: string } {
+  const m = remote.match(/^([\w.-]+)\/([\w.-]+)$/);
+  if (!m) throw new Error(`Invalid remote "${remote}" — expected "owner/repo"`);
+  return { owner: m[1], repo: m[2] };
+}
+
+/** Map a GitHub Projects status option name to a standard core state. */
+function statusNameToState(name: string): IssueState | null {
+  switch (norm(name)) {
+    case "ready": return "queued";
+    case "inprogress": return "processing";
+    case "inreview": return "done";
+    default: return null; // Backlog / Done(terminal) / unknown — not an active pipeline state
   }
-  return { owner, repo, number: parseInt(m[3], 10) };
 }
 
 /** Map a core state to the GitHub Projects status option name. */
@@ -104,54 +95,31 @@ export class GitHubIssueSourcePlugin implements IssueSourcePlugin {
   /** Per-project cache keyed by projectId. The plugin is a singleton (one per type). */
   private cache = new Map<string, ProjectMeta>();
 
-  /** Active-board cache per project so discover() + listBoard() share one item-list per poll cycle. */
+  /** Active-board cache per project so list() shares one item-list per poll cycle. */
   private boardCache = new Map<string, { items: GhItem[]; at: number }>();
   private static readonly BOARD_CACHE_TTL_MS = 10_000;
 
-  /** Quota probe cache (token-wide): collapses concurrent per-project probes within one poll. */
-  private quotaCache: { remaining: number; limit: number; reset: number; at: number } | null = null;
-  private static readonly QUOTA_TTL_MS = 5_000;
-
-  async init(ctx: ProjectContext): Promise<void> {
-    this.ensureCache(ctx);
-
-    const { skip } = resolveLabels(ctx);
-    // Create the skipped label on every repo that has a resolvable remote.
-    for (const repo of ctx.repos) {
-      if (!repo.remote) {
-        ctx.logger.warn(`Repo "${repo.name}" has no remote — cannot ensure "${skip}" label`);
-        continue;
-      }
-      try {
-        execSync(
-          `gh label create "${skip}" --repo ${repo.remote} --color BFD4F2 --description "Agent skipped this issue" --force`,
-          { timeout: 10_000, stdio: "pipe" },
-        );
-      } catch {
-        // label likely already exists
-      }
-    }
-    ctx.logger.info(`GitHub plugin initialized for project ${ctx.projectId}`);
-  }
-
-  async discover(ctx: ProjectContext): Promise<RawIssue[]> {
-    try {
-      this.ensureCache(ctx);
-    } catch (err: any) {
-      ctx.logger.error(`discover: failed to resolve project meta: ${err.message}`);
-      return [];
-    }
-
-    // readBoard shares one item-list with listBoard() (cached this poll cycle) and
-    // already narrows server-side to eligible, non-skipped, active items.
-    const items = this.readBoard(ctx);
+  /**
+   * Return every active, eligible issue with its standard `state` and, for
+   * in-review (done) issues, a `review` subIssue when the linked PR has an
+   * unresolved review thread. This single read replaces the old discover() +
+   * listBoard() pair (issue #32): the server routes dispatch by `state`, and
+   * the poller rebuilds the dashboard board snapshot from these states.
+   *
+   * Read failures THROW (issue #13) so the poller surfaces "board read failed"
+   * rather than mistaking it for an empty board. A review-thread probe failure
+   * is NOT a board-read failure — it is swallowed (the issue is returned without
+   * a review subIssue this cycle, i.e. treated as "no review work"), so a
+   * transient GraphQL hiccup never breaks polling.
+   */
+  async list(ctx: ProjectContext): Promise<RawIssue[]> {
+    const items = this.readBoard(ctx); // throws on read failure (no silent empty)
     const results: RawIssue[] = [];
 
     for (const item of items) {
-      // Only Ready items are actionable; In progress / In review / Done are tracked
-      // elsewhere (sessions table) and must not be re-dispatched.
-      if (norm(item.status ?? "") !== "ready") continue;
       if (!item.content) continue;
+      const state = statusNameToState(item.status ?? "");
+      if (!state) continue; // terminal / unknown column — not active
 
       const remote = item.content.repository;
       const repo = ctx.repos.find((r) => r.remote === remote);
@@ -164,70 +132,32 @@ export class GitHubIssueSourcePlugin implements IssueSourcePlugin {
         continue;
       }
 
-      results.push({
+      const raw: RawIssue = {
         sourceId: String(item.content.number),
         url: item.content.url,
         title: item.content.title,
         targetRepo: repo.name,
-        state: "queued",
-      });
+        state,
+      };
+
+      // An in-review issue: signal unresolved review work so the server can
+      // dispatch the review skill. The probe is best-effort (see method doc).
+      if (state === "done") {
+        const hasUnresolved = await this.hasUnresolvedReviewThread(ctx, remote, item.content.number);
+        if (hasUnresolved) raw.subIssues = [{ type: "review", resolved: false }];
+      }
+
+      results.push(raw);
     }
 
-    ctx.logger.info(`${ctx.projectId}: discovered ${results.length} ready issue(s)`);
+    ctx.logger.info(`${ctx.projectId}: listed ${results.length} active issue(s)`);
     return results;
   }
 
-  async listBoard(ctx: ProjectContext): Promise<BoardItem[]> {
-    try {
-      this.ensureCache(ctx);
-    } catch (err: any) {
-      ctx.logger.error(`listBoard: failed to resolve project meta: ${err.message}`);
-      return [];
-    }
-    // readBoard shares one item-list with discover() (cached this poll cycle) and
-    // returns only the active, eligible set. It throws on read failure (issue #13:
-    // no silent empty) — the poller surfaces it as a "board read failed" warning.
-    const items = this.readBoard(ctx);
-    const results: BoardItem[] = [];
-    for (const item of items) {
-      if (!item.content) continue;
-      results.push({
-        sourceId: String(item.content.number),
-        repository: item.content.repository,
-        boardStatus: item.status ?? "",
-        url: item.content.url,
-        title: item.content.title,
-      });
-    }
-    return results;
-  }
-
-  async checkQuota(_ctx: ProjectContext): Promise<QuotaStatus> {
-    const now = Date.now();
-    const cached = this.quotaCache;
-    if (cached && now - cached.at < GitHubIssueSourcePlugin.QUOTA_TTL_MS) {
-      return { available: true, remaining: cached.remaining, limit: cached.limit, resetAt: new Date(cached.reset * 1000) };
-    }
-    try {
-      // `gh api rate_limit` is a free probe (costs neither REST nor GraphQL quota)
-      // and reports both budgets. talos-loop only burns GraphQL, so that is what
-      // we surface for the poller's skip decision.
-      const raw = execSync("gh api rate_limit", { encoding: "utf-8", timeout: 10_000, stdio: "pipe" });
-      const graphql = (JSON.parse(raw) as { resources?: { graphql?: { remaining?: number; limit?: number; reset?: number } } }).resources?.graphql;
-      if (!graphql) return { available: false, error: "rate_limit response missing graphql resource" };
-      this.quotaCache = { remaining: graphql.remaining ?? 0, limit: graphql.limit ?? 0, reset: graphql.reset ?? 0, at: now };
-      return { available: true, remaining: this.quotaCache.remaining, limit: this.quotaCache.limit, resetAt: new Date(this.quotaCache.reset * 1000) };
-    } catch (err: any) {
-      // A probe failure must never block polling — surface it and let the caller
-      // fall through to a normal (possibly rate-limited) board read.
-      return { available: false, error: err.message };
-    }
-  }
-
-  async getStatus(ctx: ProjectContext, sourceId: string, targetRepo: string): Promise<IssueStatus> {
+  async getItem(ctx: ProjectContext, sourceId: string, targetRepo: string): Promise<IssueStatus> {
     const repo = this.repoByName(ctx, targetRepo);
     if (!repo?.remote) return { state: null };
-    const { trigger, skip } = resolveLabels(ctx);
+    const trigger = resolveTrigger(ctx);
     try {
       const raw = execSync(
         `gh issue view ${sourceId} --repo ${repo.remote} --json labels`,
@@ -235,55 +165,45 @@ export class GitHubIssueSourcePlugin implements IssueSourcePlugin {
       );
       const data = JSON.parse(raw);
       const labels: string[] = (data.labels ?? []).map((l: { name: string }) => l.name);
-      // Actionable iff it still carries the eligibility marker and has not been skipped.
-      if (labels.includes(trigger) && !labels.includes(skip)) return { state: "queued" };
+      // Actionable iff it still carries the eligibility marker.
+      if (labels.includes(trigger)) return { state: "queued" };
       return { state: null };
     } catch (err: any) {
-      // Distinguish a real read failure from a genuinely-not-actionable issue
-      // (issue #13): surface it prominently rather than silently masquerading as
-      // "not actionable". Behavior is unchanged (treated as not queued) so a
-      // transient gh outage doesn't dispatch stale issues.
-      ctx.logger.warn(`getStatus: issue read failed for ${repo.remote}#${sourceId} — treating as not actionable: ${err.message}`);
+      ctx.logger.warn(`getItem: issue read failed for ${repo.remote}#${sourceId} — treating as not actionable: ${err.message}`);
       return { state: null };
     }
   }
 
-  async test(_ctx: ProjectContext): Promise<boolean> {
-    try {
-      execSync("gh auth status", { timeout: 10_000, stdio: "pipe" });
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
-  async transition(ctx: ProjectContext, sourceId: string, transition: StatusTransition, targetRepo: string): Promise<void> {
+  /**
+   * Advance the stage by editing the project item's Status single-select. The
+   * server only initiates queued→processing (dispatch) and processing→done
+   * (clean exit detected via sentinel). Reads the board to find the item node
+   * id — a read failure warns and bails (no edit attempted).
+   */
+  async writeLabel(ctx: ProjectContext, sourceId: string, transition: StatusTransition, targetRepo: string): Promise<void> {
     const meta = this.ensureCache(ctx);
     const { owner, number } = parseProjectId(ctx.projectId);
     const repo = this.repoByName(ctx, targetRepo);
     if (!repo?.remote) {
-      ctx.logger.error(`transition: repo "${targetRepo}" has no remote`);
+      ctx.logger.error(`writeLabel: repo "${targetRepo}" has no remote`);
       return;
     }
 
     const optionId = meta.options.get(norm(stateToStatusName(transition.to)));
     if (!optionId) {
-      ctx.logger.error(`transition: no project option maps to state "${transition.to}"`);
+      ctx.logger.error(`writeLabel: no project option maps to state "${transition.to}"`);
       return;
     }
 
-    // findItem reads the board via ghItemList, which throws on read failure
-    // (issue #13). Distinguish that transient failure from a genuinely-absent
-    // item: a read failure warns and bails; an absent item errors and bails.
     let item: GhItem | undefined;
     try {
       item = this.findItem(owner, number, sourceId, repo.remote);
     } catch (err: any) {
-      ctx.logger.warn(`transition: board read failed for ${repo.remote}#${sourceId} — cannot transition: ${err.message}`);
+      ctx.logger.warn(`writeLabel: board read failed for ${repo.remote}#${sourceId} — cannot transition: ${err.message}`);
       return;
     }
     if (!item) {
-      ctx.logger.error(`transition: project item for ${repo.remote}#${sourceId} not found on board`);
+      ctx.logger.error(`writeLabel: project item for ${repo.remote}#${sourceId} not found on board`);
       return;
     }
 
@@ -293,14 +213,14 @@ export class GitHubIssueSourcePlugin implements IssueSourcePlugin {
         { timeout: 15_000, stdio: "pipe" },
       );
     } catch (err: any) {
-      ctx.logger.error(`transition failed for ${repo.remote}#${sourceId}: ${err.message}`);
+      ctx.logger.error(`writeLabel failed for ${repo.remote}#${sourceId}: ${err.message}`);
     }
   }
 
-  async onComment(ctx: ProjectContext, sourceId: string, comment: string, targetRepo: string): Promise<void> {
+  async writeComment(ctx: ProjectContext, sourceId: string, comment: string, targetRepo: string): Promise<void> {
     const repo = this.repoByName(ctx, targetRepo);
     if (!repo?.remote) {
-      ctx.logger.error(`onComment: repo "${targetRepo}" has no remote`);
+      ctx.logger.error(`writeComment: repo "${targetRepo}" has no remote`);
       return;
     }
     try {
@@ -316,119 +236,40 @@ export class GitHubIssueSourcePlugin implements IssueSourcePlugin {
     }
   }
 
-  async skip(ctx: ProjectContext, sourceId: string, targetRepo: string, reason: string): Promise<void> {
-    const repo = this.repoByName(ctx, targetRepo);
-    if (!repo?.remote) {
-      ctx.logger.error(`skip: repo "${targetRepo}" has no remote`);
-      return;
-    }
-    const { skip: skipLabel } = resolveLabels(ctx);
-
-    try {
-      execSync(`gh issue edit ${sourceId} --repo ${repo.remote} --add-label "${skipLabel}"`, {
-        timeout: 15_000,
-        stdio: "pipe",
-      });
-    } catch (err: any) {
-      ctx.logger.error(`skip: failed to add "${skipLabel}" label on ${repo.remote}#${sourceId}: ${err.message}`);
-    }
-
-    if (this.onComment) {
-      await this.onComment(ctx, sourceId, `⏭️ Agent skipped this issue.\n\nReason: ${reason}`, targetRepo);
-    }
-
-    // Return the board status to Ready (the issue stays parked via the skip label).
-    await this.transition(ctx, sourceId, { from: "processing", to: "queued" }, targetRepo);
-  }
-
-  capabilities(): PluginCapability[] {
-    return [
-      { action: "submit-pr", description: "完成编码后提交 PR", params: [{ name: "branch", description: "PR 源分支名" }] },
-      { action: "comment", description: "在工作项留言", params: [{ name: "message", description: "留言内容" }] },
-      { action: "skip", description: "放弃任务", params: [{ name: "reason", description: "跳过原因" }] },
-      // resolve-thread (issue #19): the review-fix agent calls this after
-      // addressing each thread so GitHub's native thread state is the single
-      // source of truth. `threadId` is the review-thread node id from
-      // listUnresolvedThreads(); `prUrl` identifies the PR (the agent knows both
-      // from its prompt).
-      { action: "resolve-thread", description: "解决 PR 评审线程（修复后调用）", params: [{ name: "threadId", description: "评审线程节点 id" }, { name: "prUrl", description: "PR 地址" }] },
-    ];
-  }
-
-  async submitPr(ctx: ProjectContext, sourceId: string, branch: string, targetRepo: string): Promise<string> {
-    const repo = this.repoByName(ctx, targetRepo);
-    if (!repo?.remote) {
-      throw new Error(`submitPr: repo "${targetRepo}" has no remote`);
-    }
-    // Single responsibility: create the PR and return its URL. The dispatcher
-    // performs session finalization (transition, comment, status) once it reads
-    // this URL back from the stored session.
-    // Issue #28: target the repo's declared baseline branch (default "main") so a
-    // repo on master/develop doesn't fail PR creation against a non-existent base.
-    const base = repo.branch ?? "main";
-    const title = `Closes #${sourceId}`;
-    const raw = execSync(
-      `gh pr create --head ${branch} --base ${base} --title "${title}" --repo ${repo.remote} --json url`,
-      { encoding: "utf-8", timeout: 30_000, stdio: "pipe" },
-    );
-    const url = (JSON.parse(raw) as { url?: string }).url;
-    if (!url) throw new Error(`submitPr: could not parse PR URL from gh output for ${repo.remote}#${sourceId}`);
-    ctx.logger.info(`Created PR for ${repo.remote}#${sourceId} from branch ${branch}: ${url}`);
-    return url;
-  }
+  // --- internals ---
 
   /**
-   * Unresolved review threads on a PR (issue #19). GitHub's GraphQL is the only
-   * source — `gh pr view` does not expose the thread node id that
-   * `resolveReviewThread` needs. A transient read failure returns [] (treated by
-   * `dispatchReview()` as "no work, skip this cycle"); unresolved threads still
-   * exist, so the next poll cycle retries.
+   * Does the open PR cross-referencing this issue have any unresolved review
+   * thread? Drives the `review` subIssue signal in list(). Single GraphQL call
+   * over the issue's cross-reference timeline. Fault-tolerant: any failure
+   * (network, malformed, no linked PR) returns false — the issue is then treated
+   * as having no review work this cycle, and the next poll retries the probe.
    */
-  async listUnresolvedThreads(ctx: ProjectContext, prUrl: string): Promise<ReviewThread[]> {
-    const { owner, repo, number } = parsePrUrl(prUrl);
-    // Inline the (validated) owner/repo/number as GraphQL literals. owner/repo
-    // match ^[\w.-]+$ and number is an integer, so this is injection-safe and
-    // avoids the GraphQL-Int-vs-String coercion pitfall of a `-F number=` arg.
-    const query = `query{repository(owner:"${owner}",name:"${repo}"){pullRequest(number:${number}){reviewThreads(first:100){nodes{id isResolved path comments(first:1){nodes{body}}}}}}}`;
+  private async hasUnresolvedReviewThread(ctx: ProjectContext, remote: string, issueNumber: number): Promise<boolean> {
+    let owner: string;
+    let repo: string;
+    try {
+      ({ owner, repo } = parseRemote(remote));
+    } catch {
+      return false;
+    }
+    // Cross-referenced PRs that touch this issue; walk each PR's review threads.
+    const query = `query{repository(owner:"${owner}",name:"${repo}"){issue(number:${issueNumber}){timelineItems(first:50,itemTypes:[CROSS_REFERENCED_EVENT]){nodes{...on CrossReferencedEvent{source{...on PullRequest{reviewThreads(first:100){nodes{isResolved}}}}}}}}}}`;
     let raw: string;
     try {
       raw = execSync(`gh api graphql -f query='${query}'`, { encoding: "utf-8", timeout: 30_000, stdio: "pipe" });
     } catch (err: any) {
-      ctx.logger.warn(`listUnresolvedThreads: GraphQL read failed for ${owner}/${repo}#${number}: ${err.message}`);
-      return [];
+      ctx.logger.warn(`review probe failed for ${remote}#${issueNumber}: ${err.message}`);
+      return false;
     }
-    const threads =
-      (JSON.parse(raw) as { data?: { repository?: { pullRequest?: { reviewThreads?: { nodes?: Array<{ id: string; isResolved: boolean; path?: string; comments?: { nodes?: Array<{ body?: string }> } }> } } } } })?.data?.repository?.pullRequest?.reviewThreads?.nodes ?? [];
-    return threads
-      .filter((t) => !t.isResolved)
-      .map((t) => ({
-        id: String(t.id),
-        body: t.comments?.nodes?.[0]?.body ?? "",
-        path: t.path,
-        resolved: false,
-      }));
-  }
-
-  /**
-   * Resolve one review thread via the GraphQL `resolveReviewThread` mutation
-   * (issue #19). `threadId` is the review-thread node id. The id is validated to
-   * a node-id shape (GitHub ids are base64-ish `[A-Za-z0-9_]+`) before inlining
-   * into the mutation — it carries no shell or GraphQL quoting hazard once
-   * validated. Errors propagate so the agent sees the failure.
-   */
-  async resolveThread(ctx: ProjectContext, _sourceId: string, prUrl: string, threadId: string): Promise<void> {
-    if (!/^[\w]+$/.test(threadId)) throw new Error(`resolveThread: invalid thread id "${threadId}"`);
-    parsePrUrl(prUrl); // validate the PR url shape (owner/repo/#)
-    const mutation = `mutation{resolveReviewThread(input:{threadId:"${threadId}"}){thread{isResolved}}}`;
-    try {
-      execSync(`gh api graphql -f query='${mutation}'`, { encoding: "utf-8", timeout: 15_000, stdio: "pipe" });
-    } catch (err: any) {
-      ctx.logger.error(`resolveThread: failed to resolve thread ${threadId} on ${prUrl}: ${err.message}`);
-      throw err;
+    const nodes =
+      (JSON.parse(raw) as { data?: { repository?: { issue?: { timelineItems?: { nodes?: Array<{ source?: { reviewThreads?: { nodes?: Array<{ isResolved?: boolean }> } } }> } } } } })?.data?.repository?.issue?.timelineItems?.nodes ?? [];
+    for (const node of nodes) {
+      const threads = node.source?.reviewThreads?.nodes ?? [];
+      if (threads.some((t) => !t.isResolved)) return true;
     }
+    return false;
   }
-
-  // --- internals ---
 
   /** Resolve (and cache) project metadata: node id, status field id, option ids. */
   private ensureCache(ctx: ProjectContext): ProjectMeta {
@@ -465,15 +306,12 @@ export class GitHubIssueSourcePlugin implements IssueSourcePlugin {
   }
 
   /**
-   * Read the active board — eligible (trigger label), not skipped, in an active
-   * column — once per poll cycle, cached so discover() and listBoard() share a
-   * single `gh project item-list`. Halving the GraphQL spend matters because this
-   * token's 5000/h budget is shared with the dispatched agent.
-   *
-   * Status uses exclusion form: repeating a single-select `status:` qualifier is
-   * AND (not OR), so "Ready OR In progress OR In review" is expressed by negating
-   * the two terminal columns Backlog/Done. Assumes standard five column names.
-   * Throws on read failure (issue #13) so callers distinguish empty from broken.
+   * Read the active board — eligible (trigger label), non-terminal — once per
+   * poll cycle, cached so list() (and the dashboard snapshot) share a single
+   * `gh project item-list`. Status uses exclusion form: repeating a
+   * single-select `status:` qualifier is AND (not OR), so the active set is
+   * expressed by negating the terminal columns Backlog/Done. Throws on read
+   * failure (issue #13) so callers distinguish empty from broken.
    */
   private readBoard(ctx: ProjectContext): GhItem[] {
     const cached = this.boardCache.get(ctx.projectId);
@@ -481,17 +319,17 @@ export class GitHubIssueSourcePlugin implements IssueSourcePlugin {
       return cached.items;
     }
     const { owner, number } = parseProjectId(ctx.projectId);
-    const { trigger, skip } = resolveLabels(ctx);
-    const items = this.ghItemList(owner, number, `label:${trigger} -label:${skip} -status:Backlog -status:Done`);
+    const trigger = resolveTrigger(ctx);
+    const items = this.ghItemList(owner, number, `label:${trigger} -status:Backlog -status:Done`);
     this.boardCache.set(ctx.projectId, { items, at: Date.now() });
     return items;
   }
 
   /**
    * Read the project item-list. Throws on read failure (issue #13) instead of
-   * silently returning [] — callers (discover / listBoard / findItem) then
-   * distinguish a real empty board from an unreadable one, so a transient gh
-   * outage or rate limit is surfaced rather than masquerading as "no items".
+   * silently returning [] — callers then distinguish a real empty board from an
+   * unreadable one, so a transient gh outage is surfaced rather than
+   * masquerading as "no items".
    */
   private ghItemList(owner: string, number: number, query?: string): GhItem[] {
     const q = query ? ` --query "${query}"` : "";

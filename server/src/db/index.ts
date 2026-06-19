@@ -18,17 +18,24 @@ export function getDb(): Database.Database {
 }
 
 function migrate(db: Database.Database) {
-  // Clean break: drop & recreate if the issues table carries columns removed by
-  // issue #13 (the persisted `status` / `tmux_session` workflow columns — now
-  // derived) or predates the GitHub Projects schema from #9 (`source_type`
-  // without `project_id`). This is an internal system; a data reset is
-  // acceptable (issues #9 and #13 both mandate clean breaks).
+  // Clean break on legacy schemas. issue #32 reshapes the sessions table (drops
+  // pr_url — the server no longer tracks PRs — and adds retry_count for the
+  // auto claude -r retry). Any sessions table still carrying `pr_url`, or
+  // predating the GitHub Projects schema from #9, is dropped & recreated. This
+  // is an internal system; a data reset is acceptable (prior issues mandate the
+  // same clean break).
   const cols = db.prepare("PRAGMA table_info(issues)").all() as Array<{ name: string }>;
   const hasCol = (name: string) => cols.some((c) => c.name === name);
-  const legacy =
+  const issuesLegacy =
     cols.length > 0 &&
     (hasCol("status") || hasCol("tmux_session") || (hasCol("source_type") && !hasCol("project_id")));
-  if (legacy) {
+
+  const sessionCols = db.prepare("PRAGMA table_info(sessions)").all() as Array<{ name: string }>;
+  const hasSessionCol = (name: string) => sessionCols.some((c) => c.name === name);
+  // issue #32: pr_url is gone; retry_count is new. Either signature ⇒ rebuild.
+  const sessionsLegacy = sessionCols.length > 0 && (hasSessionCol("pr_url") || !hasSessionCol("retry_count"));
+
+  if (issuesLegacy || sessionsLegacy) {
     db.exec("DROP TABLE IF EXISTS sessions");
     db.exec("DROP TABLE IF EXISTS issues");
   }
@@ -52,27 +59,27 @@ function migrate(db: Database.Database) {
       issue_id INTEGER NOT NULL REFERENCES issues(id),
       tmux_session TEXT NOT NULL,
       status TEXT NOT NULL DEFAULT 'running',
-      pr_url TEXT,
       error TEXT,
       started_at TEXT NOT NULL DEFAULT (datetime('now')),
       finished_at TEXT,
-      -- issue #19: distinguish coding sessions (create a PR) from review
-      -- sessions (fix review threads on an existing PR). Defaults to 'coding'
-      -- so pre-existing rows — and all callers that don't pass a type — keep
-      -- the original behavior.
+      -- 'coding' (default, implements the issue) or 'review' (fixes review
+      -- threads on an existing PR). Drives how checkRunningSessions classifies
+      -- the session: review sessions never advance the board.
       type TEXT NOT NULL DEFAULT 'coding',
-      -- The PR head branch: written by submit-pr for coding sessions and set at
-      -- dispatch for review sessions (the branch they push fixes to).
+      -- The PR head branch the agent pushes to (coding cuts it; review checks
+      -- it out to push fixes to the existing PR).
       branch TEXT,
-      -- issue #21: the server-determined worktree path. Written at dispatch so
-      -- the path is known to the server without the agent reporting back; a
-      -- retry session inherits it from the failed session to reuse the worktree.
+      -- The server-determined worktree path. Written at dispatch so the path is
+      -- known without the agent reporting back; a retry/claude -r session
+      -- inherits it to reuse the worktree.
       worktree_path TEXT,
-      -- issue #30: the Claude Code -p session id, captured by the stream
-      -- formatter at the stream's init event and persisted by the dispatcher so
-      -- an operator can 'claude -r <id>' to resume/inspect any session (running,
-      -- failed, or done). Written mid-run, so it survives a crash.
-      claude_session_id TEXT
+      -- The captured Claude Code session id, for "claude -r" resume/inspect.
+      -- Written mid-run by the dispatcher (from the stream-formatter sidecar),
+      -- so it survives a crash and is available for retry.
+      claude_session_id TEXT,
+      -- issue #32: how many claude -r retries have run for this issue's chain.
+      -- The server auto-retries a crashed coding session up to maxRetry times.
+      retry_count INTEGER NOT NULL DEFAULT 0
     );
 
     CREATE INDEX IF NOT EXISTS idx_issues_project ON issues(project_id);
@@ -80,38 +87,15 @@ function migrate(db: Database.Database) {
     CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);
     CREATE INDEX IF NOT EXISTS idx_sessions_issue ON sessions(issue_id);
   `);
-
-  // issue #19: additive migration — add the `type`/`branch` columns to an
-  // existing sessions table without dropping it (non-destructive, unlike the
-  // legacy clean-break above). CREATE TABLE IF NOT EXISTS is a no-op when the
-  // table predates these columns, so we ALTER them in explicitly. ADD COLUMN
-  // with a default back-fills existing rows ('coding' / NULL) in one statement.
-  const sessionCols = db.prepare("PRAGMA table_info(sessions)").all() as Array<{ name: string }>;
-  const hasSessionCol = (name: string) => sessionCols.some((c) => c.name === name);
-  if (!hasSessionCol("type")) {
-    db.exec("ALTER TABLE sessions ADD COLUMN type TEXT NOT NULL DEFAULT 'coding'");
-  }
-  if (!hasSessionCol("branch")) {
-    db.exec("ALTER TABLE sessions ADD COLUMN branch TEXT");
-  }
-  // issue #21: additive migration for the server-determined worktree path.
-  if (!hasSessionCol("worktree_path")) {
-    db.exec("ALTER TABLE sessions ADD COLUMN worktree_path TEXT");
-  }
-  // issue #30: additive migration for the captured Claude Code session id.
-  if (!hasSessionCol("claude_session_id")) {
-    db.exec("ALTER TABLE sessions ADD COLUMN claude_session_id TEXT");
-  }
 }
 
 // --- Issue Types ---
 
 /**
  * An issue's identity + display cache ONLY. There is no `status` or
- * `tmux_session` column: workflow status is now DERIVED (issue #13) from the
- * GitHub Projects board (single writer = `transition()`) plus the sessions
- * table (running-state truth). Persisting a second copy here is what caused the
- * board/DB drift incidents this change eliminates. See services/displayState.ts.
+ * `tmux_session` column: workflow status is DERIVED from the in-memory board
+ * snapshot (standard state, single writer = `writeLabel()`) plus the sessions
+ * table (running-state truth). See services/displayState.ts.
  */
 export interface Issue {
   id: number;
@@ -175,47 +159,35 @@ export interface Session {
   issue_id: number;
   tmux_session: string;
   /**
-   * running → done | failed | skipped | killed. `killed` (issue #26) marks a
-   * session torn down by the dashboard's kill action — terminal like failed,
-   * but distinct so the UI can show "killed" rather than "infra error", and so
-   * a killed coding session is still retryable from its preserved worktree.
+   * running → done | failed | killed. There is no `skipped` state (issue #32
+   * removed the skip action). `killed` marks a session torn down by the
+   * dashboard's kill action — terminal like failed, but distinct so the UI can
+   * show "killed"; a killed coding session is still retryable from its
+   * preserved worktree.
    */
-  status: "running" | "done" | "failed" | "skipped" | "killed";
-  pr_url: string | null;
+  status: "running" | "done" | "failed" | "killed";
   error: string | null;
   started_at: string;
   finished_at: string | null;
-  /** issue #19: 'coding' (default, creates a PR) or 'review' (fixes review threads). */
+  /** 'coding' (default) or 'review' (fixes review threads). */
   type: "coding" | "review";
-  /** PR head branch — set by submit-pr (coding) or at dispatch (review). */
+  /** PR head branch — set at dispatch (coding cuts it; review reuses it). */
   branch: string | null;
-  /** issue #21: server-determined worktree path; inherited by a retry session. */
+  /** Server-determined worktree path; inherited by a retry session. */
   worktree_path: string | null;
-  /** issue #30: captured Claude Code `-p` session id (for `claude -r` resume). */
+  /** Captured Claude Code session id (for `claude -r` resume). */
   claude_session_id: string | null;
+  /** How many claude -r retries have run in this issue's session chain. */
+  retry_count: number;
 }
 
 // --- Session CRUD ---
 
 /**
- * Record the PR head branch on an issue's currently-running coding session
- * (issue #19). Called by the submit-pr action so a later `dispatchReview()` can
- * push review fixes to the same branch. Mirrors {@link setSessionPrUrl} by
- * targeting the running row, so a review session (which never calls submit-pr)
- * is untouched.
- */
-export function setSessionBranch(issueId: number, branch: string): void {
-  getDb().prepare("UPDATE sessions SET branch = ? WHERE issue_id = ? AND status = 'running'")
-    .run(branch, issueId);
-}
-
-/**
- * Record the captured Claude Code `-p` session id on a session row (issue #30).
- * Called by checkRunningSessions each cycle once the stream formatter has written
- * the id to its sidecar (at the stream's init event) — so the id lands in the DB
- * mid-run, not just at completion, and survives a crash/kill. Targets the row by
- * id (the dispatcher is already iterating concrete running rows), not the running
- * issue like submit-pr/branch, since this is a per-session attribute.
+ * Record the captured Claude Code session id on a session row. Called by
+ * checkRunningSessions each cycle once the stream formatter has written the id
+ * to its sidecar (at the stream's init event) — so the id lands in the DB
+ * mid-run, survives a crash, and is available for `claude -r` retry.
  */
 export function setSessionClaudeId(sessionId: number, claudeSessionId: string): void {
   getDb().prepare("UPDATE sessions SET claude_session_id = ? WHERE id = ?")
@@ -223,24 +195,22 @@ export function setSessionClaudeId(sessionId: number, claudeSessionId: string): 
 }
 
 /**
- * Create a session row. Coding sessions (the default) leave type/branch empty —
- * branch is filled in later by submit-pr. Review sessions pass their PR url and
- * target branch up front (issue #19): the PR already exists, so the url is
- * known at dispatch time, not via an agent callback. Coding sessions now also
- * carry their server-determined `worktreePath` (issue #21) so the path is known
- * to the server without the agent reporting back, and a retry can inherit it.
+ * Create a session row. Coding sessions (the default) carry their
+ * server-determined `worktreePath` + `branch`; review sessions pass `type:
+ * "review"` and reuse the issue's feat branch. A `claude -r` retry passes the
+ * prior `retryCount` so the new row records the incremented retry chain.
  */
 export function createSession(
   issueId: number,
   tmuxSession: string,
-  init?: { type?: "coding" | "review"; branch?: string; prUrl?: string; worktreePath?: string },
+  init?: { type?: "coding" | "review"; branch?: string; worktreePath?: string; retryCount?: number },
 ): Session {
   const d = getDb();
   const type = init?.type ?? "coding";
   d.prepare(
-    `INSERT INTO sessions (issue_id, tmux_session, type, branch, pr_url, worktree_path)
+    `INSERT INTO sessions (issue_id, tmux_session, type, branch, worktree_path, retry_count)
      VALUES (?, ?, ?, ?, ?, ?)`,
-  ).run(issueId, tmuxSession, type, init?.branch ?? null, init?.prUrl ?? null, init?.worktreePath ?? null);
+  ).run(issueId, tmuxSession, type, init?.branch ?? null, init?.worktreePath ?? null, init?.retryCount ?? 0);
   return d.prepare("SELECT * FROM sessions WHERE id = last_insert_rowid()").get() as Session;
 }
 
@@ -253,44 +223,46 @@ export function getSessionsByIssue(issueId: number): Session[] {
     .all(issueId) as Session[];
 }
 
-/** Look up a single session by its DB id (issue #26 kill endpoint). */
+/** Look up a single session by its DB id (kill endpoint). */
 export function getSessionById(id: number): Session | undefined {
   return getDb().prepare("SELECT * FROM sessions WHERE id = ?").get(id) as Session | undefined;
 }
 
 export function updateSessionStatus(
   sessionId: number,
-  status: "done" | "failed" | "skipped" | "killed",
-  prUrl?: string | null,
+  status: "done" | "failed" | "killed",
   error?: string | null,
 ): void {
-  getDb().prepare("UPDATE sessions SET status = ?, pr_url = ?, error = ?, finished_at = datetime('now') WHERE id = ?")
-    .run(status, prUrl ?? null, error ?? null, sessionId);
+  getDb().prepare("UPDATE sessions SET status = ?, error = ?, finished_at = datetime('now') WHERE id = ?")
+    .run(status, error ?? null, sessionId);
 }
 
 /**
- * Mark an issue's currently-running session as skipped and record the reason.
- * Called by the skip HTTP endpoint so checkRunningSessions does not subsequently
- * treat the (now-dead) session as a done/infrastructure-failure outcome — the
- * plugin has already moved the issue back to Ready and applied the skip marker.
+ * The latest session for an issue (retry classification + retry-target lookup).
+ * Ordered by id DESC. Used by checkRunningSessions to decide whether a crashed
+ * coding session can still auto-retry (it needs a claude_session_id to resume).
  */
-export function markSessionSkipped(issueId: number, reason: string): void {
-  getDb().prepare(
-    `UPDATE sessions SET status = 'skipped', error = ?, finished_at = datetime('now')
-     WHERE issue_id = ? AND status = 'running'`
-  ).run(reason, issueId);
-}
-
-/**
- * Record the PR URL on an issue's currently-running session. Called by the
- * submit-pr action handler so checkRunningSessions classifies the (eventually
- * dead) session as done from stored state — without parsing tmux output. The
- * session stays `running` until checkRunningSessions performs the done-flow
- * finalization, which is how double-processing is prevented.
- */
-export function setSessionPrUrl(issueId: number, prUrl: string): void {
-  getDb().prepare("UPDATE sessions SET pr_url = ? WHERE issue_id = ? AND status = 'running'")
-    .run(prUrl, issueId);
+export function getLatestSession(issueId: number): (Session & {
+  project_id: string;
+  project_type: string;
+  source_id: string;
+  target_repo: string;
+  url: string;
+}) | undefined {
+  return getDb().prepare(`
+    SELECT s.*, i.project_id, i.project_type, i.source_id, i.target_repo, i.url
+    FROM sessions s
+    JOIN issues i ON s.issue_id = i.id
+    WHERE s.issue_id = ?
+    ORDER BY s.id DESC
+    LIMIT 1
+  `).get(issueId) as (Session & {
+    project_id: string;
+    project_type: string;
+    source_id: string;
+    target_repo: string;
+    url: string;
+  }) | undefined;
 }
 
 /** Get running sessions joined with their issue info */
@@ -304,82 +276,13 @@ export function getRunningSessionsWithIssues(): (Session & { project_id: string;
 }
 
 /**
- * Coding sessions that have created a PR (issue #19) — the candidates
- * `dispatchReview()` inspects for unresolved review threads. Each carries the
- * PR url and head branch (so review fixes push to the right branch) plus the
- * issue context needed for the board "In review" cross-check and session
- * dispatch. A later review session for the same issue is tracked separately.
- */
-export function getCodingSessionsWithPr(): (Session & {
-  project_id: string;
-  project_type: string;
-  source_id: string;
-  target_repo: string;
-})[] {
-  return getDb().prepare(`
-    SELECT s.*, i.project_id, i.project_type, i.source_id, i.target_repo
-    FROM sessions s
-    JOIN issues i ON s.issue_id = i.id
-    WHERE s.type = 'coding' AND s.pr_url IS NOT NULL
-  `).all() as (Session & {
-    project_id: string;
-    project_type: string;
-    source_id: string;
-    target_repo: string;
-  })[];
-}
-
-/**
- * Issue ids that currently have a running review session (issue #19).
- * `dispatchReview()` skips these: only one review session per issue at a time,
- * reusing the existing serial-dispatch guarantee to prevent concurrent agents on
- * the same PR branch.
+ * Issue ids that currently have a running review session. `dispatchReview()`
+ * skips these: only one review session per issue at a time, reusing the
+ * serial-dispatch guarantee to prevent concurrent agents on the same PR branch.
  */
 export function getRunningReviewIssueIds(): Set<number> {
   const rows = getDb().prepare(
     "SELECT DISTINCT issue_id FROM sessions WHERE type = 'review' AND status = 'running'",
   ).all() as Array<{ issue_id: number }>;
   return new Set(rows.map((r) => r.issue_id));
-}
-
-/**
- * The session a manual retry (issue #21) targets, if any. Retry is only valid
- * when the issue's LATEST session is a failed-or-killed CODING session that
- * recorded a worktree path — the worktree it left on disk is what the retry
- * continues in. `killed` (issue #26) is included so a dashboard-killed stuck
- * session can be retried from its preserved worktree (same path as a crash).
- *
- *   latest session is failed|killed coding + has worktree_path → return it (retry OK)
- *   otherwise (done/running/skipped, or a failed review session) → undefined
- *
- * Gating on the LATEST session (not just any failed one) means an issue that has
- * since succeeded (e.g. an earlier failed attempt later retried to success) is
- * NOT retryable again. Review failures are excluded: those are auto-retried by
- * the poll cycle when unresolved threads remain, so they need no manual retry.
- *
- * The returned `branch` and `worktree_path` are narrowed to `string` (non-null):
- * the runtime check above guarantees both are present when a row is returned.
- */
-export type RetryableSession = Omit<Session, "branch" | "worktree_path"> & {
-  project_id: string;
-  project_type: string;
-  source_id: string;
-  target_repo: string;
-  url: string;
-  branch: string;
-  worktree_path: string;
-};
-
-export function getRetryableSession(issueId: number): RetryableSession | undefined {
-  const latest = getDb().prepare(`
-    SELECT s.*, i.project_id, i.project_type, i.source_id, i.target_repo, i.url
-    FROM sessions s
-    JOIN issues i ON s.issue_id = i.id
-    WHERE s.issue_id = ?
-    ORDER BY s.id DESC
-    LIMIT 1
-  `).get(issueId) as RetryableSession | undefined;
-  if (!latest) return undefined;
-  if ((latest.status !== "failed" && latest.status !== "killed") || latest.type !== "coding" || !latest.worktree_path || !latest.branch) return undefined;
-  return latest;
 }

@@ -10,7 +10,6 @@ import {
   GitBranch,
   Check,
   AlertTriangle,
-  SkipForward,
   RotateCcw,
   Power,
 } from "lucide-react";
@@ -35,7 +34,6 @@ interface Session {
   id: number;
   tmux_session: string;
   status: string;
-  pr_url: string | null;
   error: string | null;
   started_at: string;
   finished_at: string | null;
@@ -43,7 +41,7 @@ interface Session {
   type?: "coding" | "review";
   /** issue #19: tmux process still alive — drives the per-session live + attach UI. */
   isLive?: boolean;
-  /** issue #21: server-determined worktree path; present when a retry is possible. */
+  /** issue #21: server-determined worktree path; present so `claude -r` can resume into it. */
   worktree_path?: string | null;
   /** issue #30: captured claude -p session id; present when a `claude -r` resume is possible. */
   claude_session_id?: string | null;
@@ -105,7 +103,6 @@ function StatusBadge({ status }: { status: string }) {
  *
  *   isLive               → pulsing dot + attach (any live session, coding or review)
  *   status failed/error  → AlertTriangle "infra error" + tooltip
- *   status skipped       → SkipForward "skipped" + tooltip
  *   status done          → neutral completed indicator
  *
  * The issue-level stage badge (StatusBadge) is decoupled and stays purely
@@ -128,19 +125,9 @@ function SessionChip({ session }: { session: Session }) {
       </span>
     );
   }
-  if (session.status === "skipped") {
-    return (
-      <span
-        className="inline-flex items-center gap-1 rounded bg-purple-100 px-1.5 py-0.5 text-[10px] font-medium text-purple-700"
-        title={session.error ?? "Agent skipped this issue — remove the skipped label on GitHub to re-enable"}
-      >
-        <SkipForward className="h-3 w-3" /> {typeLabel} · skipped
-      </span>
-    );
-  }
   // issue #26: torn down from the dashboard — terminal, but distinct from an
   // infra failure. The worktree is preserved, so a killed coding session can be
-  // retried from its partial work (the Retry button appears in the Actions cell).
+  // resumed into its partial work.
   if (session.status === "killed") {
     return (
       <span
@@ -245,8 +232,7 @@ function KillButton({ sessionId }: { sessionId: number }) {
         const body = await res.json().catch(() => ({}));
         alert(`终止失败：${body.error ?? res.status}`);
       } else {
-        // Refresh so the row re-renders as a `killed` chip (and, for a failed
-        // coding session, surfaces the Retry button).
+        // Refresh so the row re-renders as a `killed` chip.
         await queryClient.invalidateQueries({ queryKey: ["issues"] });
       }
     } finally {
@@ -263,50 +249,6 @@ function KillButton({ sessionId }: { sessionId: number }) {
     >
       {busy ? <Loader2 className="h-3 w-3 animate-spin" /> : <Power className="h-3 w-3" />}
       {busy ? "killing" : "kill"}
-    </button>
-  );
-}
-
-/**
- * Retry a failed coding session in place (issue #21): POST the retry action,
- * which dispatches a fresh agent into the failed session's preserved worktree.
- * The backend resolves the retry target (worktree + branch) from the failed
- * session, so this only needs the issue coordinates.
- */
-function RetryButton({ projectId, sourceId }: { projectId: string; sourceId: string }) {
-  const queryClient = useQueryClient();
-  const [busy, setBusy] = useState(false);
-
-  const handleRetry = async () => {
-    setBusy(true);
-    try {
-      const encoded = encodeURIComponent(projectId);
-      const res = await fetch(`${API}/api/projects/${encoded}/issues/${sourceId}/actions/retry`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: "{}",
-      });
-      if (!res.ok) {
-        const body = await res.json().catch(() => ({}));
-        alert(`重试失败：${body.error ?? res.status}`);
-      } else {
-        // Refresh so the new retry session row appears in the session group.
-        await queryClient.invalidateQueries({ queryKey: ["issues"] });
-      }
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  return (
-    <button
-      onClick={handleRetry}
-      disabled={busy}
-      className="inline-flex items-center gap-1 rounded bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-800 hover:bg-amber-200 disabled:opacity-50 cursor-pointer"
-      title="Retry the failed session in its preserved worktree"
-    >
-      {busy ? <Loader2 className="h-3 w-3 animate-spin" /> : <RotateCcw className="h-3 w-3" />}
-      {busy ? "retrying" : "retry"}
     </button>
   );
 }
@@ -478,28 +420,12 @@ export default function App() {
                       <th className="px-4 py-2 text-left font-medium text-gray-600">Project</th>
                       <th className="px-4 py-2 text-left font-medium text-gray-600">Status</th>
                       <th className="px-4 py-2 text-left font-medium text-gray-600">Sessions</th>
-                      <th className="px-4 py-2 text-left font-medium text-gray-600">PR</th>
-                      <th className="px-4 py-2 text-left font-medium text-gray-600">Actions</th>
                       <th className="px-4 py-2 text-left font-medium text-gray-600">Updated</th>
                     </tr>
                   </thead>
                   <tbody>
                     {repoIssues.map((issue) => {
                       const sessions = issue.sessions ?? [];
-                      // PR link: latest session that recorded a PR url (coding or
-                      // review carry the same PR url; review-only rows reuse it).
-                      const prSession = sessions.find((s) => s.pr_url) ?? null;
-                      // issue #21: retry is offered when the LATEST session is a
-                      // failed coding session whose worktree is preserved on disk.
-                      // sessions[] is newest-first (API returns started_at DESC).
-                      // issue #26: a `killed` session is retryable too — its
-                      // worktree was left in place, so retry continues that work.
-                      const latest = sessions[0];
-                      const retryable =
-                        !!latest &&
-                        (latest.status === "failed" || latest.status === "killed") &&
-                        latest.type !== "review" &&
-                        !!latest.worktree_path;
                       return (
                         <tr key={issue.id} className="border-b last:border-0 hover:bg-gray-50">
                           <td className="px-4 py-3">
@@ -526,27 +452,6 @@ export default function App() {
                           </td>
                           <td className="px-4 py-3">
                             <SessionGroup sessions={sessions} />
-                          </td>
-                          <td className="px-4 py-3">
-                            {prSession?.pr_url ? (
-                              <a
-                                href={prSession.pr_url}
-                                target="_blank"
-                                rel="noopener noreferrer"
-                                className="inline-flex items-center gap-1 text-blue-600 hover:underline"
-                              >
-                                PR <ExternalLink className="h-3 w-3" />
-                              </a>
-                            ) : (
-                              <span className="text-gray-400">-</span>
-                            )}
-                          </td>
-                          <td className="px-4 py-3">
-                            {retryable ? (
-                              <RetryButton projectId={issue.project_id} sourceId={issue.source_id} />
-                            ) : (
-                              <span className="text-gray-400">-</span>
-                            )}
                           </td>
                           <td className="px-4 py-3 text-gray-500">{timeAgo(issue.updated_at)}</td>
                         </tr>

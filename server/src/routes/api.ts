@@ -1,24 +1,19 @@
 import { FastifyInstance } from "fastify";
-import { loadConfig, getEnabledProjects, loadProjects, getProjectById, buildProjectContext } from "../config.js";
+import { loadConfig, getEnabledProjects, loadProjects, getProjectById } from "../config.js";
 import {
   getAllIssues,
   getIssuesByTargetRepo,
   getSessionsByIssue,
   getSessionById,
   getIssueById,
-  getIssue,
   getRunningSessions,
-  markSessionSkipped,
-  setSessionPrUrl,
-  setSessionBranch,
   updateSessionStatus,
-  getRetryableSession,
   type Issue,
 } from "../db/index.js";
 import { pollAll } from "../services/poller.js";
-import { dispatch, dispatchRetry } from "../services/dispatcher.js";
-import { resolvePlugin, getPluginName } from "../plugins/loader.js";
-import { getBoardStatus, setBoardStatus } from "../services/boardSnapshot.js";
+import { dispatch } from "../services/dispatcher.js";
+import { getPluginName } from "../plugins/loader.js";
+import { getBoardStatus } from "../services/boardSnapshot.js";
 import { deriveDisplayState, liveSessionName, isSessionLive } from "../services/displayState.js";
 import * as tmux from "../services/tmux.js";
 import { createLogger } from "../services/logger.js";
@@ -189,7 +184,7 @@ export async function registerApiRoutes(app: FastifyInstance): Promise<void> {
     tmux.killSession(session.tmux_session);
     const wasRunning = session.status === "running";
     if (wasRunning) {
-      updateSessionStatus(sessionId, "killed", undefined, "Killed via dashboard");
+      updateSessionStatus(sessionId, "killed", "Killed via dashboard");
     }
     return { success: true, status: wasRunning ? "killed" : session.status };
   });
@@ -234,96 +229,6 @@ export async function registerApiRoutes(app: FastifyInstance): Promise<void> {
         claudeSessionId: session.claude_session_id,
       }),
     };
-  });
-
-  // Unified agent-signal route. `:action` dispatches to the matching plugin
-  // method. New capabilities need no new route — a plugin just declares them via
-  // capabilities() and (for non-standard actions) the dispatcher grows a case.
-  app.post("/api/projects/:projectId/issues/:sourceId/actions/:action", async (request, reply) => {
-    const { projectId, sourceId, action } = request.params as { projectId: string; sourceId: string; action: string };
-    const body = (request.body ?? {}) as Record<string, unknown>;
-    const targetRepo = body.targetRepo as string | undefined;
-
-    const project = getProjectById(projectId);
-    if (!project) return { error: `Unknown projectId "${projectId}"` };
-
-    try {
-      const plugin = await resolvePlugin(project.projectType);
-      const ctx = buildProjectContext(project, log);
-
-      switch (action) {
-        case "submit-pr": {
-          const branch = body.branch as string | undefined;
-          if (!targetRepo || !branch) return { error: "targetRepo and branch required" };
-          if (!plugin.submitPr) return { error: "Plugin does not support submit-pr" };
-          // Single responsibility: the plugin creates the PR and returns its URL;
-          // we only persist it so checkRunningSessions finds it on the session.
-          const prUrl = await plugin.submitPr(ctx, sourceId, branch, targetRepo);
-          const issue = getIssue(projectId, sourceId);
-          // Record both the PR url AND its head branch (issue #19): a later
-          // dispatchReview() pushes fixes to this same branch.
-          if (issue) {
-            setSessionPrUrl(issue.id, prUrl);
-            setSessionBranch(issue.id, branch);
-          }
-          return { success: true, prUrl };
-        }
-        case "comment": {
-          const message = body.message as string | undefined;
-          if (!targetRepo || !message) return { error: "targetRepo and message required" };
-          if (!plugin.onComment) return { error: "Plugin does not support comments" };
-          await plugin.onComment(ctx, sourceId, message, targetRepo);
-          return { success: true };
-        }
-        case "resolve-thread": {
-          // issue #19: the review-fix agent resolves a PR review thread after
-          // addressing it. The agent supplies the PR url and the thread node id
-          // (both are in its prompt); the plugin performs the source-specific
-          // resolution (GitHub: the GraphQL resolveReviewThread mutation).
-          const prUrl = body.prUrl as string | undefined;
-          const threadId = body.threadId as string | undefined;
-          if (!targetRepo || !prUrl || !threadId) return { error: "targetRepo, prUrl and threadId required" };
-          if (!plugin.resolveThread) return { error: "Plugin does not support resolve-thread" };
-          await plugin.resolveThread(ctx, sourceId, prUrl, threadId);
-          return { success: true };
-        }
-        case "skip": {
-          if (!targetRepo) return { error: "targetRepo required" };
-          const reason = (body.reason as string | undefined) ?? "No reason provided";
-          await plugin.skip(ctx, sourceId, targetRepo, reason);
-          // Coordination: mark the running session skipped so checkRunningSessions
-          // doesn't double-process an already-resolved session. Workflow status is
-          // not persisted (issue #13) — the board move happened in plugin.skip(),
-          // and we optimistically mirror it to "Ready" for a snappy dashboard.
-          const issue = getIssue(projectId, sourceId);
-          if (issue) {
-            markSessionSkipped(issue.id, reason);
-            setBoardStatus(projectId, sourceId, "Ready");
-          }
-          return { success: true };
-        }
-        case "retry": {
-          // issue #21: developer-initiated retry into a failed session's preserved
-          // worktree. Unlike the agent-signal cases above, this needs no body —
-          // the retry target (worktree + branch) is resolved from the failed
-          // session. Gated on the issue's LATEST session being a failed coding
-          // session with a recorded worktree: review failures are auto-retried by
-          // the poll cycle, and a non-failed/done issue has nothing to retry.
-          const issue = getIssue(projectId, sourceId);
-          if (!issue) return { error: "Issue not found" };
-          const failed = getRetryableSession(issue.id);
-          if (!failed) return { error: "No failed session to retry (retry requires a failed coding session with a preserved worktree)" };
-          await dispatchRetry(failed);
-          return { success: true };
-        }
-        default:
-          reply.code(400);
-          return { error: `Unknown action "${action}"` };
-      }
-    } catch (err: any) {
-      log.error(`Action ${action} failed for ${projectId}/${sourceId}: ${err.message}`);
-      return { error: err.message };
-    }
   });
 
   // Manual poll trigger
