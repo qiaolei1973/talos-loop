@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1
-#
 # talos-loop 容器镜像。
 #
 # 镜像只烘焙「稳定运行时」：Node 22、tmux/git/gh、Claude Code CLI、以及构建好的 app。
@@ -8,9 +6,6 @@
 #
 # 以宿主机 uid 运行（构建参数 UID/GID），这样容器创建的文件仍是宿主机用户所有；
 # `git config --system safe.directory '*'` 让 git 能读写被挂载进来的、属于宿主机用户的仓库。
-#
-# 与本仓库架构的关系：server 是个 orchestrator，会在容器里 spawn `claude -p`、`gh`、
-# `git`、`tmux`。因此镜像必须内建这套工具链，且能访问宿主机上的仓库与凭证（靠挂载）。
 
 ############################
 # 1. build：编译 web + server（需要构建工具链以编译 better-sqlite3 原生模块）
@@ -18,7 +13,8 @@
 FROM node:22-bookworm-slim AS build
 
 # better-sqlite3 走 node-gyp，需要 python3/make/g++
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN sed -i 's/deb.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list.d/debian.sources \
+ && apt-get update && apt-get install -y --no-install-recommends \
       python3 make g++ ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 
@@ -53,7 +49,8 @@ ARG UID=1000
 ARG GID=1000
 
 # orchestrator 会 shell out 到这些系统工具：tmux（会话隔离）、git（worktree）、gh、tini（PID1 回收僵尸进程）
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN sed -i 's/deb.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list.d/debian.sources \
+ && apt-get update && apt-get install -y --no-install-recommends \
       tmux git tini ca-certificates curl gnupg \
  && install -m 0755 -d /etc/apt/keyrings \
  && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \

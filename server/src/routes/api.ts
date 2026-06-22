@@ -8,11 +8,14 @@ import {
   getIssueById,
   getRunningSessions,
   updateSessionStatus,
+  getAllSettings,
+  upsertSetting,
+  deleteSetting,
   type Issue,
 } from "../db/index.js";
 import { pollAll } from "../services/poller.js";
 import { dispatch } from "../services/dispatcher.js";
-import { getPluginName } from "../plugins/loader.js";
+import { getPluginName, getPluginSchemas } from "../plugins/loader.js";
 import { getBoardStatus } from "../services/boardSnapshot.js";
 import { deriveDisplayState, liveSessionName, isSessionLive } from "../services/displayState.js";
 import * as tmux from "../services/tmux.js";
@@ -242,5 +245,50 @@ export async function registerApiRoutes(app: FastifyInstance): Promise<void> {
     log.info("Received webhook event, triggering poll...");
     const result = await runPollCycle();
     return { triggered: true, ...result };
+  });
+
+  // ---- Settings endpoints ----
+
+  // List all settings grouped by plugin, values masked (show only last 4 chars)
+  app.get("/api/settings", async () => {
+    const all = getAllSettings();
+    const grouped: Record<string, Array<{ key: string; value: string; plugin: string; updated_at: string }>> = {};
+    for (const s of all) {
+      const plugin = s.plugin;
+      if (!grouped[plugin]) grouped[plugin] = [];
+      grouped[plugin].push({
+        ...s,
+        value: s.value.length > 4 ? "•".repeat(s.value.length - 4) + s.value.slice(-4) : "••••",
+      });
+    }
+    return grouped;
+  });
+
+  // Upsert a single setting. Body: { value: string, plugin: string }
+  app.put("/api/settings/:key", async (request, reply) => {
+    const { key } = request.params as { key: string };
+    const body = request.body as { value?: string; plugin?: string };
+    if (!body.value || !body.plugin) {
+      reply.code(400);
+      return { error: "Body must contain 'value' and 'plugin'" };
+    }
+    const setting = upsertSetting(key, body.value, body.plugin);
+    return setting;
+  });
+
+  // Delete a setting by key
+  app.delete("/api/settings/:key", async (request, reply) => {
+    const { key } = request.params as { key: string };
+    const deleted = deleteSetting(key);
+    if (!deleted) {
+      reply.code(404);
+      return { error: "Setting not found" };
+    }
+    return { success: true };
+  });
+
+  // Return schemas from all loaded plugins (drives the Settings UI form)
+  app.get("/api/plugins/schemas", async () => {
+    return getPluginSchemas();
   });
 }

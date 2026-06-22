@@ -10,6 +10,7 @@ import {
   setSessionClaudeId,
   getRunningReviewIssueIds,
   getIssue,
+  getSettingsByPlugin,
 } from "../db/index.js";
 import { resolvePlugin } from "../plugins/loader.js";
 import type { PollResult, IssueEntry } from "./poller.js";
@@ -39,15 +40,30 @@ function buildEnv(parts: {
   repoPath: string;
   targetRepo: string;
   branch: string;
+  baseBranch: string;
+  pluginType: string;
 }): Record<string, string> {
-  return {
+  const env: Record<string, string> = {
     TALOS_ISSUE_URL: parts.issueUrl,
     TALOS_SOURCE_ID: parts.sourceId,
     TALOS_PROJECT_ID: parts.projectId,
     TALOS_REPO_PATH: parts.repoPath,
     TALOS_TARGET_REPO: parts.targetRepo,
     TALOS_BRANCH: parts.branch,
+    TALOS_BASE_BRANCH: parts.baseBranch,
   };
+
+  // Inject settings as TALOS_SETTINGS JSON if the plugin has any configured
+  const settings = getSettingsByPlugin(parts.pluginType);
+  if (settings.length > 0) {
+    const obj: Record<string, string> = {};
+    for (const s of settings) {
+      obj[s.key] = s.value;
+    }
+    env.TALOS_SETTINGS = JSON.stringify(obj);
+  }
+
+  return env;
 }
 
 /**
@@ -290,7 +306,7 @@ async function retryCodingSession(args: {
   const session = tmux.sessionName(sourceName, targetRepo, sourceId);
   const issueUrl = getIssue(projectId, sourceId)?.url ?? "";
   const invocation = buildResumeInvocation(claudeSessionId);
-  const env = buildEnv({ issueUrl, sourceId, projectId, repoPath: repo.path, targetRepo, branch });
+  const env = buildEnv({ issueUrl, sourceId, projectId, repoPath: repo.path, targetRepo, branch, baseBranch: repo.branch ?? "main", pluginType: projectType });
   const command = launchScript(worktreePath, invocation, session, env);
 
   // Mark the crashed row terminal, then start the retry as a fresh running row.
@@ -365,7 +381,7 @@ export async function dispatchNew(pollResults: PollResult[]): Promise<number> {
     }
 
     const invocation = buildSkillInvocation(skill, issue.url);
-    const env = buildEnv({ issueUrl: issue.url, sourceId, projectId, repoPath: repo.path, targetRepo, branch });
+    const env = buildEnv({ issueUrl: issue.url, sourceId, projectId, repoPath: repo.path, targetRepo, branch, baseBranch: repo.branch ?? "main", pluginType: projectType });
     const command = launchScript(worktreePath, invocation, session, env);
 
     log.info(`🚀 Dispatching ${sourceName}:${sourceId} → session ${session} (skill ${skill}, worktree ${worktreePath})`);
@@ -445,7 +461,7 @@ export async function dispatchReview(pollResults: PollResult[]): Promise<number>
     }
 
     const invocation = buildSkillInvocation(skill, issue.url);
-    const env = buildEnv({ issueUrl: issue.url, sourceId, projectId, repoPath: repo.path, targetRepo, branch });
+    const env = buildEnv({ issueUrl: issue.url, sourceId, projectId, repoPath: repo.path, targetRepo, branch, baseBranch: repo.branch ?? "main", pluginType: projectType });
     const command = launchScript(worktreePath, invocation, session, env);
 
     log.info(`🔧 Dispatching review for ${sourceName}:${sourceId} → session ${session} (skill ${skill})`);

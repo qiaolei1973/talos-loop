@@ -86,6 +86,13 @@ function migrate(db: Database.Database) {
     CREATE INDEX IF NOT EXISTS idx_issues_target_repo ON issues(target_repo);
     CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);
     CREATE INDEX IF NOT EXISTS idx_sessions_issue ON sessions(issue_id);
+
+    CREATE TABLE IF NOT EXISTS settings (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL,
+      plugin TEXT NOT NULL,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
   `);
 }
 
@@ -285,4 +292,38 @@ export function getRunningReviewIssueIds(): Set<number> {
     "SELECT DISTINCT issue_id FROM sessions WHERE type = 'review' AND status = 'running'",
   ).all() as Array<{ issue_id: number }>;
   return new Set(rows.map((r) => r.issue_id));
+}
+
+// --- Settings Types ---
+
+export interface Setting {
+  key: string;
+  value: string;
+  plugin: string;
+  updated_at: string;
+}
+
+// --- Settings CRUD ---
+
+export function getAllSettings(): Setting[] {
+  return getDb().prepare("SELECT * FROM settings ORDER BY plugin, key").all() as Setting[];
+}
+
+export function getSettingsByPlugin(plugin: string): Setting[] {
+  return getDb().prepare("SELECT * FROM settings WHERE plugin = ? ORDER BY key").all(plugin) as Setting[];
+}
+
+export function upsertSetting(key: string, value: string, plugin: string): Setting {
+  const d = getDb();
+  d.prepare(
+    `INSERT INTO settings (key, value, plugin) VALUES (?, ?, ?)
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')`,
+  ).run(key, value, plugin);
+  return d.prepare("SELECT * FROM settings WHERE key = ?").get(key) as Setting;
+}
+
+export function deleteSetting(key: string): boolean {
+  const d = getDb();
+  const info = d.prepare("DELETE FROM settings WHERE key = ?").run(key);
+  return info.changes > 0;
 }
