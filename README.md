@@ -13,8 +13,6 @@ git clone <repo-url> && cd talos-loop
 ./init.sh
 ```
 
-`./init.sh` 一键搞定环境：自动安装 `tmux` / `gh` / `claude` / `git`、校验 Node 版本（要求见 `package.json` 的 `engines`）、从模板生成配置、`npm install`、并检查 `github-code` / `github-review` 两个 skill 与 `gh` 认证是否就位。脚本**幂等可重跑**，个别步骤失败会汇总到末尾提示手动处理。
-
 ### 1. 配置 Project 与 Repo
 
 `init.sh` 已从模板生成 `config.json` 与 `projects.json`，照着 [`projects.example.json`](./projects.example.json) 与 [`config.example.json`](./config.example.json) 改即可。
