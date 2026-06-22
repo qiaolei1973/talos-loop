@@ -12,6 +12,10 @@ import {
   AlertTriangle,
   RotateCcw,
   Power,
+  Settings,
+  Eye,
+  EyeOff,
+  Trash2,
 } from "lucide-react";
 
 interface Issue {
@@ -57,7 +61,27 @@ interface Status {
   projects?: { projectId: string; name: string; enabled: boolean }[];
 }
 
+interface SettingDef {
+  key: string;
+  label: string;
+  description: string;
+}
+
+interface PluginSchema {
+  required: SettingDef[];
+  optional: SettingDef[];
+}
+
+interface SettingValue {
+  key: string;
+  value: string;
+  plugin: string;
+  updated_at: string;
+}
+
 const API = "";
+
+// ---- Data fetching ----
 
 /**
  * Each endpoint is its own query so they refresh independently: a slow
@@ -76,6 +100,18 @@ async function fetchIssues(): Promise<Issue[]> {
 async function fetchStatus(): Promise<Status> {
   const res = await fetch(`${API}/api/status`);
   if (!res.ok) throw new Error(`Failed to load status (${res.status})`);
+  return res.json();
+}
+
+async function fetchSchemas(): Promise<Record<string, PluginSchema>> {
+  const res = await fetch(`${API}/api/plugins/schemas`);
+  if (!res.ok) throw new Error(`Failed to load schemas (${res.status})`);
+  return res.json();
+}
+
+async function fetchSettings(): Promise<Record<string, SettingValue[]>> {
+  const res = await fetch(`${API}/api/settings`);
+  if (!res.ok) throw new Error(`Failed to load settings (${res.status})`);
   return res.json();
 }
 
@@ -295,6 +331,174 @@ function ResumeButton({ sessionId }: { sessionId: number }) {
   );
 }
 
+/** Settings management UI — driven by plugin-declared schemas. */
+function SettingsSection() {
+  const queryClient = useQueryClient();
+
+  const schemasQuery = useQuery({
+    queryKey: ["schemas"],
+    queryFn: fetchSchemas,
+    staleTime: 60_000,
+  });
+  const settingsQuery = useQuery({
+    queryKey: ["settings"],
+    queryFn: fetchSettings,
+    staleTime: 30_000,
+  });
+
+  const [revealedKeys, setRevealedKeys] = useState<Set<string>>(new Set());
+
+  const schemas = schemasQuery.data ?? {};
+  const settings = settingsQuery.data ?? {};
+
+  const toggleReveal = (key: string) => {
+    setRevealedKeys((prev) => {
+      const next = new Set(prev);
+      next.has(key) ? next.delete(key) : next.add(key);
+      return next;
+    });
+  };
+
+  const handleSave = async (scopedKey: string, plugin: string) => {
+    const el = document.getElementById(`setting-input-${scopedKey}`) as HTMLInputElement | null;
+    const value = el?.value;
+    if (!value) return;
+    const res = await fetch(`${API}/api/settings/${encodeURIComponent(scopedKey)}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ value, plugin }),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      alert(`保存失败：${(body as any).error ?? res.statusText}`);
+      return;
+    }
+    await queryClient.invalidateQueries({ queryKey: ["settings"] });
+  };
+
+  const handleDelete = async (scopedKey: string) => {
+    if (!window.confirm(`删除 ${scopedKey}？`)) return;
+    const res = await fetch(`${API}/api/settings/${encodeURIComponent(scopedKey)}`, {
+      method: "DELETE",
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      alert(`删除失败：${(body as any).error ?? res.statusText}`);
+      return;
+    }
+    await queryClient.invalidateQueries({ queryKey: ["settings"] });
+  };
+
+  if (schemasQuery.isLoading) {
+    return (
+      <div className="flex items-center justify-center py-12">
+        <Loader2 className="h-6 w-6 animate-spin text-gray-400" />
+      </div>
+    );
+  }
+
+  if (Object.keys(schemas).length === 0) {
+    return (
+      <div className="rounded-lg border border-dashed border-gray-300 py-8 text-center">
+        <Settings className="mx-auto mb-2 h-8 w-8 text-gray-300" />
+        <p className="text-gray-500">没有已加载的插件声明配置项。</p>
+        <p className="mt-1 text-sm text-gray-400">当某个 project 引用声明了 <code className="rounded bg-gray-100 px-1">schema()</code> 的插件时，配置项会出现在这里。</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-6">
+      {Object.entries(schemas).map(([pluginName, schema]) => {
+        const allDefs = [...schema.required, ...schema.optional];
+        const pluginSettings = settings[pluginName] ?? [];
+        const settingsMap = new Map(pluginSettings.map((s) => [s.key, s]));
+
+        return (
+          <div key={pluginName} className="overflow-hidden rounded-lg border bg-white">
+            <div className="border-b bg-gray-50 px-4 py-3">
+              <h3 className="text-xs font-semibold uppercase tracking-wide text-gray-500">
+                {pluginName}
+              </h3>
+            </div>
+            <div className="divide-y">
+              {allDefs.map((def) => {
+                const scopedKey = `${pluginName}.${def.key}`;
+                const existing = settingsMap.get(scopedKey);
+                const isRequired = schema.required.some((r) => r.key === def.key);
+                const isRevealed = revealedKeys.has(scopedKey);
+
+                return (
+                  <div key={def.key} className="space-y-2 px-4 py-3">
+                    <div className="flex items-center gap-2">
+                      <label
+                        htmlFor={`setting-input-${scopedKey}`}
+                        className="text-sm font-medium text-gray-700"
+                      >
+                        {def.label}
+                      </label>
+                      {isRequired && (
+                        <span className="rounded bg-red-100 px-1.5 py-0.5 text-[10px] font-medium text-red-700">
+                          Required
+                        </span>
+                      )}
+                      {!isRequired && (
+                        <span className="rounded bg-gray-100 px-1.5 py-0.5 text-[10px] text-gray-500">
+                          Optional
+                        </span>
+                      )}
+                    </div>
+                    {def.description && (
+                      <p className="text-xs text-gray-400">{def.description}</p>
+                    )}
+                    <div className="flex items-center gap-2">
+                      <input
+                        id={`setting-input-${scopedKey}`}
+                        type={isRevealed ? "text" : "password"}
+                        defaultValue={existing?.value ?? ""}
+                        placeholder={existing ? "已配置" : "未配置"}
+                        className="flex-1 rounded border border-gray-300 px-3 py-1.5 text-sm placeholder:text-gray-300 focus:border-blue-500 focus:outline-none"
+                      />
+                      {existing && (
+                        <button
+                          onClick={() => toggleReveal(scopedKey)}
+                          className="rounded p-1.5 text-gray-400 hover:bg-gray-100 hover:text-gray-600"
+                          title={isRevealed ? "隐藏" : "显示"}
+                        >
+                          {isRevealed ? (
+                            <EyeOff className="h-4 w-4" />
+                          ) : (
+                            <Eye className="h-4 w-4" />
+                          )}
+                        </button>
+                      )}
+                      <button
+                        onClick={() => handleSave(scopedKey, pluginName)}
+                        className="rounded bg-blue-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-blue-700"
+                      >
+                        保存
+                      </button>
+                      {existing && (
+                        <button
+                          onClick={() => handleDelete(scopedKey)}
+                          className="rounded p-1.5 text-gray-300 hover:bg-red-50 hover:text-red-500"
+                          title="删除"
+                        >
+                          <Trash2 className="h-4 w-4" />
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 function timeAgo(dateStr: string | null): string {
   if (!dateStr) return "-";
   // SQLite datetime('now') returns UTC without 'Z' — append it so JS parses as UTC
@@ -339,6 +543,8 @@ export default function App() {
   };
   const buttonBusy = polling || issuesQuery.isFetching;
 
+  const [settingsOpen, setSettingsOpen] = useState(false);
+
   // Only the very first fetch (no data yet) shows a loading state; background
   // refetches update silently via stale-while-revalidate, so the UI doesn't
   // flicker on every poll cycle.
@@ -377,6 +583,13 @@ export default function App() {
               </span>
             )}
             <button
+              onClick={() => setSettingsOpen(!settingsOpen)}
+              className="inline-flex items-center gap-1.5 rounded-md border border-gray-300 px-3 py-1.5 text-sm font-medium text-gray-700 hover:bg-gray-50"
+            >
+              <Settings className="h-4 w-4" />
+              Settings
+            </button>
+            <button
               onClick={triggerPoll}
               disabled={buttonBusy}
               className="inline-flex items-center gap-1.5 rounded-md bg-blue-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50"
@@ -387,6 +600,24 @@ export default function App() {
           </div>
         </div>
       </header>
+
+      {/* Settings panel — collapsible, plugin-driven */}
+      {settingsOpen && (
+        <div className="border-b bg-white shadow-sm">
+          <div className="mx-auto max-w-5xl px-6 py-6">
+            <div className="mb-4 flex items-center justify-between">
+              <h2 className="text-lg font-semibold text-gray-900">Settings</h2>
+              <button
+                onClick={() => setSettingsOpen(false)}
+                className="text-sm text-gray-400 hover:text-gray-600"
+              >
+                收起
+              </button>
+            </div>
+            <SettingsSection />
+          </div>
+        </div>
+      )}
 
       {/* Content */}
       <main className="mx-auto max-w-5xl px-6 py-6">

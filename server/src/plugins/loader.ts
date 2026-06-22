@@ -1,4 +1,4 @@
-import type { IssueSourcePlugin } from "../types/plugin.js";
+import type { IssueSourcePlugin, PluginSchema } from "../types/plugin.js";
 
 const registry = new Map<string, IssueSourcePlugin>();
 
@@ -50,6 +50,22 @@ export async function getPluginName(type: string): Promise<string> {
   } catch {
     return type;
   }
+}
+
+/**
+ * Aggregate schemas from all loaded plugins. Each plugin contributes its
+ * `schema()` result keyed by its type name (e.g. "dima", "github").
+ * Only plugins currently in the registry are included — unused plugins
+ * don't need settings.
+ */
+export function getPluginSchemas(): Record<string, PluginSchema> {
+  const schemas: Record<string, PluginSchema> = {};
+  for (const [type, plugin] of registry.entries()) {
+    if (plugin.schema) {
+      schemas[type] = plugin.schema();
+    }
+  }
+  return schemas;
 }
 
 /** Clear the registry (useful for testing) */

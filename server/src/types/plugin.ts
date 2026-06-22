@@ -82,6 +82,15 @@ export interface IssueSourcePlugin {
    * Optional: when omitted, the server silently skips the comment.
    */
   writeComment?(ctx: ProjectContext, sourceId: string, comment: string, targetRepo: string): Promise<void>;
+  /**
+   * Declare settings this plugin needs. Required fields block dispatch until
+   * configured (future enforcement); optional fields are always shown in the UI.
+   *
+   * Keys are scoped to the plugin — the stored key becomes
+   * `{pluginName}.{key}` (e.g. "dima.dima-token"). Plugins that don't implement
+   * this simply show no settings in the UI.
+   */
+  schema?(): PluginSchema;
 }
 
 /**
@@ -139,4 +148,24 @@ export interface IssueStatus {
 export interface StatusTransition {
   from: IssueState;
   to: IssueState;
+}
+
+// ---------------------------------------------------------------------------
+// Settings — plugin-declared configuration parameters managed via GUI
+// ---------------------------------------------------------------------------
+
+/** A setting that a plugin declares it needs. Stored in the `settings` table
+ *  under a scoped key `{pluginName}.{key}` (e.g. "dima.dima-token").
+ *  The `schema()` return value drives the Settings UI form fields. */
+export interface SettingDef {
+  key: string;         // machine key, scoped to the plugin (e.g. "dima-token")
+  label: string;       // human label (e.g. "Dima Token")
+  description: string; // explanatory text shown below the label
+}
+
+/** A complete plugin settings schema — required fields block dispatch
+ *  until configured (future enforcement); optional fields are always shown. */
+export interface PluginSchema {
+  required: SettingDef[];
+  optional: SettingDef[];
 }
