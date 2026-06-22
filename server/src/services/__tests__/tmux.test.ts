@@ -4,8 +4,8 @@ import { exitCodePath, readExitCode, sessionIdPath, readSessionId, sessionName }
 
 describe("sessionName sanitization (issue #7)", () => {
   it("passes through already-safe identifiers unchanged", () => {
-    expect(sessionName("dima", "oceanbaseconsole-site", "123")).toBe(
-      "tl-dima-oceanbaseconsole-site-123",
+    expect(sessionName("acme", "example-site", "123")).toBe(
+      "tl-acme-example-site-123",
     );
   });
 
@@ -26,7 +26,7 @@ describe("sessionName sanitization (issue #7)", () => {
   });
 
   it("produces a flat identifier safe for use as a filename segment", () => {
-    const name = sessionName("@alipay/talos-plugin-dima", "oceanbase/console-site", "1.2");
+    const name = sessionName("@vendor/my-plugin", "owner/repo", "1.2");
     expect(name).not.toMatch(/[/@.]/);
   });
 });

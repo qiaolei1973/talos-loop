@@ -87,7 +87,7 @@ export interface IssueSourcePlugin {
    * configured (future enforcement); optional fields are always shown in the UI.
    *
    * Keys are scoped to the plugin — the stored key becomes
-   * `{pluginName}.{key}` (e.g. "dima.dima-token"). Plugins that don't implement
+   * `{pluginName}.{key}` (e.g. "jira.api-token"). Plugins that don't implement
    * this simply show no settings in the UI.
    */
   schema?(): PluginSchema;
@@ -155,11 +155,11 @@ export interface StatusTransition {
 // ---------------------------------------------------------------------------
 
 /** A setting that a plugin declares it needs. Stored in the `settings` table
- *  under a scoped key `{pluginName}.{key}` (e.g. "dima.dima-token").
+ *  under a scoped key `{pluginName}.{key}` (e.g. "jira.api-token").
  *  The `schema()` return value drives the Settings UI form fields. */
 export interface SettingDef {
-  key: string;         // machine key, scoped to the plugin (e.g. "dima-token")
-  label: string;       // human label (e.g. "Dima Token")
+  key: string;         // machine key, scoped to the plugin (e.g. "api-token")
+  label: string;       // human label (e.g. "Jira API Token")
   description: string; // explanatory text shown below the label
 }
 

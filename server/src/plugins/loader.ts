@@ -54,7 +54,7 @@ export async function getPluginName(type: string): Promise<string> {
 
 /**
  * Aggregate schemas from all loaded plugins. Each plugin contributes its
- * `schema()` result keyed by its type name (e.g. "dima", "github").
+ * `schema()` result keyed by its type name (e.g. "jira", "github").
  * Only plugins currently in the registry are included — unused plugins
  * don't need settings.
  */

@@ -38,6 +38,6 @@ services:
       - ${HOME}/.claude.json:/home/agent/.claude.json
       # —— gh 认证（token 需含 `project` scope：gh auth refresh -s project）——
       - ${HOME}/.config/gh:/home/agent/.config/gh
-      # —— SSH 私钥：仅当目标仓库用 ssh remote（如 git@code.alipay.com）时才需要 ——
+      # —— SSH 私钥：仅当目标仓库用 ssh remote（如 git@example.com）时才需要 ——
       - ${HOME}/.ssh:/home/agent/.ssh:ro
     restart: unless-stopped

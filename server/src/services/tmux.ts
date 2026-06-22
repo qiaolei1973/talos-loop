@@ -34,7 +34,7 @@ export function checkTmux(): void {
 /**
  * Build a session name from the plugin alias (or source type), target repo, and
  * source ID. Each segment is sanitized so scoped package names (e.g.
- * "@alipay/talos-plugin-dima") and display names with spaces don't inject path
+ * "@acme/source-jira") and display names with spaces don't inject path
  * separators — the returned value is embedded in temp-file paths and tmux
  * session names, so it must be a flat, shell-safe identifier.
  */

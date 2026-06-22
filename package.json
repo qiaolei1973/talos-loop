@@ -18,8 +18,5 @@
   },
   "devDependencies": {
     "concurrently": "^10.0.3"
-  },
-  "dependencies": {
-    "@alipay/talos-plugin-dima": "^0.1.3"
   }
 }
