@@ -13,6 +13,9 @@
     "server",
     "web"
   ],
+  "engines": {
+    "node": ">=22.12.0"
+  },
   "devDependencies": {
     "concurrently": "^10.0.3"
   },
