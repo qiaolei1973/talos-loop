@@ -1,6 +1,6 @@
-import { execSync } from "child_process";
-import * as fs from "fs";
+import { promises as fsp, constants as fsConstants } from "fs";
 import path from "path";
+import { execAsync } from "../utils/execAsync.js";
 import { createLogger } from "./logger.js";
 
 const log = createLogger("worktree");
@@ -24,8 +24,8 @@ export function worktreePath(repoPath: string, session: string): string {
   return path.join(path.dirname(path.resolve(repoPath)), WORKTREE_DIR, session);
 }
 
-function run(cmd: string): void {
-  execSync(cmd, { timeout: 30_000, stdio: "pipe", encoding: "utf-8" });
+async function run(cmd: string): Promise<{ stdout: string; stderr: string }> {
+  return execAsync(cmd, { timeout: 30_000 });
 }
 
 /**
@@ -38,23 +38,23 @@ function run(cmd: string): void {
  * fresh dispatch always starts clean. Throws on a real git failure (including a
  * fetch failure) — the caller logs it and skips the dispatch.
  */
-export function createWorktree(repoPath: string, worktree: string, branch: string, baseBranch: string): void {
+export async function createWorktree(repoPath: string, worktree: string, branch: string, baseBranch: string): Promise<void> {
   // Best-effort cleanup of a stale worktree and branch from a prior lifecycle.
   try {
-    run(`git -C "${repoPath}" worktree remove --force "${worktree}"`);
+    await run(`git -C "${repoPath}" worktree remove --force "${worktree}"`);
   } catch {
     // nothing stale at this path — expected on a fresh issue
   }
   try {
-    run(`git -C "${repoPath}" branch -D "${branch}"`);
+    await run(`git -C "${repoPath}" branch -D "${branch}"`);
   } catch {
     // branch absent — expected
   }
   // Fetch the remote baseline first so the feat branch starts from the current
   // tip of the integration line, not a stale local ref (issue #28). A fetch
   // failure throws and the caller skips the dispatch.
-  run(`git -C "${repoPath}" fetch origin "${baseBranch}"`);
-  run(`git -C "${repoPath}" worktree add -b "${branch}" "${worktree}" "origin/${baseBranch}"`);
+  await run(`git -C "${repoPath}" fetch origin "${baseBranch}"`);
+  await run(`git -C "${repoPath}" worktree add -b "${branch}" "${worktree}" "origin/${baseBranch}"`);
   log.info(`Created worktree ${worktree} on branch ${branch} from origin/${baseBranch}`);
 }
 
@@ -64,12 +64,15 @@ export function createWorktree(repoPath: string, worktree: string, branch: strin
  * band (e.g. disk cleared), recreate it on the EXISTING branch so the prior
  * commits survive and the retry can continue from them.
  */
-export function ensureWorktree(repoPath: string, worktree: string, branch: string): void {
-  if (fs.existsSync(worktree)) {
+export async function ensureWorktree(repoPath: string, worktree: string, branch: string): Promise<void> {
+  try {
+    await fsp.access(worktree, fsConstants.F_OK);
     log.info(`Reusing preserved worktree ${worktree} on branch ${branch}`);
     return;
+  } catch {
+    // worktree doesn't exist — recreate it below
   }
-  run(`git -C "${repoPath}" worktree add "${worktree}" "${branch}"`);
+  await run(`git -C "${repoPath}" worktree add "${worktree}" "${branch}"`);
   log.info(`Recreated missing worktree ${worktree} on existing branch ${branch}`);
 }
 
@@ -80,15 +83,15 @@ export function ensureWorktree(repoPath: string, worktree: string, branch: strin
  * deliberate NO-OP on failure, where the worktree must remain for retry. Never
  * throws: a cleanup failure must not break the success finalization.
  */
-export function removeWorktree(repoPath: string, worktree: string): void {
+export async function removeWorktree(repoPath: string, worktree: string): Promise<void> {
   try {
-    run(`git -C "${repoPath}" worktree remove --force "${worktree}"`);
+    await run(`git -C "${repoPath}" worktree remove --force "${worktree}"`);
     log.info(`Removed worktree ${worktree}`);
   } catch {
     // already gone (the agent cleaned up, or it was never created) — fine
   }
   try {
-    run(`git -C "${repoPath}" worktree prune`);
+    await run(`git -C "${repoPath}" worktree prune`);
   } catch {
     // ignore — prune is best-effort metadata tidy-up
   }

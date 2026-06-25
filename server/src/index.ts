@@ -1,7 +1,7 @@
 import Fastify from "fastify";
 import cors from "@fastify/cors";
+import { promises as fsp } from "fs";
 import path from "path";
-import fs from "fs";
 import { loadConfig, getEnabledProjects, loadProjects } from "./config.js";
 import { getDb } from "./db/index.js";
 import { registerApiRoutes, startPoller } from "./routes/api.js";
@@ -13,10 +13,10 @@ const log = createLogger("server");
 
 async function main() {
   // Check required dependencies
-  checkTmux();
+  await checkTmux();
 
-  const config = loadConfig();
-  const projects = loadProjects();
+  const config = await loadConfig();
+  const projects = await loadProjects();
 
   // Warn about enabled projects whose repos have issues (missing paths, etc.).
   for (const project of projects.filter((p) => p.enabled)) {
@@ -24,7 +24,9 @@ async function main() {
       log.warn(`Project "${project.projectId}" declares no repos — skipping`);
     }
     for (const repo of project.repos) {
-      if (!fs.existsSync(repo.path)) {
+      try {
+        await fsp.access(repo.path);
+      } catch {
         log.warn(`Project "${project.projectId}": repo "${repo.name}" path does not exist: ${repo.path}`);
       }
       if (!repo.remote) {
@@ -52,10 +54,14 @@ async function main() {
 
   // Serve static dashboard
   const webDir = path.join(__dirname, "../dist/web");
-  if (!fs.existsSync(webDir) || !fs.existsSync(path.join(webDir, "index.html"))) {
+  try {
+    await fsp.access(path.join(webDir, "index.html"));
+  } catch {
     log.warn(`Frontend not built — run: cd web && npx vite build`);
     log.warn(`Serving API-only mode at http://localhost:${config.port}`);
-  } else {
+  }
+
+  try {
     const fastifyStatic = (await import("@fastify/static")).default;
     await app.register(fastifyStatic, {
       root: webDir,
@@ -63,12 +69,19 @@ async function main() {
       wildcard: false,
     });
     // SPA fallback
-    app.setNotFoundHandler((request, reply) => {
+    app.setNotFoundHandler(async (request, reply) => {
       if (request.method === "GET" && !request.url.startsWith("/api")) {
-        return reply.type("text/html").send(fs.readFileSync(path.join(webDir, "index.html")));
+        try {
+          const html = await fsp.readFile(path.join(webDir, "index.html"), "utf-8");
+          return reply.type("text/html").send(html);
+        } catch {
+          return reply.code(404).send({ error: "not found" });
+        }
       }
       return reply.code(404).send({ error: "not found" });
     });
+  } catch {
+    // @fastify/static not available — API-only mode
   }
 
   await app.listen({ port: config.port, host: "0.0.0.0" });
@@ -76,7 +89,7 @@ async function main() {
   log.info(`📊 Dashboard: http://localhost:${config.port}`)
   log.info(`📡 API: http://localhost:${config.port}/api/status`)
 
-  const activeProjects = getEnabledProjects();
+  const activeProjects = await getEnabledProjects();
   log.info(`⏱  Polling every ${config.pollInterval / 1000}s for ${activeProjects.length} project(s)`);
   log.info(`Projects:`);
   for (const project of activeProjects) {

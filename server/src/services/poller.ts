@@ -79,7 +79,7 @@ async function pollProject(project: ProjectConfig): Promise<PollResult> {
 }
 
 export async function pollAll(): Promise<PollResult[]> {
-  const projects = getEnabledProjects();
+  const projects = await getEnabledProjects();
   log.info(`Polling ${projects.length} project(s)...`);
   return Promise.all(projects.map(pollProject));
 }

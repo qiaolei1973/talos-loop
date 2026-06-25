@@ -2,24 +2,27 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { GitHubIssueSourcePlugin } from "../index.js";
 import type { ProjectContext, RepoRef } from "../../../types/plugin.js";
 
-// Mock child_process
-vi.mock("child_process", () => ({
-  execSync: vi.fn(),
+// Mock execAsync from utils
+vi.mock("../../../utils/execAsync.js", () => ({
+  execAsync: vi.fn(),
 }));
 
-// Mock fs for writeComment / commentIfMissing tmp files
-vi.mock("fs", () => ({
-  default: {
-    writeFileSync: vi.fn(),
-    unlinkSync: vi.fn(),
-  },
-  writeFileSync: vi.fn(),
-  unlinkSync: vi.fn(),
-}));
+// Mock fs/promises for writeComment / commentIfMissing tmp files
+vi.mock("fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("fs")>();
+  return {
+    ...actual,
+    promises: {
+      ...actual.promises,
+      writeFile: vi.fn(),
+      unlink: vi.fn(),
+    },
+  };
+});
 
-import { execSync } from "child_process";
+import { execAsync } from "../../../utils/execAsync.js";
 
-const mockExecSync = execSync as unknown as ReturnType<typeof vi.fn>;
+const mockExecAsync = execAsync as unknown as ReturnType<typeof vi.fn>;
 
 /** Real gh project field-list shape: Status is a single-select with 5 options (note lowercase p/r). */
 const FIELD_LIST = {
@@ -55,15 +58,16 @@ function ghMock(opts: {
   itemListThrows?: boolean;
 } = {}) {
   return (cmd: string) => {
-    if (cmd.includes("gh project view")) return JSON.stringify({ id: "PVT_test", number: 1 });
-    if (cmd.includes("gh project field-list")) return JSON.stringify(FIELD_LIST);
-    if (cmd.includes("gh project item-list")) {
-      if (opts.itemListThrows) throw new Error("rate limited");
-      return JSON.stringify({ items: opts.items ?? [] });
+    let result = "";
+    if (cmd.includes("gh project view")) result = JSON.stringify({ id: "PVT_test", number: 1 });
+    else if (cmd.includes("gh project field-list")) result = JSON.stringify(FIELD_LIST);
+    else if (cmd.includes("gh project item-list")) {
+      if (opts.itemListThrows) return Promise.reject(new Error("rate limited"));
+      result = JSON.stringify({ items: opts.items ?? [] });
     }
-    if (cmd.includes("gh api graphql")) {
+    else if (cmd.includes("gh api graphql")) {
       // The list() review probe walks the issue's cross-referenced PR timeline.
-      return JSON.stringify({
+      result = JSON.stringify({
         data: {
           repository: {
             issue: {
@@ -73,9 +77,10 @@ function ghMock(opts: {
         },
       });
     }
-    if (cmd.includes("--json labels")) return JSON.stringify({ labels: opts.labels ?? [] });
-    if (cmd.includes("--json comments")) return JSON.stringify({ comments: opts.comments ?? [] });
-    return ""; // gh issue comment / gh project item-edit
+    else if (cmd.includes("--json labels")) result = JSON.stringify({ labels: opts.labels ?? [] });
+    else if (cmd.includes("--json comments")) result = JSON.stringify({ comments: opts.comments ?? [] });
+    // gh issue comment / gh project item-edit return empty
+    return Promise.resolve({ stdout: result, stderr: "" });
   };
 }
 
@@ -118,7 +123,7 @@ describe("GitHubIssueSourcePlugin", () => {
 
   describe("list() — the single active-board read (issue #32)", () => {
     it("maps board columns to standard states and returns only declared-repo items", async () => {
-      mockExecSync.mockImplementation(
+      mockExecAsync.mockImplementation(
         ghMock({
           items: [
             item(9, "Ready", "qiaolei1973/talos-loop"), // → queued
@@ -147,7 +152,7 @@ describe("GitHubIssueSourcePlugin", () => {
     });
 
     it("flags an in-review issue with a review subIssue when the linked PR has unresolved threads", async () => {
-      mockExecSync.mockImplementation(
+      mockExecAsync.mockImplementation(
         ghMock({
           items: [item(12, "In review", "qiaolei1973/talos-loop")],
           reviewThreads: [{ isResolved: false }, { isResolved: true }], // one unresolved
@@ -160,7 +165,7 @@ describe("GitHubIssueSourcePlugin", () => {
     });
 
     it("omits the review subIssue when the linked PR threads are all resolved", async () => {
-      mockExecSync.mockImplementation(
+      mockExecAsync.mockImplementation(
         ghMock({
           items: [item(12, "In review", "qiaolei1973/talos-loop")],
           reviewThreads: [{ isResolved: true }],
@@ -173,13 +178,13 @@ describe("GitHubIssueSourcePlugin", () => {
 
     it("throws on board-read failure instead of returning an empty array (issue #13)", async () => {
       // project-meta resolves, but the item-list read fails.
-      mockExecSync.mockImplementation(ghMock({ itemListThrows: true }));
+      mockExecAsync.mockImplementation(ghMock({ itemListThrows: true }));
 
       await expect(plugin.list(makeCtx())).rejects.toThrow(/rate limited/);
     });
 
     it("ignores a config-drift repo (repo not declared) with a warning", async () => {
-      mockExecSync.mockImplementation(
+      mockExecAsync.mockImplementation(
         ghMock({
           items: [item(14, "Ready", "qiaolei1973/other")],
           comments: [], // commentIfMissing probes existing comments before posting
@@ -195,18 +200,18 @@ describe("GitHubIssueSourcePlugin", () => {
 
   describe("getItem() — pre-dispatch freshness check", () => {
     it("maps the trigger label (no skipped) to queued", async () => {
-      mockExecSync.mockImplementation(ghMock({ labels: [{ name: "ready-for-agent" }, { name: "bug" }] }));
+      mockExecAsync.mockImplementation(ghMock({ labels: [{ name: "ready-for-agent" }, { name: "bug" }] }));
       expect((await plugin.getItem(makeCtx(), "9", "talos-loop")).state).toBe("queued");
     });
 
     it("returns null when the trigger label is absent", async () => {
-      mockExecSync.mockImplementation(ghMock({ labels: [{ name: "bug" }] }));
+      mockExecAsync.mockImplementation(ghMock({ labels: [{ name: "bug" }] }));
       expect((await plugin.getItem(makeCtx(), "9", "talos-loop")).state).toBeNull();
     });
 
     it("returns null on gh failure (warns, no silent crash)", async () => {
-      mockExecSync.mockImplementation(() => {
-        throw new Error("not found");
+      mockExecAsync.mockImplementation(() => {
+        return Promise.reject(new Error("not found"));
       });
       const ctx = makeCtx();
       expect((await plugin.getItem(ctx, "999", "talos-loop")).state).toBeNull();
@@ -216,10 +221,10 @@ describe("GitHubIssueSourcePlugin", () => {
 
   describe("writeLabel() — stage transition via gh project item-edit", () => {
     it("edits the project item to the target status option", async () => {
-      mockExecSync.mockImplementation(ghMock({ items: [item(9, "Ready")] }));
+      mockExecAsync.mockImplementation(ghMock({ items: [item(9, "Ready")] }));
       await plugin.writeLabel(makeCtx(), "9", { from: "queued", to: "processing" }, "talos-loop");
 
-      const editCmd = mockExecSync.mock.calls
+      const editCmd = mockExecAsync.mock.calls
         .map((c: any[]) => c[0] as string)
         .find((cmd) => cmd.includes("gh project item-edit"));
       expect(editCmd).toBeDefined();
@@ -231,9 +236,9 @@ describe("GitHubIssueSourcePlugin", () => {
     });
 
     it("maps done → 'In review' option (case/space-tolerant option lookup)", async () => {
-      mockExecSync.mockImplementation(ghMock({ items: [item(9, "In progress")] }));
+      mockExecAsync.mockImplementation(ghMock({ items: [item(9, "In progress")] }));
       await plugin.writeLabel(makeCtx(), "9", { from: "processing", to: "done" }, "talos-loop");
-      const editCmd = mockExecSync.mock.calls
+      const editCmd = mockExecAsync.mock.calls
         .map((c: any[]) => c[0] as string)
         .find((cmd) => cmd.includes("gh project item-edit"));
       // done → "In review" → o_review
@@ -241,12 +246,12 @@ describe("GitHubIssueSourcePlugin", () => {
     });
 
     it("warns on board-read failure and does not attempt an edit (issue #13)", async () => {
-      mockExecSync.mockImplementation(ghMock({ itemListThrows: true }));
+      mockExecAsync.mockImplementation(ghMock({ itemListThrows: true }));
       const ctx = makeCtx();
       await plugin.writeLabel(ctx, "9", { from: "queued", to: "processing" }, "talos-loop");
 
       expect(ctx.logger.warn).toHaveBeenCalledWith(expect.stringMatching(/board read failed/i));
-      const editCmd = mockExecSync.mock.calls
+      const editCmd = mockExecAsync.mock.calls
         .map((c: any[]) => c[0] as string)
         .find((cmd) => cmd.includes("gh project item-edit"));
       expect(editCmd).toBeUndefined();
@@ -255,10 +260,10 @@ describe("GitHubIssueSourcePlugin", () => {
 
   describe("writeComment() — leave a comment on an issue", () => {
     it("posts the comment body via gh issue comment --body-file", async () => {
-      mockExecSync.mockImplementation(ghMock());
+      mockExecAsync.mockImplementation(ghMock());
       await plugin.writeComment(makeCtx(), "9", "hello world", "talos-loop");
 
-      const commentCmd = mockExecSync.mock.calls
+      const commentCmd = mockExecAsync.mock.calls
         .map((c: any[]) => c[0] as string)
         .find((cmd) => cmd.includes("gh issue comment"));
       expect(commentCmd).toContain("--repo qiaolei1973/talos-loop");

@@ -1,15 +1,29 @@
 import Database from "better-sqlite3";
 import fs from "fs";
 import path from "path";
-import { loadConfig } from "../config.js";
+
+const PROJECT_ROOT = path.resolve(__dirname, "../..");
+
+/** Resolve dbPath directly (sync, one-time) without depending on async loadConfig(). */
+function resolveDbPath(): string {
+  const defaultPath = path.join(PROJECT_ROOT, "server/data/talos-loop.db");
+  const configPath = process.env.CONFIG_PATH || path.join(PROJECT_ROOT, "config.json");
+  try {
+    const raw = fs.readFileSync(configPath, "utf-8");
+    const parsed = JSON.parse(raw);
+    return parsed.dbPath ?? defaultPath;
+  } catch {
+    return defaultPath;
+  }
+}
 
 let db: Database.Database;
 
 export function getDb(): Database.Database {
   if (!db) {
-    const config = loadConfig();
-    fs.mkdirSync(path.dirname(config.dbPath), { recursive: true });
-    db = new Database(config.dbPath);
+    const dbPath = resolveDbPath();
+    fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+    db = new Database(dbPath);
     db.pragma("journal_mode = WAL");
     db.pragma("foreign_keys = ON");
     migrate(db);

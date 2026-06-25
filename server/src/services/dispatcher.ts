@@ -1,4 +1,4 @@
-import * as fs from "fs";
+import { promises as fsp } from "fs";
 import os from "os";
 import path from "path";
 import { loadConfig, buildProjectContextForIssue, getProjectById } from "../config.js";
@@ -97,7 +97,7 @@ function buildResumeInvocation(claudeSessionId: string): string {
  * .jsonl; PIPESTATUS[0] takes claude's own exit (not node's). No pipefail — it
  * would pollute the sentinel with a downstream non-zero code.
  */
-function launchScript(workDir: string, claudeInvocation: string, session: string, env: Record<string, string>): string {
+async function launchScript(workDir: string, claudeInvocation: string, session: string, env: Record<string, string>): Promise<string> {
   const exitCodeFile = tmux.exitCodePath(session);
   const sessionFile = tmux.sessionIdPath(session);
   const rawJsonl = path.join(os.tmpdir(), `tl-stream-${session}.jsonl`);
@@ -106,7 +106,7 @@ function launchScript(workDir: string, claudeInvocation: string, session: string
   const formatter = path.join(__dirname, "stream-formatter.cjs");
   const scriptFile = path.join(os.tmpdir(), `tl-run-${session}.sh`);
   const envLines = Object.entries(env).map(([k, v]) => `export ${k}="${v}"`);
-  fs.writeFileSync(scriptFile, [
+  const content = [
     `#!/bin/bash`,
     `cd ${workDir}`,
     `export TL_SESSION_FILE="${sessionFile}"`,
@@ -114,8 +114,9 @@ function launchScript(workDir: string, claudeInvocation: string, session: string
     `${claudeInvocation} 2>&1 | tee "${rawJsonl}" | node "${formatter}"`,
     `echo \${PIPESTATUS[0]} > "${exitCodeFile}"`,
     `rm -f "${scriptFile}"`,
-  ].join("\n"), "utf-8");
-  fs.chmodSync(scriptFile, 0o755);
+  ].join("\n");
+  await fsp.writeFile(scriptFile, content, "utf-8");
+  await fsp.chmod(scriptFile, 0o755);
   return scriptFile;
 }
 
@@ -133,8 +134,8 @@ function isOverdue(startedAt: string | null | undefined, claudeTimeoutSeconds: n
 }
 
 /** Resolve the project's configured skill for a stage, or undefined if unset. */
-function stageSkill(projectId: string, stage: string): string | undefined {
-  return getProjectById(projectId)?.stages?.[stage];
+async function stageSkill(projectId: string, stage: string): Promise<string | undefined> {
+  return (await getProjectById(projectId))?.stages?.[stage];
 }
 
 /**
@@ -151,7 +152,7 @@ function stageSkill(projectId: string, stage: string): string | undefined {
  */
 export async function checkRunningSessions(): Promise<{ completed: number; failed: number; retried: number }> {
   const running = getRunningSessionsWithIssues();
-  const config = loadConfig();
+  const config = await loadConfig();
   const keepSessionOnSuccess = config.keepSessionOnSuccess;
   let completed = 0;
   let failed = 0;
@@ -159,47 +160,47 @@ export async function checkRunningSessions(): Promise<{ completed: number; faile
 
   for (const { project_id, project_type, source_id, target_repo, ...session } of running) {
     const plugin = await resolvePlugin(project_type);
-    const ctx = buildProjectContextForIssue(project_id, log);
+    const ctx = await buildProjectContextForIssue(project_id, log);
     const sourceName = plugin.name;
 
     // Persist the captured claude session id as soon as the stream formatter
     // writes it to its sidecar (issue #30). Read every cycle, delete on first
     // sight; the id then lives in the DB, available mid-run and surviving a
     // crash, for `claude -r` resume.
-    const claudeId = tmux.readSessionId(session.tmux_session);
+    const claudeId = await tmux.readSessionId(session.tmux_session);
     if (claudeId) setSessionClaudeId(session.id, claudeId);
 
     // Wall-clock watchdog: a hung agent would hold a slot forever. Kill it past
     // the limit; the kill leaves no exit sentinel → failed (id already captured).
-    if (tmux.isAlive(session.tmux_session) && isOverdue(session.started_at, config.claudeTimeout)) {
+    if (await tmux.isAlive(session.tmux_session) && isOverdue(session.started_at, config.claudeTimeout)) {
       log.warn(`⏰ ${sourceName}:${source_id} exceeded claudeTimeout (${config.claudeTimeout}s) — killing`);
-      tmux.killSession(session.tmux_session);
+      await tmux.killSession(session.tmux_session);
     }
 
-    if (tmux.isAlive(session.tmux_session)) continue;
+    if (await tmux.isAlive(session.tmux_session)) continue;
 
-    const exitCode = tmux.readExitCode(session.tmux_session);
+    const exitCode = await tmux.readExitCode(session.tmux_session);
     const cleanExit = exitCode === 0;
-    const captureTail = (): string => {
+    const captureTail = async (): Promise<string> => {
       const reason = exitCode === undefined
         ? "Session terminated unexpectedly (no exit-code sentinel)"
         : `Session exited with code ${exitCode}`;
-      const lastOutput = tmux.captureOutput(session.tmux_session);
+      const lastOutput = await tmux.captureOutput(session.tmux_session);
       return lastOutput.trim().slice(-500) || reason;
     };
 
     // --- review sessions: never advance the board, always clean their worktree ---
     if (session.type === "review") {
-      removeSessionWorktree(ctx, session, target_repo);
+      await removeSessionWorktree(ctx, session, target_repo);
       if (cleanExit) {
         log.info(`✅ ${sourceName}:${source_id} review session done`);
         updateSessionStatus(session.id, "done");
-        if (!keepSessionOnSuccess) tmux.killSession(session.tmux_session);
+        if (!keepSessionOnSuccess) await tmux.killSession(session.tmux_session);
         completed++;
       } else {
         // Review is implicitly retried: the next poll re-dispatches while review
         // subIssues remain unresolved, so a crash just records failed + cleans up.
-        const tail = captureTail();
+        const tail = await captureTail();
         log.warn(`⚠️ ${sourceName}:${source_id} review session failed — unresolved threads re-trigger next tick`);
         updateSessionStatus(session.id, "failed", tail);
         failed++;
@@ -212,10 +213,10 @@ export async function checkRunningSessions(): Promise<{ completed: number; faile
       // Success: advance the stage processing→done (the ONLY board move) + clean up.
       log.info(`✅ ${sourceName}:${source_id} done — clean exit, advancing to In review`);
       updateSessionStatus(session.id, "done");
-      if (!keepSessionOnSuccess) tmux.killSession(session.tmux_session);
+      if (!keepSessionOnSuccess) await tmux.killSession(session.tmux_session);
       await plugin.writeLabel(ctx, source_id, { from: "processing", to: "done" }, target_repo);
       setBoardStatus(project_id, source_id, "done");
-      removeSessionWorktree(ctx, session, target_repo);
+      await removeSessionWorktree(ctx, session, target_repo);
       completed++;
     } else if (session.retry_count < config.maxRetry && session.claude_session_id) {
       // Auto-retry in place (issue #32): resume the failed conversation in the
@@ -233,13 +234,13 @@ export async function checkRunningSessions(): Promise<{ completed: number; faile
         branch: session.branch,
         retryCount: session.retry_count,
         claudeSessionId: session.claude_session_id,
-        tail: captureTail(),
+        tail: await captureTail(),
       });
       retried++;
     } else {
       // Exhausted retries (or no captured session id to resume): park the issue
       // In progress and, if the plugin supports it, leave a comment for a human.
-      const tail = captureTail();
+      const tail = await captureTail();
       const reason = exitCode === undefined ? "no exit-code sentinel" : `exit code ${exitCode}`;
       log.warn(`⚠️ ${sourceName}:${source_id} failed (${reason}, retries exhausted ${session.retry_count}/${config.maxRetry}) — leaving In progress`);
       updateSessionStatus(session.id, "failed", tail);
@@ -259,14 +260,14 @@ export async function checkRunningSessions(): Promise<{ completed: number; faile
 }
 
 /** Remove a session's worktree (best-effort; never throws). */
-function removeSessionWorktree(
+async function removeSessionWorktree(
   ctx: { repos: Array<{ name: string; path: string }> },
   session: { worktree_path: string | null },
   targetRepo: string,
-): void {
+): Promise<void> {
   if (!session.worktree_path) return;
   const repoPath = ctx.repos.find((r) => r.name === targetRepo)?.path;
-  if (repoPath) worktree.removeWorktree(repoPath, session.worktree_path);
+  if (repoPath) await worktree.removeWorktree(repoPath, session.worktree_path);
 }
 
 /**
@@ -296,28 +297,28 @@ async function retryCodingSession(args: {
   }
 
   const plugin = await resolvePlugin(projectType);
-  const ctx = buildProjectContextForIssue(projectId, log);
+  const ctx = await buildProjectContextForIssue(projectId, log);
   const sourceName = plugin.name;
   const repo = ctx.repos.find((r) => r.name === targetRepo);
   if (!repo) throw new Error(`Repo "${targetRepo}" not found for retry of ${sourceName}:${sourceId}`);
 
-  worktree.ensureWorktree(repo.path, worktreePath, branch);
+  await worktree.ensureWorktree(repo.path, worktreePath, branch);
 
   const session = tmux.sessionName(sourceName, targetRepo, sourceId);
   const issueUrl = getIssue(projectId, sourceId)?.url ?? "";
   const invocation = buildResumeInvocation(claudeSessionId);
   const env = buildEnv({ issueUrl, sourceId, projectId, repoPath: repo.path, targetRepo, branch, baseBranch: repo.branch ?? "main", pluginType: projectType });
-  const command = launchScript(worktreePath, invocation, session, env);
+  const command = await launchScript(worktreePath, invocation, session, env);
 
   // Mark the crashed row terminal, then start the retry as a fresh running row.
   updateSessionStatus(sessionId, "failed", tail);
-  tmux.createSession(session, command);
+  await tmux.createSession(session, command);
   createSession(issueId, session, { type: "coding", branch, worktreePath, retryCount: retryCount + 1 });
 }
 
 /** Dispatch queued issues: create a worktree, advance to processing, launch the ready-stage skill. */
 export async function dispatchNew(pollResults: PollResult[]): Promise<number> {
-  const config = loadConfig();
+  const config = await loadConfig();
   const runningCount = getRunningSessions().length;
 
   if (runningCount >= config.maxParallel) {
@@ -344,14 +345,14 @@ export async function dispatchNew(pollResults: PollResult[]): Promise<number> {
     if (dispatched >= slotsAvailable) break;
     const { issue, projectId, projectType, sourceId, targetRepo } = candidate;
 
-    const skill = stageSkill(projectId, "ready");
+    const skill = await stageSkill(projectId, "ready");
     if (!skill) {
       log.warn(`No "ready" stage skill configured for ${projectId} — skipping ${sourceId}`);
       continue;
     }
 
     const plugin = await resolvePlugin(projectType);
-    const ctx = buildProjectContextForIssue(projectId, log);
+    const ctx = await buildProjectContextForIssue(projectId, log);
     const sourceName = plugin.name;
 
     const repo = ctx.repos.find((r) => r.name === targetRepo);
@@ -374,7 +375,7 @@ export async function dispatchNew(pollResults: PollResult[]): Promise<number> {
     const worktreePath = worktree.worktreePath(repo.path, session);
     try {
       // Cut the feat branch from the repo's declared baseline (default "main").
-      worktree.createWorktree(repo.path, worktreePath, branch, repo.branch ?? "main");
+      await worktree.createWorktree(repo.path, worktreePath, branch, repo.branch ?? "main");
     } catch (err: any) {
       log.error(`Failed to create worktree for ${sourceName}:${sourceId}: ${err.message}`);
       continue;
@@ -382,14 +383,14 @@ export async function dispatchNew(pollResults: PollResult[]): Promise<number> {
 
     const invocation = buildSkillInvocation(skill, issue.url);
     const env = buildEnv({ issueUrl: issue.url, sourceId, projectId, repoPath: repo.path, targetRepo, branch, baseBranch: repo.branch ?? "main", pluginType: projectType });
-    const command = launchScript(worktreePath, invocation, session, env);
+    const command = await launchScript(worktreePath, invocation, session, env);
 
     log.info(`🚀 Dispatching ${sourceName}:${sourceId} → session ${session} (skill ${skill}, worktree ${worktreePath})`);
 
     try {
       await plugin.writeLabel(ctx, sourceId, { from: "queued", to: "processing" }, targetRepo);
 
-      tmux.createSession(session, command);
+      await tmux.createSession(session, command);
 
       createSession(issue.id, session, { type: "coding", branch, worktreePath });
       // Optimistically flip the snapshot to processing so the dashboard reflects
@@ -400,7 +401,7 @@ export async function dispatchNew(pollResults: PollResult[]): Promise<number> {
     } catch (err: any) {
       log.error(`Failed to dispatch ${sourceName}:${sourceId}: ${err.message}`);
       // Drop the unused worktree so it doesn't leak, and roll the board back.
-      worktree.removeWorktree(repo.path, worktreePath);
+      await worktree.removeWorktree(repo.path, worktreePath);
       await plugin.writeLabel(ctx, sourceId, { from: "processing", to: "queued" }, targetRepo);
     }
   }
@@ -434,14 +435,14 @@ export async function dispatchReview(pollResults: PollResult[]): Promise<number>
       continue;
     }
 
-    const skill = stageSkill(projectId, "in-review");
+    const skill = await stageSkill(projectId, "in-review");
     if (!skill) {
       // No review skill configured — nothing to do for this stage.
       continue;
     }
 
     const plugin = await resolvePlugin(projectType);
-    const ctx = buildProjectContextForIssue(projectId, log);
+    const ctx = await buildProjectContextForIssue(projectId, log);
     const sourceName = plugin.name;
     const repo = ctx.repos.find((r) => r.name === targetRepo);
     if (!repo) {
@@ -454,7 +455,7 @@ export async function dispatchReview(pollResults: PollResult[]): Promise<number>
     const worktreePath = worktree.worktreePath(repo.path, session);
     try {
       // Reuse/recreate the worktree on the existing PR head branch.
-      worktree.ensureWorktree(repo.path, worktreePath, branch);
+      await worktree.ensureWorktree(repo.path, worktreePath, branch);
     } catch (err: any) {
       log.error(`Failed to ensure review worktree for ${sourceName}:${sourceId}: ${err.message}`);
       continue;
@@ -462,12 +463,12 @@ export async function dispatchReview(pollResults: PollResult[]): Promise<number>
 
     const invocation = buildSkillInvocation(skill, issue.url);
     const env = buildEnv({ issueUrl: issue.url, sourceId, projectId, repoPath: repo.path, targetRepo, branch, baseBranch: repo.branch ?? "main", pluginType: projectType });
-    const command = launchScript(worktreePath, invocation, session, env);
+    const command = await launchScript(worktreePath, invocation, session, env);
 
     log.info(`🔧 Dispatching review for ${sourceName}:${sourceId} → session ${session} (skill ${skill})`);
 
     try {
-      tmux.createSession(session, command);
+      await tmux.createSession(session, command);
       createSession(issue.id, session, { type: "review", branch, worktreePath });
       reviewed++;
       runningReview.add(issue.id);

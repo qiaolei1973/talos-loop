@@ -42,12 +42,14 @@ export function mapBoardStatus(boardStatus: string | null | undefined): DisplayS
  *   running CODING session AND tmux.isAlive → processing
  *   otherwise mapBoardStatus(snapshot state)
  */
-export function deriveDisplayState(
+export async function deriveDisplayState(
   sessions: Session[],
   boardStatus: string | null | undefined,
-): DisplayState {
-  if (sessions.some((s) => s.status === "running" && s.type !== "review" && tmux.isAlive(s.tmux_session))) {
-    return "processing";
+): Promise<DisplayState> {
+  for (const s of sessions) {
+    if (s.status === "running" && s.type !== "review" && await tmux.isAlive(s.tmux_session)) {
+      return "processing";
+    }
   }
   return mapBoardStatus(boardStatus);
 }
@@ -58,8 +60,8 @@ export function deriveDisplayState(
  * and `liveSessionName` use. Surfaced per session row in the dashboard so an
  * attach button can be offered on any live session, coding or review.
  */
-export function isSessionLive(session: Session): boolean {
-  return session.status === "running" && tmux.isAlive(session.tmux_session);
+export async function isSessionLive(session: Session): Promise<boolean> {
+  return session.status === "running" && await tmux.isAlive(session.tmux_session);
 }
 
 /**
@@ -67,7 +69,11 @@ export function isSessionLive(session: Session): boolean {
  * still alive. Null when nothing is live (e.g. a board "processing" item whose
  * session died — a zombie — has nothing to attach to).
  */
-export function liveSessionName(sessions: Session[]): string | null {
-  const live = sessions.find((s) => s.status === "running" && tmux.isAlive(s.tmux_session));
-  return live?.tmux_session ?? null;
+export async function liveSessionName(sessions: Session[]): Promise<string | null> {
+  for (const s of sessions) {
+    if (s.status === "running" && await tmux.isAlive(s.tmux_session)) {
+      return s.tmux_session;
+    }
+  }
+  return null;
 }

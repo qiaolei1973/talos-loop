@@ -1,7 +1,7 @@
-import { execSync } from "child_process";
-import fs from "fs";
+import { promises as fsp } from "fs";
 import os from "os";
 import path from "path";
+import { execAsync } from "../../utils/execAsync.js";
 import type {
   IssueSourcePlugin,
   ProjectContext,
@@ -113,7 +113,7 @@ export class GitHubIssueSourcePlugin implements IssueSourcePlugin {
    * transient GraphQL hiccup never breaks polling.
    */
   async list(ctx: ProjectContext): Promise<RawIssue[]> {
-    const items = this.readBoard(ctx); // throws on read failure (no silent empty)
+    const items = await this.readBoard(ctx); // throws on read failure (no silent empty)
     const results: RawIssue[] = [];
 
     for (const item of items) {
@@ -128,7 +128,7 @@ export class GitHubIssueSourcePlugin implements IssueSourcePlugin {
         ctx.logger.warn(
           `Issue #${item.content.number} (${remote}) is in project ${ctx.projectId} but its repo is not declared in projects.json — ignoring`,
         );
-        this.commentIfMissing(remote, item.content.number, ctx);
+        await this.commentIfMissing(remote, item.content.number, ctx);
         continue;
       }
 
@@ -159,11 +159,11 @@ export class GitHubIssueSourcePlugin implements IssueSourcePlugin {
     if (!repo?.remote) return { state: null };
     const trigger = resolveTrigger(ctx);
     try {
-      const raw = execSync(
+      const { stdout } = await execAsync(
         `gh issue view ${sourceId} --repo ${repo.remote} --json labels`,
-        { encoding: "utf-8", timeout: 15_000, stdio: "pipe" },
+        { timeout: 15_000 },
       );
-      const data = JSON.parse(raw);
+      const data = JSON.parse(stdout);
       const labels: string[] = (data.labels ?? []).map((l: { name: string }) => l.name);
       // Actionable iff it still carries the eligibility marker.
       if (labels.includes(trigger)) return { state: "queued" };
@@ -181,7 +181,7 @@ export class GitHubIssueSourcePlugin implements IssueSourcePlugin {
    * id — a read failure warns and bails (no edit attempted).
    */
   async writeLabel(ctx: ProjectContext, sourceId: string, transition: StatusTransition, targetRepo: string): Promise<void> {
-    const meta = this.ensureCache(ctx);
+    const meta = await this.ensureCache(ctx);
     const { owner, number } = parseProjectId(ctx.projectId);
     const repo = this.repoByName(ctx, targetRepo);
     if (!repo?.remote) {
@@ -197,7 +197,7 @@ export class GitHubIssueSourcePlugin implements IssueSourcePlugin {
 
     let item: GhItem | undefined;
     try {
-      item = this.findItem(owner, number, sourceId, repo.remote);
+      item = await this.findItem(owner, number, sourceId, repo.remote);
     } catch (err: any) {
       ctx.logger.warn(`writeLabel: board read failed for ${repo.remote}#${sourceId} — cannot transition: ${err.message}`);
       return;
@@ -208,9 +208,9 @@ export class GitHubIssueSourcePlugin implements IssueSourcePlugin {
     }
 
     try {
-      execSync(
+      await execAsync(
         `gh project item-edit --id ${item.id} --field-id ${meta.statusFieldId} --project-id ${meta.projectNodeId} --single-select-option-id ${optionId}`,
-        { timeout: 15_000, stdio: "pipe" },
+        { timeout: 15_000 },
       );
     } catch (err: any) {
       ctx.logger.error(`writeLabel failed for ${repo.remote}#${sourceId}: ${err.message}`);
@@ -225,12 +225,11 @@ export class GitHubIssueSourcePlugin implements IssueSourcePlugin {
     }
     try {
       const tmpFile = path.join(os.tmpdir(), `tl-comment-${Date.now()}.md`);
-      fs.writeFileSync(tmpFile, comment, "utf-8");
-      execSync(`gh issue comment ${sourceId} --repo ${repo.remote} --body-file "${tmpFile}"`, {
+      await fsp.writeFile(tmpFile, comment, "utf-8");
+      await execAsync(`gh issue comment ${sourceId} --repo ${repo.remote} --body-file "${tmpFile}"`, {
         timeout: 15_000,
-        stdio: "pipe",
       });
-      fs.unlinkSync(tmpFile);
+      await fsp.unlink(tmpFile);
     } catch (err: any) {
       ctx.logger.error(`Failed to comment on ${repo.remote}#${sourceId}: ${err.message}`);
     }
@@ -257,7 +256,8 @@ export class GitHubIssueSourcePlugin implements IssueSourcePlugin {
     const query = `query{repository(owner:"${owner}",name:"${repo}"){issue(number:${issueNumber}){timelineItems(first:50,itemTypes:[CROSS_REFERENCED_EVENT]){nodes{...on CrossReferencedEvent{source{...on PullRequest{reviewThreads(first:100){nodes{isResolved}}}}}}}}}}`;
     let raw: string;
     try {
-      raw = execSync(`gh api graphql -f query='${query}'`, { encoding: "utf-8", timeout: 30_000, stdio: "pipe" });
+      const { stdout } = await execAsync(`gh api graphql -f query='${query}'`, { timeout: 30_000 });
+      raw = stdout;
     } catch (err: any) {
       ctx.logger.warn(`review probe failed for ${remote}#${issueNumber}: ${err.message}`);
       return false;
@@ -272,24 +272,20 @@ export class GitHubIssueSourcePlugin implements IssueSourcePlugin {
   }
 
   /** Resolve (and cache) project metadata: node id, status field id, option ids. */
-  private ensureCache(ctx: ProjectContext): ProjectMeta {
+  private async ensureCache(ctx: ProjectContext): Promise<ProjectMeta> {
     const existing = this.cache.get(ctx.projectId);
     if (existing) return existing;
 
     const { owner, number } = parseProjectId(ctx.projectId);
 
-    const projectRaw = execSync(`gh project view ${number} --owner ${owner} --format json`, {
-      encoding: "utf-8",
+    const { stdout: projectRaw } = await execAsync(`gh project view ${number} --owner ${owner} --format json`, {
       timeout: 15_000,
-      stdio: "pipe",
     });
     const projectNodeId = (JSON.parse(projectRaw) as { id?: string }).id;
     if (!projectNodeId) throw new Error(`Could not resolve project node id for ${ctx.projectId}`);
 
-    const fieldRaw = execSync(`gh project field-list ${number} --owner ${owner} --format json`, {
-      encoding: "utf-8",
+    const { stdout: fieldRaw } = await execAsync(`gh project field-list ${number} --owner ${owner} --format json`, {
       timeout: 15_000,
-      stdio: "pipe",
     });
     const fields = (JSON.parse(fieldRaw) as { fields: Array<{ id: string; name: string; type: string; options?: Array<{ id: string; name: string }> }> }).fields;
     const statusField = fields.find((f) => f.name === "Status" && f.type === "ProjectV2SingleSelectField" && Array.isArray(f.options));
@@ -313,14 +309,14 @@ export class GitHubIssueSourcePlugin implements IssueSourcePlugin {
    * expressed by negating the terminal columns Backlog/Done. Throws on read
    * failure (issue #13) so callers distinguish empty from broken.
    */
-  private readBoard(ctx: ProjectContext): GhItem[] {
+  private async readBoard(ctx: ProjectContext): Promise<GhItem[]> {
     const cached = this.boardCache.get(ctx.projectId);
     if (cached && Date.now() - cached.at < GitHubIssueSourcePlugin.BOARD_CACHE_TTL_MS) {
       return cached.items;
     }
     const { owner, number } = parseProjectId(ctx.projectId);
     const trigger = resolveTrigger(ctx);
-    const items = this.ghItemList(owner, number, `label:${trigger} -status:Backlog -status:Done`);
+    const items = await this.ghItemList(owner, number, `label:${trigger} -status:Backlog -status:Done`);
     this.boardCache.set(ctx.projectId, { items, at: Date.now() });
     return items;
   }
@@ -331,17 +327,18 @@ export class GitHubIssueSourcePlugin implements IssueSourcePlugin {
    * unreadable one, so a transient gh outage is surfaced rather than
    * masquerading as "no items".
    */
-  private ghItemList(owner: string, number: number, query?: string): GhItem[] {
+  private async ghItemList(owner: string, number: number, query?: string): Promise<GhItem[]> {
     const q = query ? ` --query "${query}"` : "";
-    const raw = execSync(
+    const { stdout } = await execAsync(
       `gh project item-list ${number} --owner ${owner} --format json --limit 100${q}`,
-      { encoding: "utf-8", timeout: 30_000, stdio: "pipe" },
+      { timeout: 30_000 },
     );
-    return (JSON.parse(raw) as { items?: GhItem[] }).items ?? [];
+    return (JSON.parse(stdout) as { items?: GhItem[] }).items ?? [];
   }
 
-  private findItem(owner: string, number: number, sourceId: string, remote: string): GhItem | undefined {
-    return this.ghItemList(owner, number).find(
+  private async findItem(owner: string, number: number, sourceId: string, remote: string): Promise<GhItem | undefined> {
+    const items = await this.ghItemList(owner, number);
+    return items.find(
       (it) => it.content && String(it.content.number) === String(sourceId) && it.content.repository === remote,
     );
   }
@@ -351,30 +348,27 @@ export class GitHubIssueSourcePlugin implements IssueSourcePlugin {
   }
 
   /** Post a one-time config-drift comment so we don't spam the issue every poll cycle. */
-  private commentIfMissing(remote: string, issueNumber: number, ctx: ProjectContext): void {
+  private async commentIfMissing(remote: string, issueNumber: number, ctx: ProjectContext): Promise<void> {
     try {
-      const raw = execSync(`gh issue view ${issueNumber} --repo ${remote} --json comments`, {
-        encoding: "utf-8",
+      const { stdout } = await execAsync(`gh issue view ${issueNumber} --repo ${remote} --json comments`, {
         timeout: 15_000,
-        stdio: "pipe",
       });
-      const comments = (JSON.parse(raw) as { comments?: Array<{ body?: string }> }).comments ?? [];
+      const comments = (JSON.parse(stdout) as { comments?: Array<{ body?: string }> }).comments ?? [];
       if (comments.some((c) => c.body?.includes(DRIFT_MARKER))) return; // already notified
     } catch {
       // proceed to attempt the comment anyway
     }
     try {
       const tmpFile = path.join(os.tmpdir(), `tl-comment-${Date.now()}.md`);
-      fs.writeFileSync(
+      await fsp.writeFile(
         tmpFile,
         `<!-- ${DRIFT_MARKER} -->\n⚠️ This issue's repository \`${remote}\` is not declared in talos-loop's \`projects.json\`, so it will not be processed. Add the repo to the relevant project entry to enable it.`,
         "utf-8",
       );
-      execSync(`gh issue comment ${issueNumber} --repo ${remote} --body-file "${tmpFile}"`, {
+      await execAsync(`gh issue comment ${issueNumber} --repo ${remote} --body-file "${tmpFile}"`, {
         timeout: 15_000,
-        stdio: "pipe",
       });
-      fs.unlinkSync(tmpFile);
+      await fsp.unlink(tmpFile);
     } catch (err: any) {
       ctx.logger.error(`Failed to post config-drift comment on ${remote}#${issueNumber}: ${err.message}`);
     }

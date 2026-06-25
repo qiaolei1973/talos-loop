@@ -1,5 +1,4 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import * as fs from "fs";
 import * as db from "../db/index.js";
 import * as boardSnapshot from "../services/boardSnapshot.js";
 import * as worktree from "../services/worktree.js";
@@ -8,7 +7,8 @@ import type { IssueEntry, PollResult } from "../services/poller.js";
 import type { Issue } from "../db/index.js";
 
 // --- spy references into the mocked modules ---
-const mockWriteFileSync = fs.writeFileSync as unknown as ReturnType<typeof vi.fn>;
+let mockWriteFile: ReturnType<typeof vi.fn>;
+let mockChmod: ReturnType<typeof vi.fn>;
 const mockUpdateSessionStatus = db.updateSessionStatus as unknown as ReturnType<typeof vi.fn>;
 const mockCreateSession = db.createSession as unknown as ReturnType<typeof vi.fn>;
 const mockSetSessionClaudeId = db.setSessionClaudeId as unknown as ReturnType<typeof vi.fn>;
@@ -59,14 +59,14 @@ const mockPlugin = {
 };
 
 vi.mock("../config.js", () => ({
-  loadConfig: () => ({ maxParallel: 1, maxRetry, keepSessionOnSuccess, claudeTimeout }),
-  buildProjectContextForIssue: () => ({
+  loadConfig: async () => ({ maxParallel: 1, maxRetry, keepSessionOnSuccess, claudeTimeout }),
+  buildProjectContextForIssue: async () => ({
     config: {},
     logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
     repos: ctxRepos,
     projectId: "qiaolei1973/1",
   }),
-  getProjectById: () => ({ stages }),
+  getProjectById: async () => ({ stages }),
 }));
 
 vi.mock("../db/index.js", () => ({
@@ -77,6 +77,7 @@ vi.mock("../db/index.js", () => ({
   updateSessionStatus: vi.fn(),
   setSessionClaudeId: vi.fn(),
   getIssue: vi.fn(),
+  getSettingsByPlugin: () => [],
 }));
 
 vi.mock("../services/boardSnapshot.js", () => ({
@@ -93,15 +94,15 @@ vi.mock("../services/tmux.js", () => ({
   reviewSessionName: (sourceName: string, repo: string, sourceId: string) =>
     `tl-${sourceName}-${repo}-${sourceId}-review`,
   createSession: vi.fn(),
-  captureOutput: (session: string) => tmuxOutput[session] ?? "",
-  isAlive: (session: string) => tmuxAlive.has(session),
+  captureOutput: async (session: string) => tmuxOutput[session] ?? "",
+  isAlive: async (session: string) => tmuxAlive.has(session),
   exitCodePath: (session: string) => `/tmp/tl-exit-${session}.txt`,
-  readExitCode: (session: string) => exitCodeBySession[session],
+  readExitCode: async (session: string) => exitCodeBySession[session],
   sessionIdPath: (session: string) => `/tmp/tl-session-${session}.txt`,
-  readSessionId: (session: string) => readSessionIdBySession[session],
+  readSessionId: async (session: string) => readSessionIdBySession[session],
   // A real kill detaches the session; mirror that so a watchdog-killed session
   // reads as dead and falls through to classification.
-  killSession: vi.fn((session: string) => {
+  killSession: vi.fn(async (session: string) => {
     tmuxAlive.delete(session);
   }),
 }));
@@ -117,10 +118,19 @@ vi.mock("../services/logger.js", () => ({
   createLogger: () => ({ info: vi.fn(), warn: vi.fn(), error: vi.fn() }),
 }));
 
-// Stub the launcher-script + chmod writes; leave the rest of fs real.
+// Stub the fs.promises writeFile + chmod used by launchScript; leave the rest real.
 vi.mock("fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("fs")>();
-  return { ...actual, writeFileSync: vi.fn(), chmodSync: vi.fn() };
+  mockWriteFile = vi.fn();
+  mockChmod = vi.fn();
+  return {
+    ...actual,
+    promises: {
+      ...actual.promises,
+      writeFile: mockWriteFile,
+      chmod: mockChmod,
+    },
+  };
 });
 
 function makeIssue(sourceId: string): Issue {
@@ -181,7 +191,8 @@ function makeRunningSession(
 
 /** The single launcher-script write dispatch performs. */
 function launcherScript(): string {
-  const scriptCall = mockWriteFileSync.mock.calls.find(
+  if (!mockWriteFile) throw new Error("mockWriteFile not initialized");
+  const scriptCall = mockWriteFile.mock.calls.find(
     (c: any[]) => typeof c[0] === "string" && c[0].endsWith(".sh"),
   );
   if (!scriptCall) throw new Error("launcher script was not written");
@@ -260,7 +271,7 @@ describe("dispatchNew() launches the ready-stage skill (issue #32)", () => {
     expect(script).toContain('export TALOS_BRANCH="feat/issue-1"');
     expect(script).toContain('export TALOS_TARGET_REPO="talos-loop"');
     // No prompt .txt is written anymore — only the launcher script.
-    const txtCalls = mockWriteFileSync.mock.calls.filter(
+    const txtCalls = mockWriteFile.mock.calls.filter(
       (c: any[]) => typeof c[0] === "string" && c[0].endsWith(".txt"),
     );
     expect(txtCalls).toHaveLength(0);

@@ -39,22 +39,22 @@ async function withProjectName(issues: Issue[]): Promise<(Issue & { project_name
 }
 
 export function startPoller(): void {
-  const config = loadConfig();
+  const config = loadConfig().then((cfg) => {
+    runPollCycle().catch((err) => {
+      log.error(`Poll cycle error: ${err}`);
+    });
 
-  runPollCycle().catch((err) => {
-    log.error(`Poll cycle error: ${err}`);
+    function scheduleNext(): void {
+      nextPollAt = new Date(Date.now() + cfg.pollInterval);
+      pollTimer = setTimeout(() => {
+        runPollCycle().catch((err) => {
+          log.error(`Poll cycle error: ${err}`);
+        });
+        scheduleNext();
+      }, cfg.pollInterval);
+    }
+    scheduleNext();
   });
-
-  function scheduleNext(): void {
-    nextPollAt = new Date(Date.now() + config.pollInterval);
-    pollTimer = setTimeout(() => {
-      runPollCycle().catch((err) => {
-        log.error(`Poll cycle error: ${err}`);
-      });
-      scheduleNext();
-    }, config.pollInterval);
-  }
-  scheduleNext();
 }
 
 export function stopPoller(): void {
@@ -98,9 +98,9 @@ export function buildResumeCommand(parts: {
 export async function registerApiRoutes(app: FastifyInstance): Promise<void> {
   // Global status
   app.get("/api/status", async () => {
-    const config = loadConfig();
+    const config = await loadConfig();
     const running = getRunningSessions();
-    const projects = getEnabledProjects();
+    const projects = await getEnabledProjects();
     return {
       status: "ok",
       runningCount: running.length,
@@ -117,7 +117,7 @@ export async function registerApiRoutes(app: FastifyInstance): Promise<void> {
   // List projects and their repos
   app.get("/api/projects", async () => {
     return Promise.all(
-      loadProjects().map(async (p) => ({
+      (await loadProjects()).map(async (p) => ({
         projectId: p.projectId,
         projectType: p.projectType,
         enabled: p.enabled,
@@ -130,7 +130,7 @@ export async function registerApiRoutes(app: FastifyInstance): Promise<void> {
   // Union of repos across all projects (dashboard grouping helper)
   app.get("/api/repos", async () => {
     const seen = new Map<string, { name: string; path: string; remote?: string }>();
-    for (const p of loadProjects()) {
+    for (const p of await loadProjects()) {
       for (const r of p.repos) {
         if (!seen.has(r.name)) seen.set(r.name, { name: r.name, path: r.path, remote: r.remote });
       }
@@ -152,16 +152,20 @@ export async function registerApiRoutes(app: FastifyInstance): Promise<void> {
   // issue's stage badge stays purely board-driven.
   app.get("/api/issues", async () => {
     const issues = await withProjectName(getAllIssues());
-    return issues.map((issue) => {
-      const sessions = getSessionsByIssue(issue.id);
-      const boardStatus = getBoardStatus(issue.project_id, issue.source_id);
-      return {
-        ...issue,
-        status: deriveDisplayState(sessions, boardStatus),
-        tmux_session: liveSessionName(sessions),
-        sessions: sessions.map((s) => ({ ...s, isLive: isSessionLive(s) })),
-      };
-    });
+    return Promise.all(
+      issues.map(async (issue) => {
+        const sessions = getSessionsByIssue(issue.id);
+        const boardStatus = getBoardStatus(issue.project_id, issue.source_id);
+        return {
+          ...issue,
+          status: await deriveDisplayState(sessions, boardStatus),
+          tmux_session: await liveSessionName(sessions),
+          sessions: await Promise.all(
+            sessions.map(async (s) => ({ ...s, isLive: await isSessionLive(s) })),
+          ),
+        };
+      }),
+    );
   });
 
   // Sessions for an issue
@@ -184,7 +188,7 @@ export async function registerApiRoutes(app: FastifyInstance): Promise<void> {
       reply.code(404);
       return { error: "Session not found" };
     }
-    tmux.killSession(session.tmux_session);
+    await tmux.killSession(session.tmux_session);
     const wasRunning = session.status === "running";
     if (wasRunning) {
       updateSessionStatus(sessionId, "killed", "Killed via dashboard");
@@ -219,7 +223,8 @@ export async function registerApiRoutes(app: FastifyInstance): Promise<void> {
       reply.code(404);
       return { error: "Issue not found" };
     }
-    const repo = getProjectById(issue.project_id)?.repos.find((r) => r.name === issue.target_repo);
+    const project = await getProjectById(issue.project_id);
+    const repo = project?.repos.find((r) => r.name === issue.target_repo);
     if (!repo) {
       reply.code(404);
       return { error: `Repo "${issue.target_repo}" not found` };

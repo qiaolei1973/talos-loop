@@ -40,32 +40,32 @@ describe("readExitCode sentinel (issue #20)", () => {
     fs.writeFileSync(exitCodePath(session), content, "utf-8");
   }
 
-  it("returns the integer code and deletes the sentinel after reading", () => {
+  it("returns the integer code and deletes the sentinel after reading", async () => {
     writeSentinel("0\n");
-    expect(readExitCode(session)).toBe(0);
+    expect(await readExitCode(session)).toBe(0);
     // single-use: the file is gone after the read
     expect(fs.existsSync(exitCodePath(session))).toBe(false);
   });
 
-  it("returns a non-zero exit code verbatim", () => {
+  it("returns a non-zero exit code verbatim", async () => {
     writeSentinel("137");
-    expect(readExitCode(session)).toBe(137);
+    expect(await readExitCode(session)).toBe(137);
     expect(fs.existsSync(exitCodePath(session))).toBe(false);
   });
 
-  it("returns undefined when the sentinel is absent (unclean termination)", () => {
+  it("returns undefined when the sentinel is absent (unclean termination)", async () => {
     // Ensure no leftover from a prior test, then read a missing sentinel.
     try {
       fs.unlinkSync(exitCodePath(session));
     } catch {
       // already absent
     }
-    expect(readExitCode(session)).toBeUndefined();
+    expect(await readExitCode(session)).toBeUndefined();
   });
 
-  it("returns undefined for non-integer sentinel contents", () => {
+  it("returns undefined for non-integer sentinel contents", async () => {
     writeSentinel("not-a-number");
-    expect(readExitCode(session)).toBeUndefined();
+    expect(await readExitCode(session)).toBeUndefined();
     // the corrupt sentinel is still cleaned up
     expect(fs.existsSync(exitCodePath(session))).toBe(false);
   });
@@ -79,25 +79,25 @@ describe("readSessionId sidecar (issue #30)", () => {
     fs.writeFileSync(sessionIdPath(session), content, "utf-8");
   }
 
-  it("returns the id and deletes the sidecar after reading", () => {
+  it("returns the id and deletes the sidecar after reading", async () => {
     writeSidecar("claude-uuid-123\n");
-    expect(readSessionId(session)).toBe("claude-uuid-123");
+    expect(await readSessionId(session)).toBe("claude-uuid-123");
     // single-use: the file is gone after the read
     expect(fs.existsSync(sessionIdPath(session))).toBe(false);
   });
 
-  it("returns undefined when the sidecar is absent (init not seen yet)", () => {
+  it("returns undefined when the sidecar is absent (init not seen yet)", async () => {
     try {
       fs.unlinkSync(sessionIdPath(session));
     } catch {
       // already absent
     }
-    expect(readSessionId(session)).toBeUndefined();
+    expect(await readSessionId(session)).toBeUndefined();
   });
 
-  it("returns undefined for a blank sidecar (and still cleans it up)", () => {
+  it("returns undefined for a blank sidecar (and still cleans it up)", async () => {
     writeSidecar("   \n");
-    expect(readSessionId(session)).toBeUndefined();
+    expect(await readSessionId(session)).toBeUndefined();
     expect(fs.existsSync(sessionIdPath(session))).toBe(false);
   });
 

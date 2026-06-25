@@ -1,6 +1,6 @@
-import { execSync } from "child_process";
-import fs from "fs";
+import { promises as fsp } from "fs";
 import path from "path";
+import { execAsync } from "./utils/execAsync.js";
 import type { Logger } from "./services/logger.js";
 import type { ProjectContext, RepoRef } from "./types/plugin.js";
 
@@ -81,10 +81,10 @@ function defaults(): Partial<AppConfig> {
   };
 }
 
-export function loadConfig(): AppConfig {
+export async function loadConfig(): Promise<AppConfig> {
   if (cachedConfig) return cachedConfig;
 
-  const raw = fs.readFileSync(configPath(), "utf-8");
+  const raw = await fsp.readFile(configPath(), "utf-8");
   const parsed = JSON.parse(raw);
   const def = defaults();
 
@@ -100,7 +100,7 @@ export function loadConfig(): AppConfig {
   };
 
   // Ensure database directory exists
-  fs.mkdirSync(path.dirname(cachedConfig.dbPath), { recursive: true });
+  await fsp.mkdir(path.dirname(cachedConfig.dbPath), { recursive: true });
 
   return cachedConfig;
 }
@@ -122,14 +122,12 @@ function parseOwnerRepo(url: string): string | undefined {
 }
 
 /** Infer "owner/repo" from `git remote get-url origin` in the given path. */
-function inferRemote(repoPath: string): string | undefined {
+async function inferRemote(repoPath: string): Promise<string | undefined> {
   try {
-    const url = execSync(`git -C ${repoPath} remote get-url origin`, {
-      encoding: "utf-8",
+    const { stdout } = await execAsync(`git -C ${repoPath} remote get-url origin`, {
       timeout: 10_000,
-      stdio: "pipe",
-    }).trim();
-    return parseOwnerRepo(url);
+    });
+    return parseOwnerRepo(stdout.trim());
   } catch {
     return undefined;
   }
@@ -144,15 +142,17 @@ function inferRemote(repoPath: string): string | undefined {
  * empty array. Duplicate repo basenames within a project emit a console warning
  * (they collide on the target_repo key).
  */
-export function loadProjects(): ProjectConfig[] {
+export async function loadProjects(): Promise<ProjectConfig[]> {
   if (cachedProjects) return cachedProjects;
 
-  if (!fs.existsSync(projectsPath())) {
+  let raw: string;
+  try {
+    raw = await fsp.readFile(projectsPath(), "utf-8");
+  } catch {
     cachedProjects = [];
     return cachedProjects;
   }
 
-  const raw = fs.readFileSync(projectsPath(), "utf-8");
   const parsed = JSON.parse(raw) as Array<{
     projectId: string;
     projectType: string;
@@ -162,44 +162,50 @@ export function loadProjects(): ProjectConfig[] {
     config?: Record<string, unknown>;
   }>;
 
-  cachedProjects = parsed.map((p) => {
-    const repos: RepoRef[] = (p.repos ?? []).map((r) => ({
-      name: basename(r.path),
-      path: r.path,
-      remote: r.remote ?? inferRemote(r.path),
-      // Issue #28: baseline branch passed through; the dispatcher applies the
-      // "main" default where it's consumed (createWorktree).
-      branch: r.branch,
-    }));
+  cachedProjects = await Promise.all(
+    parsed.map(async (p) => {
+      const repos: RepoRef[] = await Promise.all(
+        (p.repos ?? []).map(async (r) => ({
+          name: basename(r.path),
+          path: r.path,
+          remote: r.remote ?? await inferRemote(r.path),
+          // Issue #28: baseline branch passed through; the dispatcher applies the
+          // "main" default where it's consumed (createWorktree).
+          branch: r.branch,
+        })),
+      );
 
-    // Duplicate basenames within a project collide on the target_repo key.
-    const seen = new Set<string>();
-    for (const r of repos) {
-      if (seen.has(r.name)) console.warn(`[config] project "${p.projectId}" has duplicate repo basename "${r.name}"`);
-      seen.add(r.name);
-    }
+      // Duplicate basenames within a project collide on the target_repo key.
+      const seen = new Set<string>();
+      for (const r of repos) {
+        if (seen.has(r.name)) console.warn(`[config] project "${p.projectId}" has duplicate repo basename "${r.name}"`);
+        seen.add(r.name);
+      }
 
-    return {
-      projectId: p.projectId,
-      projectType: p.projectType,
-      enabled: p.enabled ?? true,
-      repos,
-      // issue #32: stage → skill map. Defaults to empty (no dispatch) when a
-      // project declares no stages; the two core stages are "ready"/"in-review".
-      stages: p.stages ?? {},
-      config: p.config,
-    };
-  });
+      return {
+        projectId: p.projectId,
+        projectType: p.projectType,
+        enabled: p.enabled ?? true,
+        repos,
+        // issue #32: stage → skill map. Defaults to empty (no dispatch) when a
+        // project declares no stages; the two core stages are "ready"/"in-review".
+        stages: p.stages ?? {},
+        config: p.config,
+      };
+    }),
+  );
 
   return cachedProjects;
 }
 
-export function getEnabledProjects(): ProjectConfig[] {
-  return loadProjects().filter((p) => p.enabled && p.repos.length > 0);
+export async function getEnabledProjects(): Promise<ProjectConfig[]> {
+  const projects = await loadProjects();
+  return projects.filter((p) => p.enabled && p.repos.length > 0);
 }
 
-export function getProjectById(projectId: string): ProjectConfig | undefined {
-  return loadProjects().find((p) => p.projectId === projectId);
+export async function getProjectById(projectId: string): Promise<ProjectConfig | undefined> {
+  const projects = await loadProjects();
+  return projects.find((p) => p.projectId === projectId);
 }
 
 /** Build ProjectContext for a project, exposing all its repos. */
@@ -213,8 +219,8 @@ export function buildProjectContext(project: ProjectConfig, logger: Logger): Pro
 }
 
 /** Build ProjectContext by projectId (looks up the project; throws if unknown). */
-export function buildProjectContextForIssue(projectId: string, logger: Logger): ProjectContext {
-  const project = getProjectById(projectId);
+export async function buildProjectContextForIssue(projectId: string, logger: Logger): Promise<ProjectContext> {
+  const project = await getProjectById(projectId);
   if (!project) throw new Error(`Unknown projectId "${projectId}" — not declared in projects.json`);
   return buildProjectContext(project, logger);
 }

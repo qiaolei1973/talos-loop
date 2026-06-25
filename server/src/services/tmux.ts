@@ -1,7 +1,7 @@
-import { execSync } from "child_process";
-import * as fs from "fs";
+import { promises as fsp } from "fs";
 import os from "os";
 import path from "path";
+import { execAsync } from "../utils/execAsync.js";
 import { createLogger } from "./logger.js";
 
 const log = createLogger("tmux");
@@ -21,10 +21,10 @@ const EXIT_CODE_PREFIX = "tl-exit";
 const SESSION_ID_PREFIX = "tl-session";
 
 /** Check that tmux is available */
-export function checkTmux(): void {
+export async function checkTmux(): Promise<void> {
   try {
-    const ver = execSync("tmux -V", { timeout: 3_000, encoding: "utf-8" }).trim();
-    log.info(ver);
+    const { stdout } = await execAsync("tmux -V", { timeout: 3_000 });
+    log.info(stdout.trim());
   } catch {
     log.error("tmux is not installed. Please install it first: sudo dnf install -y tmux");
     process.exit(1);
@@ -56,14 +56,14 @@ export function reviewSessionName(sourceName: string, targetRepo: string, source
 }
 
 /** Create a new detached tmux session running a command */
-export function createSession(name: string, command: string): void {
-  execSync(`tmux new-session -d -s "${name}" -x 200 -y 50 "${command}"`, { timeout: 10_000 });
+export async function createSession(name: string, command: string): Promise<void> {
+  await execAsync(`tmux new-session -d -s "${name}" -x 200 -y 50 "${command}"`, { timeout: 10_000 });
 }
 
 /** Check if a tmux session is still alive */
-export function isAlive(name: string): boolean {
+export async function isAlive(name: string): Promise<boolean> {
   try {
-    execSync(`tmux has-session -t "${name}" 2>/dev/null`, { timeout: 5_000 });
+    await execAsync(`tmux has-session -t "${name}" 2>/dev/null`, { timeout: 5_000 });
     return true;
   } catch {
     return false;
@@ -71,21 +71,21 @@ export function isAlive(name: string): boolean {
 }
 
 /** Kill a tmux session */
-export function killSession(name: string): void {
+export async function killSession(name: string): Promise<void> {
   try {
-    execSync(`tmux kill-session -t "${name}" 2>/dev/null`, { timeout: 5_000 });
+    await execAsync(`tmux kill-session -t "${name}" 2>/dev/null`, { timeout: 5_000 });
   } catch {
     // session already dead
   }
 }
 
 /** Capture the last N lines of a tmux session's output */
-export function captureOutput(name: string, lines = 200): string {
+export async function captureOutput(name: string, lines = 200): Promise<string> {
   try {
-    return execSync(`tmux capture-pane -t "${name}" -p -S -${lines}`, {
-      encoding: "utf-8",
+    const { stdout } = await execAsync(`tmux capture-pane -t "${name}" -p -S -${lines}`, {
       timeout: 5_000,
     });
+    return stdout;
   } catch {
     return "";
   }
@@ -109,17 +109,17 @@ export function exitCodePath(session: string): string {
  * "failed" signal: `checkRunningSessions` treats it as unclean termination
  * rather than guessing at success (issue #20).
  */
-export function readExitCode(session: string): number | undefined {
+export async function readExitCode(session: string): Promise<number | undefined> {
   const file = exitCodePath(session);
   let code: number | undefined;
   try {
-    const parsed = Number(fs.readFileSync(file, "utf-8").trim());
+    const parsed = Number((await fsp.readFile(file, "utf-8")).trim());
     code = Number.isInteger(parsed) ? parsed : undefined;
   } catch {
     code = undefined;
   }
   try {
-    fs.unlinkSync(file);
+    await fsp.unlink(file);
   } catch {
     // sentinel already absent — nothing to clean up
   }
@@ -142,17 +142,17 @@ export function sessionIdPath(session: string): string {
  * the run never produced one. The dispatcher persists the id the first cycle it
  * appears, so an absent sidecar on a later cycle simply means "already captured".
  */
-export function readSessionId(session: string): string | undefined {
+export async function readSessionId(session: string): Promise<string | undefined> {
   const file = sessionIdPath(session);
   let id: string | undefined;
   try {
-    const raw = fs.readFileSync(file, "utf-8").trim();
+    const raw = (await fsp.readFile(file, "utf-8")).trim();
     id = raw.length > 0 ? raw : undefined;
   } catch {
     id = undefined;
   }
   try {
-    fs.unlinkSync(file);
+    await fsp.unlink(file);
   } catch {
     // sidecar already absent — nothing to clean up
   }
@@ -160,13 +160,12 @@ export function readSessionId(session: string): string | undefined {
 }
 
 /** List all talos-loop managed sessions */
-export function listManagedSessions(): string[] {
+export async function listManagedSessions(): Promise<string[]> {
   try {
-    const raw = execSync("tmux list-sessions -F '#{session_name}'", {
-      encoding: "utf-8",
+    const { stdout } = await execAsync("tmux list-sessions -F '#{session_name}'", {
       timeout: 5_000,
     });
-    return raw.trim().split("\n").filter((s) => s.startsWith(SESSION_PREFIX + "-"));
+    return stdout.trim().split("\n").filter((s) => s.startsWith(SESSION_PREFIX + "-"));
   } catch {
     return [];
   }

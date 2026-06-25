@@ -516,12 +516,12 @@ export default function App() {
   const issuesQuery = useQuery({
     queryKey: ["issues"],
     queryFn: fetchIssues,
-    refetchInterval: 10_000, // refresh issue list every 10s
+    refetchInterval: 60_000, // refresh issue list every 60s
   });
   const statusQuery = useQuery({
     queryKey: ["status"],
     queryFn: fetchStatus,
-    refetchInterval: 30_000, // status is lightweight metadata — poll less often
+    refetchInterval: 60_000, // status is lightweight metadata — poll every 60s
   });
 
   const issues = issuesQuery.data ?? [];

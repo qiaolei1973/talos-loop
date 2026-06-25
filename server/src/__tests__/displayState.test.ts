@@ -5,7 +5,7 @@ import type { Session } from "../db/index.js";
 let aliveNames: Set<string> = new Set();
 
 vi.mock("../services/tmux.js", () => ({
-  isAlive: (name: string) => aliveNames.has(name),
+  isAlive: async (name: string) => aliveNames.has(name),
 }));
 
 import { deriveDisplayState, isSessionLive, liveSessionName, mapBoardStatus } from "../services/displayState.js";
@@ -33,18 +33,18 @@ describe("isSessionLive() (issue #19)", () => {
     aliveNames = new Set();
   });
 
-  it("is live only when status is running AND tmux reports the session alive", () => {
+  it("is live only when status is running AND tmux reports the session alive", async () => {
     // running + alive → live
     aliveNames = new Set(["tl-a"]);
-    expect(isSessionLive(session({ tmux_session: "tl-a", status: "running" }))).toBe(true);
+    expect(await isSessionLive(session({ tmux_session: "tl-a", status: "running" }))).toBe(true);
     // running but dead (zombie) → not live
     aliveNames = new Set();
-    expect(isSessionLive(session({ tmux_session: "tl-a", status: "running" }))).toBe(false);
+    expect(await isSessionLive(session({ tmux_session: "tl-a", status: "running" }))).toBe(false);
     // alive-looking but already terminal → not live
     aliveNames = new Set(["tl-a"]);
-    expect(isSessionLive(session({ tmux_session: "tl-a", status: "done" }))).toBe(false);
-    expect(isSessionLive(session({ tmux_session: "tl-a", status: "failed" }))).toBe(false);
-    expect(isSessionLive(session({ tmux_session: "tl-a", status: "killed" }))).toBe(false);
+    expect(await isSessionLive(session({ tmux_session: "tl-a", status: "done" }))).toBe(false);
+    expect(await isSessionLive(session({ tmux_session: "tl-a", status: "failed" }))).toBe(false);
+    expect(await isSessionLive(session({ tmux_session: "tl-a", status: "killed" }))).toBe(false);
   });
 });
 
@@ -69,18 +69,18 @@ describe("deriveDisplayState() — stage badge is board-driven, review-unaffecte
     aliveNames = new Set();
   });
 
-  it("a live CODING session overrides the board to processing", () => {
+  it("a live CODING session overrides the board to processing", async () => {
     aliveNames = new Set(["tl-c"]);
-    const state = deriveDisplayState(
+    const state = await deriveDisplayState(
       [session({ tmux_session: "tl-c", type: "coding", status: "running" })],
       "queued",
     );
     expect(state).toBe("processing");
   });
 
-  it("a live REVIEW session does NOT override the board — badge stays done", () => {
+  it("a live REVIEW session does NOT override the board — badge stays done", async () => {
     aliveNames = new Set(["tl-r"]);
-    const state = deriveDisplayState(
+    const state = await deriveDisplayState(
       [session({ tmux_session: "tl-r", type: "review", status: "running" })],
       "done",
     );
@@ -88,9 +88,9 @@ describe("deriveDisplayState() — stage badge is board-driven, review-unaffecte
     expect(state).toBe("done");
   });
 
-  it("a live review session never reads as processing even against a queued board", () => {
+  it("a live review session never reads as processing even against a queued board", async () => {
     aliveNames = new Set(["tl-r"]);
-    const state = deriveDisplayState(
+    const state = await deriveDisplayState(
       [session({ tmux_session: "tl-r", type: "review", status: "running" })],
       "queued",
     );
@@ -98,17 +98,17 @@ describe("deriveDisplayState() — stage badge is board-driven, review-unaffecte
     expect(state).toBe("queued");
   });
 
-  it("falls back to the board state when no session is live", () => {
+  it("falls back to the board state when no session is live", async () => {
     aliveNames = new Set();
-    expect(deriveDisplayState([], "queued")).toBe("queued");
-    expect(deriveDisplayState([], "processing")).toBe("processing");
-    expect(deriveDisplayState([], "done")).toBe("done");
-    expect(deriveDisplayState([], "Backlog")).toBeNull();
+    expect(await deriveDisplayState([], "queued")).toBe("queued");
+    expect(await deriveDisplayState([], "processing")).toBe("processing");
+    expect(await deriveDisplayState([], "done")).toBe("done");
+    expect(await deriveDisplayState([], "Backlog")).toBeNull();
   });
 
-  it("liveSessionName still surfaces a live review session as an attach target", () => {
+  it("liveSessionName still surfaces a live review session as an attach target", async () => {
     aliveNames = new Set(["tl-r"]);
-    const name = liveSessionName([session({ tmux_session: "tl-r", type: "review", status: "running" })]);
+    const name = await liveSessionName([session({ tmux_session: "tl-r", type: "review", status: "running" })]);
     expect(name).toBe("tl-r");
   });
 });
