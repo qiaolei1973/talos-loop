@@ -2,27 +2,27 @@ import type { Session } from "../db/index.js";
 import * as tmux from "./tmux.js";
 
 /** The dashboard-facing status, derived on read (never persisted). */
-export type DisplayState = "queued" | "processing" | "done" | null;
+export type DisplayState = "ready" | "inprogress" | "inreview" | null;
 
 /**
  * Map a board-snapshot value (a standard core state written by the poller from
  * list().state, or an optimistic flip) to a display state. The board snapshot
  * (issue #32) now stores standard states directly — the source plugin's list()
- * already translated its platform-specific column into queued/processing/done —
+ * already translated its platform-specific column into ready/inprogress/inreview —
  * so this is a passthrough + validity check. Unknown/empty → null (indeterminate).
  *
- *   queued      → queued      (Ready)
- *   processing  → processing  (In progress)
- *   done        → done        (In review; "Done"/merged is excluded upstream)
+ *   ready       → ready       (Ready)
+ *   inprogress  → inprogress  (In progress)
+ *   inreview    → inreview    (In review; "Done"/merged is excluded upstream)
  */
 export function mapBoardStatus(boardStatus: string | null | undefined): DisplayState {
   switch (boardStatus ?? "") {
-    case "queued":
-      return "queued";
-    case "processing":
-      return "processing";
-    case "done":
-      return "done";
+    case "ready":
+      return "ready";
+    case "inprogress":
+      return "inprogress";
+    case "inreview":
+      return "inreview";
     default:
       return null;
   }
@@ -31,7 +31,7 @@ export function mapBoardStatus(boardStatus: string | null | undefined): DisplayS
 /**
  * Derive an issue's display status from the two sources of truth. The board
  * snapshot's standard state is the sole source of workflow truth, EXCEPT that a
- * live CODING session always reads as "processing" — so a board hand-moved to
+ * live CODING session always reads as "inprogress" — so a board hand-moved to
  * Ready mid-flight doesn't mis-report an actively-running agent.
  *
  * A live REVIEW session does NOT override the board: review sessions are
@@ -39,7 +39,7 @@ export function mapBoardStatus(boardStatus: string | null | undefined): DisplayS
  * must stay stable and board-driven while one runs. (Its liveness is shown
  * separately as a per-session `isLive` indicator.)
  *
- *   running CODING session AND tmux.isAlive → processing
+ *   running CODING session AND tmux.isAlive → inprogress
  *   otherwise mapBoardStatus(snapshot state)
  */
 export async function deriveDisplayState(
@@ -48,7 +48,7 @@ export async function deriveDisplayState(
 ): Promise<DisplayState> {
   for (const s of sessions) {
     if (s.status === "running" && s.type !== "review" && await tmux.isAlive(s.tmux_session)) {
-      return "processing";
+      return "inprogress";
     }
   }
   return mapBoardStatus(boardStatus);
@@ -66,7 +66,7 @@ export async function isSessionLive(session: Session): Promise<boolean> {
 
 /**
  * The tmux session name to offer an "attach" link for, if a running session is
- * still alive. Null when nothing is live (e.g. a board "processing" item whose
+ * still alive. Null when nothing is live (e.g. a board "inprogress" item whose
  * session died — a zombie — has nothing to attach to).
  */
 export async function liveSessionName(sessions: Session[]): Promise<string | null> {

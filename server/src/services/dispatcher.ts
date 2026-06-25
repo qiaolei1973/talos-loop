@@ -214,8 +214,8 @@ export async function checkRunningSessions(): Promise<{ completed: number; faile
       log.info(`✅ ${sourceName}:${source_id} done — clean exit, advancing to In review`);
       updateSessionStatus(session.id, "done");
       if (!keepSessionOnSuccess) await tmux.killSession(session.tmux_session);
-      await plugin.writeLabel(ctx, source_id, { from: "processing", to: "done" }, target_repo);
-      setBoardStatus(project_id, source_id, "done");
+      await plugin.writeLabel(ctx, source_id, { from: "inprogress", to: "inreview" }, target_repo);
+      setBoardStatus(project_id, source_id, "inreview");
       await removeSessionWorktree(ctx, session, target_repo);
       completed++;
     } else if (session.retry_count < config.maxRetry && session.claude_session_id) {
@@ -316,7 +316,7 @@ async function retryCodingSession(args: {
   createSession(issueId, session, { type: "coding", branch, worktreePath, retryCount: retryCount + 1 });
 }
 
-/** Dispatch queued issues: create a worktree, advance to processing, launch the ready-stage skill. */
+/** Dispatch ready issues: create a worktree, advance to inprogress, launch the ready-stage skill. */
 export async function dispatchNew(pollResults: PollResult[]): Promise<number> {
   const config = await loadConfig();
   const runningCount = getRunningSessions().length;
@@ -328,7 +328,7 @@ export async function dispatchNew(pollResults: PollResult[]): Promise<number> {
 
   const candidates: IssueEntry[] = pollResults
     .flatMap((r) => r.discovered)
-    .filter((c) => c.state === "queued");
+    .filter((c) => c.state === "ready");
 
   // Sort by sourceId (for GitHub, lower number = older = higher priority)
   candidates.sort((a, b) => {
@@ -364,7 +364,7 @@ export async function dispatchNew(pollResults: PollResult[]): Promise<number> {
     // Real-time freshness check — only dispatch issues still actionable.
     if (plugin.getItem) {
       const current = await plugin.getItem(ctx, sourceId, targetRepo);
-      if (current.state !== "queued") {
+      if (current.state !== "ready") {
         log.info(`Skipping ${sourceName}:${sourceId} — not actionable (state ${current.state ?? "null"})`);
         continue;
       }
@@ -388,21 +388,21 @@ export async function dispatchNew(pollResults: PollResult[]): Promise<number> {
     log.info(`🚀 Dispatching ${sourceName}:${sourceId} → session ${session} (skill ${skill}, worktree ${worktreePath})`);
 
     try {
-      await plugin.writeLabel(ctx, sourceId, { from: "queued", to: "processing" }, targetRepo);
+      await plugin.writeLabel(ctx, sourceId, { from: "ready", to: "inprogress" }, targetRepo);
 
       await tmux.createSession(session, command);
 
       createSession(issue.id, session, { type: "coding", branch, worktreePath });
       // Optimistically flip the snapshot to processing so the dashboard reflects
       // dispatch before the next poll re-reads the board.
-      setBoardStatus(projectId, sourceId, "processing");
+      setBoardStatus(projectId, sourceId, "inprogress");
 
       dispatched++;
     } catch (err: any) {
       log.error(`Failed to dispatch ${sourceName}:${sourceId}: ${err.message}`);
       // Drop the unused worktree so it doesn't leak, and roll the board back.
       await worktree.removeWorktree(repo.path, worktreePath);
-      await plugin.writeLabel(ctx, sourceId, { from: "processing", to: "queued" }, targetRepo);
+      await plugin.writeLabel(ctx, sourceId, { from: "inprogress", to: "ready" }, targetRepo);
     }
   }
 
@@ -410,7 +410,7 @@ export async function dispatchNew(pollResults: PollResult[]): Promise<number> {
 }
 
 /**
- * Dispatch the review skill for in-review (done) issues that carry an unresolved
+ * Dispatch the review skill for in-review (inreview) issues that carry an unresolved
  * `review` subIssue (issue #32). The board is NOT touched: review is a perpetual
  * worker on a PR that is already "In review", and GitHub's automation advances
  * it to Done on merge. Reuses the per-issue review session name + worktree on
@@ -420,7 +420,7 @@ export async function dispatchReview(pollResults: PollResult[]): Promise<number>
   const candidates: IssueEntry[] = pollResults
     .flatMap((r) => r.discovered)
     .filter(
-      (c) => c.state === "done" && (c.subIssues?.some((s) => s.type === "review" && !s.resolved) ?? false),
+      (c) => c.state === "inreview" && (c.subIssues?.some((s) => s.type === "review" && !s.resolved) ?? false),
     );
   if (candidates.length === 0) return 0;
 

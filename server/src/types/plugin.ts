@@ -17,12 +17,9 @@ import type { Logger } from "../services/logger.js";
  *                          crash   ──┘   (review subIssues → review skill; crash → claude -r retry)
  *
  * ⚠️ There is no `failed` state on the board: a crash that exhausts retries
- * leaves the issue `processing` (In progress) for a human, with a comment.
- * ⚠️ Naming trap: the `done` state corresponds to GitHub's **"In review"**
- * column (PR created), NOT the terminal "Done" column (advanced by GitHub's own
- * automation on PR merge — talos-loop never drives it).
+ * leaves the issue `inprogress` (In progress) for a human, with a comment.
  */
-export type IssueState = "queued" | "processing" | "done";
+export type IssueState = "ready" | "inprogress" | "inreview";
 
 /**
  * A minimal signal carried on a {@link RawIssue} that something downstream of
@@ -46,7 +43,7 @@ export interface SubIssue {
  *   list()       required — every active issue + its standard state + subIssues
  *   getItem?()   optional — single-issue freshness recheck; defaults to the
  *                            state already in the list() result
- *   writeLabel() required — advance the stage (queued/processing/done)
+ *   writeLabel() required — advance the stage (ready/inprogress/inreview)
  *   writeComment?() optional — post on the issue; absent ⇒ server skips silently
  */
 export interface IssueSourcePlugin {

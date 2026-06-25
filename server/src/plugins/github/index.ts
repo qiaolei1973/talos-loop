@@ -70,9 +70,9 @@ function parseRemote(remote: string): { owner: string; repo: string } {
 /** Map a GitHub Projects status option name to a standard core state. */
 function statusNameToState(name: string): IssueState | null {
   switch (norm(name)) {
-    case "ready": return "queued";
-    case "inprogress": return "processing";
-    case "inreview": return "done";
+    case "ready": return "ready";
+    case "inprogress": return "inprogress";
+    case "inreview": return "inreview";
     default: return null; // Backlog / Done(terminal) / unknown — not an active pipeline state
   }
 }
@@ -80,9 +80,9 @@ function statusNameToState(name: string): IssueState | null {
 /** Map a core state to the GitHub Projects status option name. */
 function stateToStatusName(state: IssueState): string {
   switch (state) {
-    case "queued": return "Ready";
-    case "processing": return "In progress";
-    case "done": return "In review";
+    case "ready": return "Ready";
+    case "inprogress": return "In progress";
+    case "inreview": return "In review";
   }
 }
 
@@ -142,7 +142,7 @@ export class GitHubIssueSourcePlugin implements IssueSourcePlugin {
 
       // An in-review issue: signal unresolved review work so the server can
       // dispatch the review skill. The probe is best-effort (see method doc).
-      if (state === "done") {
+      if (state === "inreview") {
         const hasUnresolved = await this.hasUnresolvedReviewThread(ctx, remote, item.content.number);
         if (hasUnresolved) raw.subIssues = [{ type: "review", resolved: false }];
       }
@@ -166,7 +166,7 @@ export class GitHubIssueSourcePlugin implements IssueSourcePlugin {
       const data = JSON.parse(stdout);
       const labels: string[] = (data.labels ?? []).map((l: { name: string }) => l.name);
       // Actionable iff it still carries the eligibility marker.
-      if (labels.includes(trigger)) return { state: "queued" };
+      if (labels.includes(trigger)) return { state: "ready" };
       return { state: null };
     } catch (err: any) {
       ctx.logger.warn(`getItem: issue read failed for ${repo.remote}#${sourceId} — treating as not actionable: ${err.message}`);
