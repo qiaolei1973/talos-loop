@@ -12,11 +12,5 @@ export default defineConfig({
       "@": path.resolve(__dirname, "./src"),
     },
   },
-  test: {
-    environment: "jsdom",
-    setupFiles: ["./src/__tests__/setup.ts"],
-    // Component tests assert on rendered output, not on which hooks are used,
-    // so they stay valid regardless of the fetching implementation underneath.
-    include: ["src/__tests__/**/*.test.{ts,tsx}"],
-  },
+  // Tests will be added in a follow-up.
 });

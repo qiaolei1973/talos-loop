@@ -116,17 +116,14 @@ async function fetchSettings(): Promise<Record<string, SettingValue[]>> {
 }
 
 function StatusBadge({ status }: { status: string }) {
-  const config: Record<string, { icon: any; label: string; cls: string }> = {
-    queued: { icon: Clock, label: "Ready", cls: "bg-yellow-100 text-yellow-800" },
-    processing: { icon: Loader2, label: "In progress", cls: "bg-blue-100 text-blue-800" },
-    done: { icon: CheckCircle, label: "In review", cls: "bg-green-100 text-green-800" },
-    other: { icon: Clock, label: status, cls: "bg-gray-100 text-gray-800" },
+  const config: Record<string, { label: string; cls: string }> = {
+    queued: { label: "Ready", cls: "bg-yellow-100 text-yellow-800" },
+    processing: { label: "In progress", cls: "bg-blue-100 text-blue-800" },
+    done: { label: "In review", cls: "bg-green-100 text-green-800" },
   };
-  const c = config[status] || config.other;
-  const Icon = c.icon;
+  const c = config[status] ?? { label: status, cls: "bg-gray-100 text-gray-800" };
   return (
-    <span className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-medium ${c.cls}`}>
-      <Icon className={`h-3 w-3 ${status === "processing" ? "animate-spin" : ""}`} />
+    <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${c.cls}`}>
       {c.label}
     </span>
   );

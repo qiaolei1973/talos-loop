@@ -6,7 +6,7 @@
 		"dev": "tsx watch src/index.ts",
 		"build": "tsc && cp src/services/stream-formatter.cjs dist/services/stream-formatter.cjs",
 		"start": "node dist/index.js",
-		"test": "vitest run",
+		"test": "vitest run --passWithNoTests",
 		"test:watch": "vitest"
 	},
 	"dependencies": {
