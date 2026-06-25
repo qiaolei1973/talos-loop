@@ -2,7 +2,9 @@ import Database from "better-sqlite3";
 import fs from "fs";
 import path from "path";
 
-const PROJECT_ROOT = path.resolve(__dirname, "../..");
+// db/index.ts 在 server/src/db/ (或 server/dist/db/)，比 config.ts 深一层，
+// 所以需要 3 级 ".." 才能到项目根（config.ts 只需 2 级）。
+const PROJECT_ROOT = path.resolve(__dirname, "../../..");
 
 /** Resolve dbPath directly (sync, one-time) without depending on async loadConfig(). */
 function resolveDbPath(): string {
