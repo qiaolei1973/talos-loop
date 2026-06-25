@@ -266,7 +266,7 @@ export class GitHubIssueSourcePlugin implements IssueSourcePlugin {
       (JSON.parse(raw) as { data?: { repository?: { issue?: { timelineItems?: { nodes?: Array<{ source?: { reviewThreads?: { nodes?: Array<{ isResolved?: boolean }> } } }> } } } } })?.data?.repository?.issue?.timelineItems?.nodes ?? [];
     for (const node of nodes) {
       const threads = node.source?.reviewThreads?.nodes ?? [];
-      if (threads.some((t) => !t.isResolved)) return true;
+      if (threads.some((t) => t.isResolved === false)) return true;
     }
     return false;
   }

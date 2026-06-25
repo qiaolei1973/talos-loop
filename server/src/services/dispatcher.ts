@@ -150,13 +150,14 @@ async function stageSkill(projectId: string, stage: string): Promise<string | un
  * The board advances ONLY on a clean coding exit — the deliberate stage move.
  * Everything else leaves the board alone (a crash parks the issue In progress).
  */
-export async function checkRunningSessions(): Promise<{ completed: number; failed: number; retried: number }> {
+export async function checkRunningSessions(): Promise<{ completed: number; failed: number; retried: number; /** issue ids whose review session just finished this cycle — dispatchReview() must skip them. */ completedReviewIssueIds: Set<number> }> {
   const running = getRunningSessionsWithIssues();
   const config = await loadConfig();
   const keepSessionOnSuccess = config.keepSessionOnSuccess;
   let completed = 0;
   let failed = 0;
   let retried = 0;
+  const completedReviewIssueIds = new Set<number>();
 
   for (const { project_id, project_type, source_id, target_repo, ...session } of running) {
     const plugin = await resolvePlugin(project_type);
@@ -197,6 +198,7 @@ export async function checkRunningSessions(): Promise<{ completed: number; faile
         updateSessionStatus(session.id, "done");
         if (!keepSessionOnSuccess) await tmux.killSession(session.tmux_session);
         completed++;
+        completedReviewIssueIds.add(session.issue_id);
       } else {
         // Review is implicitly retried: the next poll re-dispatches while review
         // subIssues remain unresolved, so a crash just records failed + cleans up.
@@ -204,6 +206,7 @@ export async function checkRunningSessions(): Promise<{ completed: number; faile
         log.warn(`⚠️ ${sourceName}:${source_id} review session failed — unresolved threads re-trigger next tick`);
         updateSessionStatus(session.id, "failed", tail);
         failed++;
+        completedReviewIssueIds.add(session.issue_id);
       }
       continue;
     }
@@ -256,7 +259,7 @@ export async function checkRunningSessions(): Promise<{ completed: number; faile
     }
   }
 
-  return { completed, failed, retried };
+  return { completed, failed, retried, completedReviewIssueIds };
 }
 
 /** Remove a session's worktree (best-effort; never throws). */
@@ -416,7 +419,7 @@ export async function dispatchNew(pollResults: PollResult[]): Promise<number> {
  * it to Done on merge. Reuses the per-issue review session name + worktree on
  * the existing feat branch (the PR head). One review session per issue at a time.
  */
-export async function dispatchReview(pollResults: PollResult[]): Promise<number> {
+export async function dispatchReview(pollResults: PollResult[], completedReviewIssueIds?: Set<number>): Promise<number> {
   const candidates: IssueEntry[] = pollResults
     .flatMap((r) => r.discovered)
     .filter(
@@ -425,6 +428,12 @@ export async function dispatchReview(pollResults: PollResult[]): Promise<number>
   if (candidates.length === 0) return 0;
 
   const runningReview = getRunningReviewIssueIds();
+  // Also skip issues whose review session just finished this very cycle —
+  // otherwise dispatch() will re-dispatch before the next poll can refresh
+  // the board snapshot (same-cycle re-dispatch loop).
+  if (completedReviewIssueIds) {
+    for (const id of completedReviewIssueIds) runningReview.add(id);
+  }
   let reviewed = 0;
 
   for (const candidate of candidates) {
@@ -482,11 +491,11 @@ export async function dispatchReview(pollResults: PollResult[]): Promise<number>
 
 /** Main dispatch cycle: check running + dispatch new + dispatch review */
 export async function dispatch(pollResults: PollResult[]): Promise<DispatchResult> {
-  const { completed, failed, retried } = await checkRunningSessions();
+  const { completed, failed, retried, completedReviewIssueIds } = await checkRunningSessions();
   const dispatched = await dispatchNew(pollResults);
   // Review is driven by the subIssue signal in list() every cycle (guarded by
   // the one-review-session-per-issue rule), so no slow cadence counter.
-  const reviewed = await dispatchReview(pollResults);
+  const reviewed = await dispatchReview(pollResults, completedReviewIssueIds);
 
   const runningCount = getRunningSessions().length;
 
